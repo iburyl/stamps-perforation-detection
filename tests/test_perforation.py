@@ -1,0 +1,657 @@
+"""Geometry tests with known hole pitch, valley depth, rotation and damage."""
+import csv
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import cv2
+import numpy as np
+
+from perforation import (circular_arc_count, draw_measurement, fit_arc_lattice,
+                         exclude_points_outside_corners,
+                         measure_stamp, refine_edge, refine_edge_from_arc_lattice,
+                         recover_missing_side, recover_side_by_parallel_scan,
+                         recover_side_by_periodic_attenuation,
+                         recovery_targets,
+                         save_measurements, measure_profile)
+from segment_stamps import (average_perforation, summary_row, write_perf_json,
+                            detect_stamps_2d, estimate_orientation,
+                            perforation_label, reconcile_perforation,
+                            refine_orientation_from_measurement)
+
+
+class PerforationTests(unittest.TestCase):
+    def sample(self, angle=0, damaged=False, perforated=True, hinge=False,
+               paper_color=(125, 180, 200)):
+        mask = np.zeros((900, 900), np.uint8)
+        cv2.rectangle(mask, (250, 170), (650, 730), 255, -1)
+        if perforated:
+            for i, x in enumerate(range(262, 645, 28)):
+                for y in (170, 730):
+                    if not damaged or i % 5 != 2:
+                        cv2.circle(mask, (x, y), 8, 0, -1)
+            for i, y in enumerate(range(186, 725, 32)):
+                for x in (250, 650):
+                    if not damaged or i % 6 != 2:
+                        cv2.circle(mask, (x, y), 8, 0, -1)
+        if damaged:
+            cv2.line(mask, (235, 370), (665, 580), 0, 6)
+        unrotated_mask = mask.copy()
+        matrix = cv2.getRotationMatrix2D((450, 450), -angle, 1)
+        mask = cv2.warpAffine(mask, matrix, (900, 900), flags=cv2.INTER_LINEAR)
+        gray = np.uint8(30+mask.astype(float)*190/255)
+        image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        if hinge:
+            # A grey hinge is brighter than the normal background threshold,
+            # nearly as bright as the paper, and covers most top perforations.
+            image = np.full((900, 900, 3), 30, np.uint8)
+            cv2.rectangle(image, (290, 150), (645, 205), (175, 175, 175), -1)
+            image[unrotated_mask > 0] = paper_color
+            image = cv2.warpAffine(image, matrix, (900, 900), flags=cv2.INTER_LINEAR,
+                                   borderMode=cv2.BORDER_CONSTANT, borderValue=(30, 30, 30))
+        orientation = dict(angle_deg=angle, width_px=400., height_px=560.,
+                           center_x=450., center_y=450.)
+        return measure_stamp(image, orientation, 100)
+
+    def test_known_dimensions_pitch_and_rotation(self):
+        for angle in (-6, 0, 5):
+            for damaged in (False, True):
+                with self.subTest(angle=angle, damaged=damaged):
+                    result = self.sample(angle, damaged)
+                    self.assertIn(result['status'], ('ok', 'review'))
+                    self.assertAlmostEqual(result['valley_width_px'], 384, delta=3)
+                    self.assertAlmostEqual(result['valley_height_px'], 544, delta=3)
+                    for side, pitch in [('top', 28), ('bottom', 28), ('left', 32), ('right', 32)]:
+                        edge = result['sides'][side]
+                        self.assertGreaterEqual(edge.get('count', 0), 5)
+                        self.assertAlmostEqual(edge['pitch_px'], pitch, delta=0.5)
+
+    def test_straight_edges_not_perforation(self):
+        result = self.sample(perforated=False)
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertNotIn('valley_width_px', result)
+
+    def test_hinge_behind_colored_paper(self):
+        for angle in (-6, 0, 5):
+            for color in ((125, 180, 200), (200, 180, 125)):
+                with self.subTest(angle=angle, color=color):
+                    result = self.sample(angle=angle, hinge=True, paper_color=color)
+                    top = result['sides']['top']
+                    self.assertTrue(top['method'].startswith('adaptive_lab_'))
+                    self.assertEqual(top['status'], 'review')
+                    self.assertGreaterEqual(top['count'], 6)
+                    self.assertAlmostEqual(top['pitch_px'], 28, delta=0.5)
+                    self.assertAlmostEqual(result['valley_height_px'], 544, delta=3)
+                    points = top['points_image'][top['accepted']]
+                    # Transform back: the points must lie on paper valley bases,
+                    # not on the straight top edge of the hinge (y=150).
+                    matrix = cv2.getRotationMatrix2D((450, 450), angle, 1)
+                    restored = points @ matrix[:, :2].T + matrix[:, 2]
+                    np.testing.assert_allclose(restored[:, 1], 178, atol=3)
+
+    def test_hinge_does_not_invent_perforations_on_straight_paper(self):
+        result = self.sample(perforated=False, hinge=True)
+        self.assertEqual(result['status'], 'unavailable')
+
+    def test_1k_stamp_3_right_hinge_falls_back_after_false_brightness_peaks(self):
+        path = Path(__file__).resolve().parent.parent / '1K.png'
+        if not path.exists():
+            self.skipTest('1K scan is not included')
+        image = cv2.imread(str(path))
+        boxes, mask = detect_stamps_2d(image)
+        orientation = estimate_orientation(mask, boxes[2])
+        scale = min(1.0, 1500 / image.shape[1])
+        sample = cv2.resize(image, None, fx=scale, fy=scale,
+                            interpolation=cv2.INTER_AREA)
+        threshold = min(250, float(np.percentile(
+            cv2.cvtColor(sample, cv2.COLOR_BGR2GRAY), 10
+        )) + 35)
+        result = measure_stamp(image, orientation, threshold)
+        right = result['sides']['right']
+        self.assertTrue(right['method'].startswith('adaptive_lab_'))
+        self.assertGreaterEqual(circular_arc_count(right), 5)
+        self.assertAlmostEqual(right['pitch_px'], 63.3, delta=1.0)
+        self.assertNotIn('pitch_px', result['sides']['top'])
+
+    def test_empty_profile_and_no_orientation(self):
+        self.assertEqual(measure_profile(np.arange(100), np.full(100, np.nan), 100)['status'], 'unavailable')
+        self.assertEqual(measure_stamp(None, None, 100)['status'], 'unavailable')
+
+    def test_orientation_is_refined_from_consistent_perforation_lines(self):
+        orientation = {
+            'angle_deg': 0., 'width_px': 400., 'height_px': 560.,
+            'center_x': 300., 'center_y': 350., 'corners': np.zeros((4, 2)),
+            'status': 'review', 'edge_spread_deg': 2.,
+        }
+        sides = {}
+        for index, (side, angle) in enumerate(zip(
+                ('top', 'bottom', 'left', 'right'),
+                (-2.0, -2.2, -1.9, 8.0))):
+            radians = np.deg2rad(angle + (90 if side in ('left', 'right') else 0))
+            direction = np.array([np.cos(radians), np.sin(radians)]) * 100
+            sides[side] = {
+                'line_image': np.array([[0., 0.], direction]),
+                'geometry_source': 'circle_arcs', 'count': 8,
+                'status': 'ok', 'method': 'brightness',
+            }
+        refined = refine_orientation_from_measurement(
+            orientation, {'sides': sides}
+        )
+        self.assertAlmostEqual(refined['angle_deg'], -2.033, delta=0.1)
+        self.assertEqual(set(refined['orientation_inlier_sides']),
+                         {'top', 'bottom', 'left'})
+        self.assertNotIn('right', refined['orientation_inlier_sides'])
+
+    def test_exports_coordinates_and_scale(self):
+        result = self.sample()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'perforation.csv'
+            save_measurements(path, [result], offset=np.array([100, 200]), dpi=1200)
+            with path.open(encoding='utf-8-sig') as stream:
+                row = next(csv.DictReader(stream))
+            self.assertAlmostEqual(float(row['top_per_20mm']), 20*1200/(25.4*28), delta=0.1)
+            self.assertAlmostEqual(float(row['valley_width_mm']), result['valley_width_px']*25.4/1200, places=3)
+            details = json.loads(path.with_suffix('.json').read_text())
+            point = details['stamps'][0]['sides']['top']['points'][0]
+            np.testing.assert_allclose(point, result['sides']['top']['points_image'][0]+[100, 200])
+            save_measurements(path, [result])
+            with path.open(encoding='utf-8-sig') as stream:
+                self.assertNotIn('valley_width_mm', next(csv.DictReader(stream)))
+
+    def test_per_image_json_contains_summary_and_detailed_hole_ids(self):
+        result = self.sample()
+        reconcile_perforation(result, ('top', 'bottom'), 1200)
+        reconcile_perforation(result, ('left', 'right'), 1200)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'scan_perf.json'
+            orientation = dict(angle_deg=0., width_px=400., height_px=560.,
+                               center_x=450., center_y=450., corners=np.zeros((4, 2)))
+            write_perf_json(path, 'scan.png', [(250, 170, 650, 730)],
+                            [orientation], [result], 1200, {})
+            payload = json.loads(path.read_text(encoding='utf-8'))
+            row = payload['stamps'][0]['summary']
+            self.assertEqual(row['source'], 'scan.png')
+            self.assertEqual(len(payload['stamps']), 1)
+            self.assertAlmostEqual(float(row['width_mm']),
+                                   result['valley_width_px'] * 25.4 / 1200, places=3)
+            self.assertFalse(any('point' in name for name in row))
+            holes = payload['stamps'][0]['measurement']['sides']['top']['holes']
+            self.assertEqual([hole['id'] for hole in holes], list(range(1, len(holes) + 1)))
+
+    def test_circular_arc_refinement_has_distinct_drawing_color(self):
+        image = np.zeros((40, 40, 3), np.uint8)
+        result = {'sides': {'top': {
+            'points_image': np.array([[10., 10.], [25., 25.]]),
+            'accepted': np.array([True, True]),
+            'refinement_fits': [{'model': 'circle'}, None],
+            'line_image': np.array([[0., 35.], [39., 35.]]),
+        }}}
+        draw_measurement(image, result, thickness=2)
+        np.testing.assert_array_equal(image[10, 10], [255, 0, 255])
+        np.testing.assert_array_equal(image[25, 25], [0, 120, 255])
+
+    def test_rejected_circle_is_hollow_and_does_not_support_side(self):
+        image = np.zeros((40, 40, 3), np.uint8)
+        edge = {
+            'points_image': np.array([[10., 10.], [25., 25.]]),
+            'accepted': np.array([True, False]),
+            'refinement_fits': [{'model': 'circle'}, {'model': 'circle'}],
+            'line_image': np.array([[0., 35.], [39., 35.]]),
+        }
+        draw_measurement(image, {'sides': {'top': edge}}, thickness=2)
+        np.testing.assert_array_equal(image[10, 10], [255, 0, 255])
+        np.testing.assert_array_equal(image[25, 25], [0, 0, 0])
+        self.assertGreater(int(image[25, 21, 0]), 0)
+        self.assertEqual(circular_arc_count(edge), 1)
+
+    def test_arc_outlier_is_excluded_before_lattice_fit(self):
+        points = np.array([[20., 10.], [40., 10.], [60., 10.],
+                           [80., 10.], [100., 10.], [120., 24.]])
+        edge = {'status': 'ok', 'pitch_px': 20., 'amplitude_px': 8.}
+        fits = [{'point': point.copy(), 'curve': np.empty((0, 2)),
+                 'model': 'circle', 'rms_px': .1} for point in points]
+        with patch('perforation.refine_valleys',
+                   side_effect=lambda signal, positions, depth, seeds, pitch:
+                   [None] * len(seeds)):
+            success = refine_edge_from_arc_lattice(
+                edge, np.zeros((40, 141)), np.arange(141.),
+                np.full(141, 10.), points, fits)
+        self.assertTrue(success)
+        self.assertEqual(edge['accepted'].sum(), 5)
+        self.assertFalse(edge['accepted'][5])
+        self.assertAlmostEqual(edge['pitch_px'], 20.)
+        self.assertAlmostEqual(edge['slope'], 0.)
+
+    def test_corner_arc_beyond_adjacent_edge_is_excluded(self):
+        valleys = np.column_stack([
+            np.arange(0., 91., 15.), np.full(7, 10.)
+        ])
+        top = {
+            'status': 'ok', 'line': (0., 10.), 'slope': 0.,
+            'intercept': 10., 'pitch_px': 15., 'amplitude_px': 8.,
+            'geometry_source': 'circle_arcs', 'valleys': valleys,
+            'accepted': np.ones(7, bool),
+        }
+        sides = {
+            'top': top,
+            'bottom': {'status': 'unavailable'},
+            'left': {'line': (0., 10.)},
+            'right': {'line': (0., 80.)},
+        }
+        contexts = {'top': {'positions': np.arange(101.)}}
+
+        exclude_points_outside_corners(sides, contexts)
+
+        np.testing.assert_array_equal(
+            top['accepted'], [False, True, True, True, True, True, False]
+        )
+        np.testing.assert_array_equal(
+            top['inside_corner_bounds'],
+            [False, True, True, True, True, True, False],
+        )
+        self.assertEqual(top['count'], 5)
+        self.assertAlmostEqual(top['pitch_px'], 15.)
+
+    def test_bottom_refit_does_not_collapse_vertical_corner_bounds(self):
+        def measured_side(line, slope, intercept, valleys, pitch=15.):
+            return {
+                'line': line, 'slope': slope, 'intercept': intercept,
+                'pitch_px': pitch, 'amplitude_px': 8.,
+                'geometry_source': 'circle_arcs', 'valleys': valleys,
+                'accepted': np.ones(len(valleys), bool),
+            }
+
+        horizontal = np.column_stack([
+            [0., 20., 35., 50., 65., 80.], np.full(6, 9.),
+        ])
+        vertical = np.column_stack([
+            [10., 25., 40., 55., 70., 85., 90.], np.full(7, 10.),
+        ])
+        sides = {
+            'top': {'line': (0., 10.)},
+            # Patch y=90, while side-local inward y=9.  Trimming x=0 forces
+            # this flipped side through the refit branch that exposed the bug.
+            'bottom': measured_side((0., 90.), 0., 9., horizontal),
+            'left': measured_side((0., 10.), 0., 10., vertical),
+            'right': measured_side((0., 90.), 0., 9., vertical),
+        }
+        context = {'positions': np.arange(100.), 'work_shape': (100, 100)}
+        contexts = {name: dict(context) for name in sides}
+
+        exclude_points_outside_corners(sides, contexts)
+
+        self.assertEqual(sides['bottom']['accepted'].sum(), 5)
+        self.assertEqual(sides['left']['accepted'].sum(), 7)
+        self.assertEqual(sides['right']['accepted'].sum(), 7)
+        self.assertAlmostEqual(sides['bottom']['line_patch'][1], 90.)
+
+    def test_point_outside_corner_bounds_is_not_drawn(self):
+        image = np.zeros((40, 40, 3), np.uint8)
+        edge = {
+            'points_image': np.array([[10., 10.], [25., 25.]]),
+            'accepted': np.array([False, True]),
+            'inside_corner_bounds': np.array([False, True]),
+            'refinement_fits': [{'model': 'circle'}, {'model': 'circle'}],
+            'line_image': np.array([[0., 35.], [39., 35.]]),
+        }
+        draw_measurement(image, {'sides': {'top': edge}}, thickness=2)
+        np.testing.assert_array_equal(image[10, 10], [0, 0, 0])
+        np.testing.assert_array_equal(image[25, 25], [255, 0, 255])
+
+    def test_final_gauge_uses_only_arc_lattice_pitch(self):
+        measurement = {'sides': {
+            'top': {'pitch_px': 20., 'geometry_source': 'initial_peaks'},
+            'bottom': {'pitch_px': 25., 'geometry_source': 'circle_arcs', 'count': 5},
+            'left': {'pitch_px': 30., 'geometry_source': 'initial_peaks'},
+            'right': {},
+        }}
+        self.assertIsNone(
+            average_perforation(measurement, ('top', 'bottom'), 1200)
+        )
+        self.assertIsNone(
+            average_perforation(measurement, ('left', 'right'), 1200)
+        )
+        self.assertEqual(perforation_label(measurement, 1200), '-- x --')
+
+    def test_opposite_sides_reject_one_false_half_pitch_arc(self):
+        top_x = np.array([
+            214.20, 243.27, 306.26, 371.21, 437.89, 497.88, 568.78,
+            630.48, 695.65, 761.81, 825.14, 889.54, 948.68,
+        ])
+        top_points = np.column_stack([top_x, np.full(len(top_x), 180.)])
+        circle_fits = [
+            {'point': point.copy(), 'curve': np.empty((0, 2)),
+             'model': 'circle', 'rms_px': .2}
+            for point in top_points
+        ]
+        measurement = {'sides': {
+            'top': {
+                'pitch_px': 32.2206, 'geometry_source': 'circle_arcs',
+                'count': len(top_x), 'slope': 0., 'valleys': top_points,
+                'accepted': np.ones(len(top_x), bool),
+                'refinement_fits': circle_fits,
+            },
+            'bottom': {
+                'pitch_px': 64.5888, 'geometry_source': 'circle_arcs',
+                'count': 7, 'method': 'brightness',
+            },
+        }}
+        gauge = average_perforation(measurement, ('top', 'bottom'), 1200)
+        self.assertIsInstance(gauge, float)
+        self.assertAlmostEqual(gauge, 14.63, delta=.1)
+        self.assertFalse(measurement['sides']['top']['accepted'][0])
+        self.assertAlmostEqual(measurement['sides']['top']['pitch_px'], 64.4,
+                               delta=1.)
+
+    def test_discordant_final_sides_are_reported_separately(self):
+        measurement = {'sides': {
+            'top': {'pitch_px': 60., 'geometry_source': 'circle_arcs',
+                    'count': 7},
+            'bottom': {'pitch_px': 70., 'geometry_source': 'circle_arcs',
+                       'count': 7},
+            'left': {}, 'right': {},
+        }}
+        gauges = average_perforation(measurement, ('top', 'bottom'), 1200)
+        self.assertIsInstance(gauges, tuple)
+        self.assertGreater(abs(gauges[0] - gauges[1]), .25)
+        self.assertRegex(perforation_label(measurement, 1200),
+                         r'^\([0-9.]+/[0-9.]+\) x --$')
+
+    def test_arc_lattice_recovers_base_period_across_large_gaps(self):
+        points = np.array([396.83, 459.65, 841.34, 1033.38, 1161.01])
+        fitted = fit_arc_lattice(points, np.arange(140., 1321.))
+        self.assertIsNotNone(fitted)
+        pitch, _, chosen, lattice = fitted
+        self.assertEqual(len(chosen), 5)
+        self.assertAlmostEqual(pitch, 63.6, delta=1.0)
+        self.assertEqual(len(np.unique(lattice)), 5)
+
+    def test_arc_lattice_prefers_fourteen_intervals_over_shorter_alias(self):
+        # Five accepted arcs on 7K #1: the large gap contains nine intervals.
+        points = np.array([198.0686, 392.2235, 454.1873, 1008.1788, 1072.4859])
+        for reference in (None, 62.36):
+            with self.subTest(reference=reference):
+                fitted = fit_arc_lattice(points, np.arange(140., 1321.), reference)
+                self.assertIsNotNone(fitted)
+                pitch, _, _, indices = fitted
+                self.assertEqual(int(np.ptp(indices)), 14)
+                self.assertAlmostEqual(pitch, 62.11, delta=0.1)
+
+    def test_discordant_recovered_side_does_not_bias_gauge(self):
+        measurement = {'sides': {
+            'left': {'pitch_px': 62.36, 'geometry_source': 'circle_arcs',
+                     'count': 11, 'status': 'review', 'method': 'brightness'},
+            'right': {'pitch_px': 67.82, 'geometry_source': 'circle_arcs',
+                      'count': 5, 'status': 'review',
+                      'method': 'parallel_edge_arc_recovery',
+                      'spacing_rms_px': 5.13},
+        }}
+        self.assertAlmostEqual(
+            average_perforation(measurement, ('left', 'right'), 1200),
+            24000 / (25.4 * 62.36), places=6)
+        self.assertEqual(perforation_label(measurement, 1200), '-- x 15.15')
+
+    def test_five_arcs_complete_lattice_and_exclude_other_points_from_line(self):
+        valleys = np.column_stack([np.arange(20., 101., 20.), np.full(5, 10.)])
+        edge = {
+            'valleys': valleys,
+            'accepted': np.ones(5, bool),
+            'pitch_px': 20.,
+            'slope': 0.,
+            'intercept': 10.,
+            'amplitude_px': 8.,
+            'autocorrelation': 0.8,
+            'status': 'ok',
+        }
+        def fake_refinement(signal, positions, depth, seeds, pitch):
+            if len(seeds) == 7:
+                return [
+                    ({'point': seed.copy(), 'curve': np.empty((0, 2)),
+                      'model': 'circle', 'rms_px': 0.1}
+                     if 20 <= seed[0] <= 100 else None)
+                    for seed in seeds
+                ]
+            return [
+                {'point': seed.copy(), 'curve': np.empty((0, 2)),
+                 'model': 'circle', 'rms_px': 0.1}
+                for seed in seeds
+            ]
+
+        with patch('perforation.refine_valleys', side_effect=fake_refinement) as mocked:
+            refine_edge(edge, np.zeros((30, 121)), np.arange(121.),
+                        np.full(121, 10.), )
+
+        self.assertEqual(mocked.call_count, 2)
+        first_pass_seeds = mocked.call_args_list[0].args[3]
+        np.testing.assert_allclose(first_pass_seeds[:, 0],
+                                   [20, 40, 60, 80, 100, 0, 120], atol=1e-9)
+        predicted = mocked.call_args_list[1].args[3]
+        np.testing.assert_allclose(predicted[:, 0], [0, 120], atol=1e-9)
+        self.assertEqual(edge['accepted'].sum(), 7)
+        self.assertTrue(all(
+            fit is not None and fit['model'] == 'circle'
+            for fit, accepted in zip(edge['refinement_fits'], edge['accepted'])
+            if accepted
+        ))
+        self.assertAlmostEqual(edge['pitch_px'], 20.)
+        self.assertAlmostEqual(edge['slope'], 0.)
+
+    def test_missing_side_is_recovered_from_parallel_and_adjacent_edges(self):
+        def adjacent(side):
+            valleys = np.column_stack([np.arange(30., 111., 20.), np.full(5, 10.)])
+            return {
+                'status': 'ok', 'method': 'brightness', 'line': (0., 10.),
+                'slope': 0., 'intercept': 10., 'pitch_px': 20.,
+                'geometry_source': 'circle_arcs',
+                'valleys': valleys, 'accepted': np.ones(5, bool),
+                'refinement_fits': [
+                    {'point': point.copy(), 'curve': np.empty((0, 2)),
+                     'model': 'circle', 'rms_px': 0.1}
+                    for point in valleys
+                ],
+            }
+
+        positions = np.arange(10., 141.)
+        context = {'positions': positions, 'signal': np.zeros((150, 150)),
+                   'depth': np.full(len(positions), 10.), 'work_shape': (150, 150)}
+        sides = {
+            'top': adjacent('top'), 'bottom': adjacent('bottom'),
+            'left': {'status': 'unavailable'},
+            # No opposite edge: the two adjacent arc-supported sides suffice.
+            'right': {'status': 'unavailable'},
+        }
+        contexts = {name: dict(context) for name in sides}
+
+        def fake_refinement(signal, positions, depth, seeds, pitch):
+            if len(seeds) < 5:
+                return [None] * len(seeds)
+            return [
+                {'point': seed.copy(), 'curve': np.empty((0, 2)),
+                 'model': 'circle', 'rms_px': 0.1}
+                for seed in seeds
+            ]
+
+        with patch('perforation.refine_valleys', side_effect=fake_refinement):
+            recovered = recover_missing_side('left', sides, contexts)
+
+        self.assertIsNotNone(recovered)
+        self.assertEqual(recovered['method'], 'parallel_edge_arc_recovery')
+        self.assertEqual(recovered['status'], 'review')
+        self.assertGreaterEqual(recovered['count'], 5)
+        self.assertAlmostEqual(recovered['slope'], 0.)
+
+    def test_missing_side_is_recovered_from_opposite_and_one_adjacent_edge(self):
+        def reliable(valleys):
+            return {
+                'status': 'ok', 'method': 'brightness', 'line': (0., 10.),
+                'slope': 0., 'intercept': 10., 'pitch_px': 20.,
+                'geometry_source': 'circle_arcs',
+                'valleys': valleys, 'accepted': np.ones(len(valleys), bool),
+                'refinement_fits': [
+                    {'point': point.copy(), 'curve': np.empty((0, 2)),
+                     'model': 'circle', 'rms_px': 0.1}
+                    for point in valleys
+                ],
+            }
+
+        horizontal = np.column_stack([
+            np.arange(30., 111., 20.), np.full(5, 10.)
+        ])
+        vertical = np.column_stack([
+            np.arange(30., 111., 20.), np.full(5, 10.)
+        ])
+        sides = {
+            'top': {'status': 'unavailable'},
+            'bottom': reliable(horizontal),
+            'left': reliable(vertical),
+            'right': {'status': 'unavailable'},
+        }
+        positions = np.arange(10., 141.)
+        context = {
+            'positions': positions, 'signal': np.zeros((150, 150)),
+            'depth': np.full(len(positions), 39.), 'work_shape': (150, 150),
+        }
+        contexts = {name: dict(context) for name in sides}
+
+        def fake_refinement(signal, positions, depth, seeds, pitch):
+            if len(seeds) < 5:
+                return [None] * len(seeds)
+            return [
+                {'point': seed.copy(), 'curve': np.empty((0, 2)),
+                 'model': 'circle', 'rms_px': 0.1}
+                for seed in seeds
+            ]
+
+        with patch('perforation.refine_valleys', side_effect=fake_refinement):
+            recovered = recover_missing_side('right', sides, contexts)
+
+        self.assertIsNotNone(recovered)
+        self.assertEqual(recovered['method'], 'parallel_edge_arc_recovery')
+        self.assertGreaterEqual(recovered['count'], 5)
+        self.assertAlmostEqual(recovered['slope'], -sides['left']['line'][0])
+
+    def test_parallel_scan_can_follow_plausible_weak_target_slope(self):
+        points = np.column_stack([
+            np.arange(20., 121., 20.), np.full(6, 10.),
+        ])
+        circles = [
+            {'point': point.copy(), 'curve': np.empty((0, 2)),
+             'model': 'circle', 'rms_px': .1}
+            for point in points
+        ]
+        sides = {
+            'top': {
+                'line': (0., 10.), 'pitch_px': 20.,
+                'geometry_source': 'circle_arcs', 'accepted': np.ones(6, bool),
+                'refinement_fits': circles,
+            },
+            'bottom': {'slope': .03, 'intercept': 8.},
+        }
+        positions = np.arange(10., 131.)
+        context = {
+            'positions': positions, 'signal': np.zeros((80, 150)),
+            'normal_search': (0, 35), 'expected_normal': 10.,
+            'work_shape': (80, 150),
+        }
+
+        def fake_refinement(signal, positions, depth, seeds, pitch):
+            slope = np.polyfit(positions, depth, 1)[0]
+            if abs(slope - .03) > 1e-4:
+                return [None] * len(seeds)
+            return [
+                {'point': seed.copy(), 'curve': np.empty((0, 2)),
+                 'model': 'circle', 'rms_px': .1}
+                for seed in seeds
+            ]
+
+        with patch('perforation.refine_valleys', side_effect=fake_refinement):
+            recovered = recover_side_by_parallel_scan(
+                'bottom', sides, {'bottom': context}
+            )
+
+        self.assertIsNotNone(recovered)
+        self.assertAlmostEqual(recovered['slope'], .03, places=4)
+        self.assertGreaterEqual(circular_arc_count(recovered), 5)
+
+    def test_periodic_attenuation_uses_its_own_k3_period(self):
+        points = np.column_stack([
+            np.arange(20., 121., 20.), np.full(6, 10.),
+        ])
+        circles = [
+            {'point': point.copy(), 'curve': np.empty((0, 2)),
+             'model': 'circle', 'rms_px': .1}
+            for point in points
+        ]
+        unrelated_opposite = {
+            'status': 'ok', 'line': (0., 60.), 'pitch_px': 31.,
+            'amplitude_px': 3.2, 'geometry_source': 'circle_arcs',
+            'valleys': points, 'accepted': np.ones(len(points), bool),
+            'refinement_fits': circles,
+        }
+        positions = np.arange(10., 141.)
+        context = {
+            'positions': positions,
+            'signal': np.full((80, 150), 180., dtype=np.float32),
+            'depth': np.full(len(positions), 20.),
+            'normal_search': (5, 45), 'expected_normal': 20.,
+            'work_shape': (80, 150),
+        }
+        sides = {'top': {'status': 'unavailable'},
+                 'bottom': unrelated_opposite}
+
+        def fake_refinement(signal, positions, depth, seeds, pitch):
+            # The fallback must actually pass an attenuated signal.
+            self.assertLess(float(np.min(signal)), 1.0)
+            return [
+                {'point': seed.copy(), 'curve': np.empty((0, 2)),
+                 'model': 'circle', 'rms_px': .1}
+                for seed in seeds
+            ]
+
+        sine_fit = {
+            'period': 20., 'amplitude': 3.2, 'slope': 0.,
+            'intercept': 20., 'phase': 10.,
+        }
+        with (patch('perforation._fit_kmeans_sine', return_value=sine_fit),
+              patch('perforation.refine_valleys', side_effect=fake_refinement)):
+            recovered = recover_side_by_periodic_attenuation(
+                'top', sides, {'top': context}
+            )
+
+        self.assertIsNotNone(recovered)
+        self.assertEqual(recovered['method'],
+                         'sinusoidal_attenuation_recovery')
+        self.assertAlmostEqual(recovered['pitch_px'], 20., delta=1.)
+        self.assertGreaterEqual(circular_arc_count(recovered), 5)
+
+    def test_arc_poor_and_nonparallel_sides_are_recovery_targets(self):
+        def edge(count, slope=0., status='ok'):
+            return {
+                'status': status,
+                'line': (slope, 10.),
+                'geometry_source': 'circle_arcs',
+                'coverage': 0.8,
+                'refinement_fits': [
+                    {'model': 'circle', 'rms_px': 0.1}
+                    for _ in range(count)
+                ],
+            }
+
+        sides = {
+            'top': edge(7),
+            'bottom': edge(4),
+            'left': edge(6),
+            'right': edge(6),
+        }
+        self.assertEqual(recovery_targets(sides), {'bottom'})
+
+        # With five magenta points on both sides, a 3-degree disagreement still
+        # rebuilds the less strongly supported member, not both sides.
+        sides['bottom'] = edge(5, np.tan(np.deg2rad(3)))
+        self.assertEqual(recovery_targets(sides), {'bottom'})
+
+
+if __name__ == '__main__':
+    unittest.main()
