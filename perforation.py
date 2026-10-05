@@ -320,15 +320,13 @@ def refine_edge(edge, signal, positions, depth):
 
 
 def fit_arc_lattice(values, positions, reference_pitch=None):
-    """Fit an integer lattice, optionally bounded by the opposite arc edge."""
+    """Fit an integer lattice used while constructing the edge geometry."""
     values = np.asarray(values, dtype=float)
     if len(values) < 5:
         return None
     span = float(positions[-1] - positions[0])
     min_pitch = max(8.0, span / 45.0)
     max_pitch = span / 5.0
-    # Pair differences contain integer multiples when holes are missing.
-    # Quantisation only deduplicates initialisers; regression remains subpixel.
     differences = np.abs(values[:, None] - values[None, :])
     differences = differences[np.triu_indices(len(values), 1)]
     candidates = {
@@ -383,12 +381,6 @@ def fit_arc_lattice(values, positions, reference_pitch=None):
             direct_support = int(np.sum(
                 np.abs(direct_gaps / spacing[0] - 1) < 0.12
             ))
-            # Distinct period aliases can explain the same arcs. A materially
-            # better fit wins, but a half-pitch harmonic must not beat a period
-            # supported by actual neighbouring holes.
-            # A stray arc half-way between two real holes can make a half-pitch
-            # lattice contain one extra point.  Actual one-step neighbours are
-            # stronger evidence of the fundamental period than raw occupancy.
             score = (direct_support, len(chosen), -int(rms_ratio / 0.01),
                      -(abs(spacing[0] / reference_pitch - 1)
                        if reference_pitch is not None else 0),
@@ -399,6 +391,78 @@ def fit_arc_lattice(values, positions, reference_pitch=None):
         return None
     _, pitch, phase, chosen, indices = best
     return pitch, phase, chosen, indices
+
+
+def fit_extreme_arc_lattice(values, positions, reference_pitch=None):
+    """Fit the coarsest integer lattice supported by all circular-arc points.
+
+    The extreme points define an integer number of periods.  Every interior
+    point must then lie close to the same lattice.  A point is omitted only
+    when no all-point lattice exists and leave-one-out identifies one unique
+    incompatible point.
+    """
+    values = np.asarray(values, dtype=float)
+    if len(values) < 5:
+        return None
+    order = np.argsort(values)
+    values = values[order]
+    span = float(positions[-1] - positions[0])
+    min_pitch = max(8.0, span / 45.0)
+    max_pitch = span / 5.0
+
+    def coarsest_fit(sample):
+        sample = np.asarray(sample, dtype=float)
+        distance = float(sample[-1] - sample[0])
+        first = max(len(sample) - 1, int(np.ceil(distance / max_pitch)))
+        last = int(np.floor(distance / min_pitch))
+        candidates = []
+        for intervals in range(first, last + 1):
+            initial_pitch = distance / intervals
+            lattice = np.rint(
+                (sample - sample[0]) / initial_pitch
+            ).astype(int)
+            if (lattice[0] != 0 or lattice[-1] != intervals
+                    or np.any(np.diff(lattice) <= 0)):
+                continue
+            pitch, phase = np.polyfit(lattice, sample, 1)
+            if (not np.isfinite(pitch) or pitch <= 0
+                    or (reference_pitch is not None
+                        and abs(pitch / reference_pitch - 1) > 0.05)):
+                continue
+            residual = np.abs(sample - np.polyval((pitch, phase), lattice))
+            max_ratio = float(np.max(residual) / pitch)
+            rms_ratio = float(np.sqrt(np.mean(residual ** 2)) / pitch)
+            if max_ratio <= 0.12 and rms_ratio <= 0.06:
+                candidates.append((float(pitch), float(phase), lattice,
+                                   max_ratio, rms_ratio))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda fit: (fit[0], -fit[3], -fit[4]))
+
+    fit = coarsest_fit(values)
+    chosen_sorted = np.arange(len(values), dtype=int)
+    if fit is None:
+        omitted = []
+        for excluded in range(len(values)):
+            candidate = coarsest_fit(np.delete(values, excluded))
+            if candidate is not None:
+                omitted.append((excluded, candidate))
+        if not omitted:
+            return None
+        omitted.sort(key=lambda item: (
+            item[1][3], item[1][4], -item[1][0],
+        ))
+        # Do not invent an outlier when several omissions explain the points
+        # equally well.  Only one clearly incompatible point may be discarded.
+        if (len(omitted) > 1
+                and omitted[0][1][3] + 0.025 >= omitted[1][1][3]):
+            return None
+        excluded, fit = omitted[0]
+        chosen_sorted = np.delete(chosen_sorted, excluded)
+
+    pitch, phase, lattice, _, _ = fit
+    chosen = order[chosen_sorted]
+    return pitch, phase, chosen, lattice
 
 
 def arc_line_inliers(points, pitch):

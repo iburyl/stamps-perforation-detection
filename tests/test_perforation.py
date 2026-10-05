@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 
 from perforation import (circular_arc_count, draw_measurement, fit_arc_lattice,
+                         fit_extreme_arc_lattice,
                          exclude_points_outside_corners,
                          measure_stamp, refine_edge, refine_edge_from_arc_lattice,
                          recover_missing_side, recover_side_by_parallel_scan,
@@ -378,6 +379,59 @@ class PerforationTests(unittest.TestCase):
                 pitch, _, _, indices = fitted
                 self.assertEqual(int(np.ptp(indices)), 14)
                 self.assertAlmostEqual(pitch, 62.11, delta=0.1)
+
+    def test_arc_lattice_uses_every_circle_and_rejects_double_period(self):
+        # 1K #11 bottom: a sparse subset supports ~133 px, while all seven
+        # circular arcs support the actual ~66 px lattice.
+        points = np.array([
+            4527.2, 4667.6, 4731.0, 4859.5, 4930.6, 5066.0, 5192.0,
+        ])
+        fitted = fit_extreme_arc_lattice(points, np.array([4450., 5280.]))
+        self.assertIsNotNone(fitted)
+        pitch, _, chosen, indices = fitted
+        self.assertEqual(len(chosen), len(points))
+        self.assertAlmostEqual(pitch, 66.45, delta=.2)
+        np.testing.assert_array_equal(indices, [0, 2, 3, 5, 6, 8, 10])
+
+    def test_valid_parity_breaking_circle_is_not_removed(self):
+        # 14K #4: omitting the fifth circle permits a false ~130 px period.
+        # Since all circles already fit ~65 px, leave-one-out must not fire.
+        points = np.array([
+            3466.8, 3587.7, 3718.9, 3854.3, 3916.2, 4113.5,
+        ])
+        fitted = fit_extreme_arc_lattice(points, np.array([3400., 4180.]))
+        self.assertIsNotNone(fitted)
+        pitch, _, chosen, _ = fitted
+        self.assertEqual(len(chosen), len(points))
+        self.assertAlmostEqual(pitch, 65.0, delta=.2)
+
+    def test_opposite_side_reconciliation_halves_double_period(self):
+        def side(points, pitch):
+            valleys = np.column_stack([points, np.full(len(points), 20.)])
+            return {
+                'pitch_px': pitch, 'geometry_source': 'circle_arcs',
+                'count': len(points), 'slope': 0., 'valleys': valleys,
+                'accepted': np.ones(len(points), bool),
+                'refinement_fits': [
+                    {'point': point.copy(), 'curve': np.empty((0, 2)),
+                     'model': 'circle', 'rms_px': .2}
+                    for point in valleys
+                ],
+            }
+
+        points = np.array([
+            4527.2, 4667.6, 4731.0, 4859.5, 4930.6, 5066.0, 5192.0,
+        ])
+        measurement = {'sides': {
+            'top': side(points, 66.45),
+            'bottom': side(points, 132.9),
+        }}
+        gauge = average_perforation(measurement, ('top', 'bottom'), 1200)
+        self.assertIsInstance(gauge, float)
+        self.assertAlmostEqual(gauge, 14.22, delta=.1)
+        self.assertAlmostEqual(
+            measurement['sides']['bottom']['pitch_px'], 66.45, delta=.2,
+        )
 
     def test_discordant_recovered_side_does_not_bias_gauge(self):
         measurement = {'sides': {

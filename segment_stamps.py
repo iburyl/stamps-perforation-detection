@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 
 from perforation import (SIDES, boundary_profile, draw_measurement,
-                         fit_arc_lattice, measure_stamp)
+                         fit_extreme_arc_lattice, measure_stamp)
 from refine_perforation import fit_arc, fit_parabola
 
 
@@ -1032,14 +1032,15 @@ def _edge_gauge(edge, dpi):
     return gauge if PERFORATION_LIMITS[0] <= gauge <= PERFORATION_LIMITS[1] else None
 
 
-def _leave_one_out_pitch(edge, excluded, reference_pitch, dpi):
-    """Refit one side after turning one filled magenta point into a hollow one."""
+def _refit_circle_pitch(edge, reference_pitch, dpi):
+    """Refit a side near a target pitch using every in-bounds circle fit."""
     points = np.asarray(edge.get('valleys', []), dtype=float).reshape(-1, 2)
-    accepted = np.asarray(edge.get('accepted', []), dtype=bool)
     fits = edge.get('refinement_fits', [])
+    inside = np.asarray(edge.get('inside_corner_bounds',
+                                 np.ones(len(points), bool)), dtype=bool)
     circle_indices = np.array([
-        index for index in np.flatnonzero(accepted)
-        if index != excluded and index < len(fits)
+        index for index in range(min(len(points), len(fits), len(inside)))
+        if inside[index]
         and fits[index] is not None and fits[index].get('model') == 'circle'
     ], dtype=int)
     if len(circle_indices) < 5:
@@ -1047,40 +1048,48 @@ def _leave_one_out_pitch(edge, excluded, reference_pitch, dpi):
     values = points[circle_indices, 0]
     all_along = points[:, 0] if len(points) else values
     positions = np.array([np.min(all_along), np.max(all_along)], dtype=float)
-    lattice_fit = fit_arc_lattice(values, positions, reference_pitch)
+    slope = float(edge.get('slope', 0.0))
+    axis_reference = (None if reference_pitch is None else
+                      reference_pitch / np.sqrt(1 + slope * slope))
+    lattice_fit = fit_extreme_arc_lattice(values, positions, axis_reference)
     if lattice_fit is None:
         return None
     _, _, chosen, lattice = lattice_fit
-    # This operation is explicitly leave-one-out: it must not silently discard
-    # a second filled magenta point.
-    if len(chosen) != len(circle_indices):
-        return None
     selected = circle_indices[chosen]
     spacing = np.polyfit(lattice, points[selected, 0], 1)
-    slope = float(edge.get('slope', 0.0))
     pitch = float(spacing[0] * np.sqrt(1 + slope * slope))
     gauge = 20 * dpi / (25.4 * pitch)
     if not (PERFORATION_LIMITS[0] <= gauge <= PERFORATION_LIMITS[1]):
         return None
     residual = points[selected, 0] - np.polyval(spacing, lattice)
-    mask = np.zeros(len(accepted), dtype=bool)
+    mask = np.zeros(len(points), dtype=bool)
     mask[selected] = True
-    return {
+    result = {
         'accepted': mask,
         'pitch_px': pitch,
         'count': int(mask.sum()),
         'refined_count': int(mask.sum()),
         'spacing_rms_px': float(np.sqrt(np.mean(residual ** 2))),
         'gauge': float(gauge),
-        'excluded_point_index': int(excluded),
     }
+    omitted = np.setdiff1d(circle_indices, selected)
+    if len(omitted) == 1:
+        result['excluded_point_index'] = int(omitted[0])
+    return result
 
 
 def reconcile_perforation(measurement, side_names, dpi):
-    """Make opposite sides agree by excluding at most one circular-arc point."""
+    """Reconcile opposite sides, including exact pitch harmonics."""
     if not dpi:
         return
     sides = [measurement.get('sides', {}).get(name, {}) for name in side_names]
+    # This is deliberately a final-period pass.  It uses all already detected
+    # in-bounds circles, but does not feed back into edge or orientation search.
+    for edge in sides:
+        refit = _refit_circle_pitch(edge, None, dpi)
+        if refit is not None:
+            edge.update({key: value for key, value in refit.items()
+                         if key != 'gauge'})
     raw_gauges = []
     for edge in sides:
         pitch = edge.get('pitch_px', 0)
@@ -1091,34 +1100,64 @@ def reconcile_perforation(measurement, side_names, dpi):
         return
 
     candidates = []
+    # First try the other side's period directly.  The lattice fitter may
+    # discard one uniquely incompatible circle, but never a convenient subset.
     for side_index, edge in enumerate(sides):
         other_index = 1 - side_index
         other_pitch = sides[other_index].get('pitch_px', 0)
         other_gauge = valid[other_index]
         if other_pitch <= 0 or other_gauge is None:
             continue
-        accepted = np.asarray(edge.get('accepted', []), dtype=bool)
-        fits = edge.get('refinement_fits', [])
-        for excluded in np.flatnonzero(accepted):
-            if (excluded >= len(fits) or fits[excluded] is None
-                    or fits[excluded].get('model') != 'circle'):
+        refit = _refit_circle_pitch(edge, float(other_pitch), dpi)
+        if refit is None:
+            continue
+        difference = abs(refit['gauge'] - other_gauge)
+        if difference > PERFORATION_AGREEMENT:
+            continue
+        primary = (PERFORATION_PRIMARY_LIMITS[0] <= refit['gauge']
+                   <= PERFORATION_PRIMARY_LIMITS[1]
+                   and PERFORATION_PRIMARY_LIMITS[0] <= other_gauge
+                   <= PERFORATION_PRIMARY_LIMITS[1])
+        candidates.append((not primary, difference,
+                           refit['spacing_rms_px'], side_index, refit))
+
+    # If one side landed on every second (or third) hole, test the smaller
+    # period only after the two independently measured sides disagree.
+    if valid[0] is not None and valid[1] is not None:
+        larger_index = int(sides[1].get('pitch_px', 0)
+                           > sides[0].get('pitch_px', 0))
+        other_index = 1 - larger_index
+        other_gauge = valid[other_index]
+        larger_pitch = float(sides[larger_index]['pitch_px'])
+        for divisor in (2, 3):
+            target_pitch = larger_pitch / divisor
+            implied_gauge = 20 * dpi / (25.4 * target_pitch)
+            if abs(implied_gauge - other_gauge) > PERFORATION_AGREEMENT:
                 continue
-            refit = _leave_one_out_pitch(
-                edge, int(excluded), float(other_pitch), dpi,
+            refit = _refit_circle_pitch(
+                sides[larger_index], target_pitch, dpi,
             )
-            if refit is None:
-                continue
+            if (refit is None
+                    or abs(refit['gauge'] - other_gauge)
+                    > PERFORATION_AGREEMENT):
+                # Sparse points may contain only every second/third hole, so a
+                # target-period refit can remain underdetermined.  The exact
+                # harmonic agreement itself is the requested final evidence.
+                refit = {
+                    'pitch_px': target_pitch,
+                    'gauge': implied_gauge,
+                    'harmonic_divisor': divisor,
+                    'spacing_rms_px': float(
+                        sides[larger_index].get('spacing_rms_px', 0.0)
+                    ),
+                }
             difference = abs(refit['gauge'] - other_gauge)
-            if difference > PERFORATION_AGREEMENT:
-                continue
-            primary = (PERFORATION_PRIMARY_LIMITS[0] <= refit['gauge']
-                       <= PERFORATION_PRIMARY_LIMITS[1]
-                       and PERFORATION_PRIMARY_LIMITS[0] <= other_gauge
-                       <= PERFORATION_PRIMARY_LIMITS[1])
-            candidates.append((not primary, difference,
-                               refit['spacing_rms_px'], side_index, refit))
+            candidates.append((False, difference,
+                               refit['spacing_rms_px'], larger_index, refit))
     if candidates:
-        _, _, _, side_index, refit = min(candidates)
+        _, _, _, side_index, refit = min(
+            candidates, key=lambda candidate: candidate[:3],
+        )
         sides[side_index].update({
             key: value for key, value in refit.items() if key != 'gauge'
         })
@@ -1912,6 +1951,7 @@ def main():
     input_path = Path(args.input)
     output_path = input_path.with_name(input_path.stem + '_detected.jpg')
     perf_path = input_path.with_name(input_path.stem + '_perf.json')
+    print(f"Image: {input_path}")
 
     image = cv2.imread(
         args.input,
@@ -1936,6 +1976,7 @@ def main():
             args.stamp_delta
         ),
     )
+    print(f"Found stamps: {len(boxes)}")
 
     #
     # Draw result.
@@ -2132,56 +2173,21 @@ def main():
             measurements[args.stamp - 1],
         )
 
-    if args.stamp is None:
-        print(f"Annotated image: {output_path}")
-        analyzed_count = sum(
-            measurement is not None for measurement in measurements
+    for index in selected_indices:
+        number = index + 1
+        measurement = measurements[index]
+        label = (perforation_label(measurement, args.dpi)
+                 if measurement is not None else '-- x --')
+        measured_sides = (measurement.get('sides', {})
+                          if measurement is not None else {})
+        sides = ' '.join(
+            f"{side}={measured_sides.get(side, {}).get('count', 0)}"
+            for side in ('top', 'bottom', 'left', 'right')
         )
-        print(f"Per-image results: {perf_path} ({analyzed_count} analyzed stamp(s))")
-    if details_path is not None:
-        print(f"Diagnostic images: {details_path}")
-    for number, measurement in enumerate(measurements, 1):
-        if measurement is None:
-            continue
-        sides = ' '.join(f"{side}={value.get('count', 0)}"
-                          for side, value in measurement['sides'].items())
-        print(f"{number:3}: {perforation_label(measurement, args.dpi)} {sides}")
-    for number, orientation in enumerate(orientations, 1):
-        if orientation:
-            coarse = coarse_orientations[number - 1]
-            angle_text = f"angle={orientation['angle_deg']:+.3f} deg"
-            if coarse and 'orientation_correction_deg' in orientation:
-                angle_text = (
-                    f"angle={coarse['angle_deg']:+.3f} -> "
-                    f"{orientation['angle_deg']:+.3f} deg"
-                )
-            print(f"{number:3}: {angle_text} "
-                  f"size={orientation['width_px']:.1f}x{orientation['height_px']:.1f} px")
-    #
-    # Console diagnostics.
-    #
-
-    print(
-        f"Found {len(boxes)} stamp(s)"
-    )
-    print(f"Analysis workers: {worker_count}")
-
-    for i, (
-        x0,
-        y0,
-        x1,
-        y1,
-    ) in enumerate(
-        boxes,
-        start=1,
-    ):
-
         print(
-            f"{i:3}: "
-            f"x={x0:5} "
-            f"y={y0:5} "
-            f"w={x1 - x0 + 1:5} "
-            f"h={y1 - y0 + 1:5}"
+            f"Stamp {number}: "
+            f"perforation={label}; "
+            f"reliable points: {sides}"
         )
 
 
