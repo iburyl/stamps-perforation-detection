@@ -650,7 +650,7 @@ class PerforationTests(unittest.TestCase):
             'signal': np.full((80, 150), 180., dtype=np.float32),
             'depth': np.full(len(positions), 20.),
             'normal_search': (5, 45), 'expected_normal': 20.,
-            'work_shape': (80, 150),
+            'work_shape': (80, 150), 'collect_debug': True,
         }
         sides = {'top': {'status': 'unavailable'},
                  'bottom': unrelated_opposite}
@@ -667,6 +667,12 @@ class PerforationTests(unittest.TestCase):
         sine_fit = {
             'period': 20., 'amplitude': 3.2, 'slope': 0.,
             'intercept': 20., 'phase': 10.,
+            'cluster_curves': np.vstack([
+                np.full(len(positions), 12.),
+                np.full(len(positions), 20.),
+                np.full(len(positions), 28.),
+            ]),
+            'selected_label': 1,
         }
         with (patch('perforation._fit_kmeans_sine', return_value=sine_fit),
               patch('perforation.refine_valleys', side_effect=fake_refinement)):
@@ -679,6 +685,14 @@ class PerforationTests(unittest.TestCase):
                          'sinusoidal_attenuation_recovery')
         self.assertAlmostEqual(recovered['pitch_px'], 20., delta=1.)
         self.assertGreaterEqual(circular_arc_count(recovered), 5)
+        debug = recovered['debug_sinusoidal_attenuation']
+        self.assertEqual(debug['base_signal'].shape,
+                         debug['attenuated_signal'].shape)
+        self.assertEqual(debug['base_signal'].shape,
+                         debug['attenuation'].shape)
+        self.assertEqual(debug['base_signal'].shape[1], len(positions))
+        self.assertEqual(debug['cluster_curves'].shape, (3, len(positions)))
+        self.assertEqual(debug['selected_cluster'], 1)
 
     def test_arc_poor_and_nonparallel_sides_are_recovery_targets(self):
         def edge(count, slope=0., status='ok'):

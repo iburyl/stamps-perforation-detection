@@ -1236,7 +1236,7 @@ def _json_value(value):
         return value.item()
     if isinstance(value, dict):
         return {key: _json_value(item) for key, item in value.items()
-                if key != 'debug_mask'}
+                if not key.startswith('debug_')}
     if isinstance(value, (list, tuple)):
         return [_json_value(item) for item in value]
     if isinstance(value, float) and not np.isfinite(value):
@@ -1265,6 +1265,7 @@ def measurement_details(measurement):
         key: _json_value(value)
         for key, value in measurement.items()
         if key not in {'sides', 'status', 'reason'}
+        and not key.startswith('debug_')
     }
     details['sides'] = {}
     for side in SIDES:
@@ -1278,7 +1279,7 @@ def measurement_details(measurement):
                 'valleys', 'initial_valleys', 'points_image',
                 'initial_points_image', 'accepted', 'inside_corner_bounds',
                 'refinement_fits', 'debug_mask', 'status', 'reason',
-            }
+            } and not key.startswith('debug_')
         }
         points = edge.get('points_image', np.empty((0, 2)))
         initial = edge.get('initial_points_image', points)
@@ -1537,6 +1538,117 @@ def _profile_image(context):
     return canvas
 
 
+def _sinusoidal_detail_images(edge):
+    """Render the actual signal, sinusoid and attenuation used by k=3 recovery."""
+    debug = edge.get('debug_sinusoidal_attenuation')
+    if not debug:
+        return None
+    positions = np.asarray(debug['positions'], dtype=float)
+    base = np.asarray(debug['base_signal'], dtype=np.float32)
+    attenuation = np.asarray(debug['attenuation'], dtype=np.float32)
+    attenuated = np.asarray(debug['attenuated_signal'], dtype=np.float32)
+    sine = np.asarray(debug['sine_depth'], dtype=float)
+    if (base.ndim != 2 or base.shape != attenuation.shape
+            or base.shape != attenuated.shape or len(positions) != base.shape[1]
+            or len(sine) != len(positions)):
+        return None
+
+    scale = max(1.0, 1800 / max(1, base.shape[1]))
+    def shown_gray(values):
+        gray = _display_gray(values)
+        return cv2.resize(gray, None, fx=scale, fy=scale,
+                          interpolation=cv2.INTER_CUBIC)
+
+    def project(x, y):
+        return (int(round((x - positions[0]) * scale)),
+                int(round(y * scale)))
+
+    cluster_labels = np.asarray(debug.get('cluster_labels', []), dtype=np.uint8)
+    if cluster_labels.ndim != 2 or cluster_labels.shape[1] != len(positions):
+        return None
+    cluster_centers_lab = np.asarray(
+        debug.get('cluster_centers_lab', []), dtype=np.float32,
+    )
+    if cluster_centers_lab.shape != (3, 3):
+        return None
+    centers_lab_image = np.clip(
+        np.rint(cluster_centers_lab), 0, 255,
+    ).astype(np.uint8).reshape(1, 3, 3)
+    cluster_colors = cv2.cvtColor(
+        centers_lab_image, cv2.COLOR_LAB2BGR,
+    ).reshape(3, 3)
+    sine_image = cv2.resize(
+        cluster_colors[cluster_labels], None, fx=scale, fy=scale,
+        interpolation=cv2.INTER_NEAREST,
+    )
+    cluster_offset = float(debug['cluster_n0']) - float(debug['band0'])
+    cluster_sine = sine - cluster_offset
+    def project_cluster(x, y):
+        return (int(round((x - positions[0]) * scale)),
+                int(round(y * scale)))
+    for first, second in zip(zip(positions[:-1], cluster_sine[:-1]),
+                             zip(positions[1:], cluster_sine[1:])):
+        cv2.line(sine_image, project_cluster(*first), project_cluster(*second),
+                 (255, 255, 0), 2, cv2.LINE_AA)
+    label = (f"k=3 sine: period={debug['period']:.1f}px  "
+             f"amplitude={debug['amplitude']:.1f}px  "
+             f"clusters: Lab centroid colours; selected="
+             f"{debug.get('selected_cluster', '?')}")
+    cv2.rectangle(sine_image, (0, 0),
+                  (min(sine_image.shape[1] - 1, 1050), 34),
+                  (245, 245, 245), -1)
+    cv2.putText(sine_image, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                0.62, (20, 20, 20), 1, cv2.LINE_AA)
+
+    mask_image = cv2.cvtColor(
+        cv2.resize(np.uint8(np.clip(attenuation, 0, 1) * 255), None,
+                   fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST),
+        cv2.COLOR_GRAY2BGR,
+    )
+    for first, second in zip(zip(positions[:-1], sine[:-1]),
+                             zip(positions[1:], sine[1:])):
+        cv2.line(mask_image, project(*first), project(*second),
+                 (255, 220, 0), 2, cv2.LINE_AA)
+
+    attenuated_image = cv2.cvtColor(
+        shown_gray(attenuated), cv2.COLOR_GRAY2BGR,
+    )
+    holes_image = attenuated_image.copy()
+    band0 = float(debug['band0'])
+    points = np.asarray(edge.get('valleys', []), dtype=float).reshape(-1, 2)
+    initial = np.asarray(edge.get('initial_valleys', points),
+                         dtype=float).reshape(-1, 2)
+    accepted = np.asarray(edge.get('accepted', []), dtype=bool)
+    fits = edge.get('refinement_fits', [])
+    for public_id, index in enumerate(_hole_indices(edge), 1):
+        point = points[index] if index < len(points) else initial[index]
+        fit = fits[index] if index < len(fits) else None
+        is_accepted = bool(accepted[index]) if index < len(accepted) else False
+        if fit is not None and fit.get('model') == 'circle':
+            curve = np.asarray(fit.get('curve', []), dtype=float).reshape(-1, 2)
+            for first, second in zip(curve[:-1], curve[1:]):
+                cv2.line(holes_image,
+                         project(first[0], first[1] - band0),
+                         project(second[0], second[1] - band0),
+                         (255, 0, 255), 2, cv2.LINE_AA)
+            color = (255, 0, 255)
+        else:
+            color = (0, 120, 255)
+        center = project(point[0], point[1] - band0)
+        cv2.circle(holes_image, center, 7, color,
+                   -1 if is_accepted or fit is None else 2, cv2.LINE_AA)
+        cv2.putText(holes_image, str(public_id),
+                    (center[0] + 8, max(18, center[1] - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+
+    return {
+        'sine': sine_image,
+        'mask': mask_image,
+        'attenuated': attenuated_image,
+        'holes': holes_image,
+    }
+
+
 def _message_image(lines, width=1200, height=360):
     image = np.full((height, width, 3), 245, np.uint8)
     for index, line in enumerate(lines):
@@ -1759,6 +1871,16 @@ def save_details(directory, image, box, stamp_number, coarse_orientation,
                  orientation, measurement, side, threshold, spot=None):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
+    for filename in (
+        '04_holes_numbered.png', '05_boundary_profile.png',
+        '04_boundary_profile.png', '05_holes_numbered.png',
+        '04_brightness_profile.png', '05_brightness_holes_numbered.png',
+        '06_k3_sinusoid.png', '06_k3_clusters_sinusoid.png',
+        '07_attenuation_mask.png',
+        '08_attenuated_signal.png', '09_attenuated_holes_numbered.png',
+        '10_algorithm_trials.png',
+    ):
+        (directory / filename).unlink(missing_ok=True)
     _write_image(directory / '00_detection_bbox.png',
                  _stage_outline_image(image, box, stamp_number))
     _write_image(directory / '00_orientation_coarse.png',
@@ -1768,6 +1890,10 @@ def save_details(directory, image, box, stamp_number, coarse_orientation,
                  _stage_outline_image(image, box, stamp_number, orientation))
     context = analysis_context(image, orientation, measurement, side, threshold)
     numbered = _numbered_side_image(context)
+    trial_edges = measurement.get('debug_algorithm_edges', {}).get(side, {})
+    brightness_context = dict(context)
+    brightness_context['edge'] = trial_edges.get('brightness', context['edge'])
+    brightness_numbered = _numbered_side_image(brightness_context)
     if context['edge'].get('method') == 'parallel_normal_scan_recovery':
         _write_image(directory / '06_parallel_scan_recovery.png', numbered)
     _write_image(directory / '01_rectified_stamp.png', context['patch'])
@@ -1776,8 +1902,19 @@ def save_details(directory, image, box, stamp_number, coarse_orientation,
     _write_image(directory / '02_side_analysis_input.png', signal)
     _write_image(directory / '03_side_threshold_input.png',
                  context['binary'][n0:n1 + 3, start:end] * 255)
-    _write_image(directory / '04_holes_numbered.png', numbered)
-    _write_image(directory / '05_boundary_profile.png', _profile_image(context))
+    _write_image(directory / '04_brightness_profile.png',
+                 _profile_image(brightness_context))
+    _write_image(directory / '05_brightness_holes_numbered.png',
+                 brightness_numbered)
+    sine_images = _sinusoidal_detail_images(context['edge'])
+    if sine_images is not None:
+        _write_image(directory / '06_k3_clusters_sinusoid.png',
+                     sine_images['sine'])
+        _write_image(directory / '07_attenuation_mask.png', sine_images['mask'])
+        _write_image(directory / '08_attenuated_signal.png',
+                     sine_images['attenuated'])
+        _write_image(directory / '09_attenuated_holes_numbered.png',
+                     sine_images['holes'])
     if spot is not None:
         save_spot_diagnostics(directory, context, spot)
 

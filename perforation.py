@@ -1259,7 +1259,7 @@ def _fit_kmeans_sine(context):
     cv2.setRNGSeed(31003)
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
                 60, 0.25)
-    _, labels, _ = cv2.kmeans(
+    _, labels, centers = cv2.kmeans(
         samples, 3, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
     labels = labels.reshape(colour_band.shape[:2])
 
@@ -1326,6 +1326,17 @@ def _fit_kmeans_sine(context):
             'start': start, 'stop': stop,
         }
 
+    cluster_curves = np.full((3, len(positions)), np.nan, dtype=float)
+    for selected_label in range(3):
+        selected = labels == selected_label
+        runs = selected[:-2] & selected[1:-1] & selected[2:]
+        for column_index in range(runs.shape[1]):
+            starts = np.flatnonzero(runs[:, column_index])
+            if starts.size:
+                cluster_curves[selected_label, column_index] = float(
+                    n0 + starts[0]
+                )
+
     best = None
     widths = sorted(set(
         max(90, min(len(positions), int(round(len(positions) * fraction))))
@@ -1333,13 +1344,7 @@ def _fit_kmeans_sine(context):
     ))
     period_grid = np.arange(np.ceil(min_pitch), np.floor(max_pitch) + 1, 1.0)
     for selected_label in range(3):
-        curve = np.full(len(positions), np.nan, dtype=float)
-        selected = labels == selected_label
-        runs = selected[:-2] & selected[1:-1] & selected[2:]
-        for column_index in range(runs.shape[1]):
-            starts = np.flatnonzero(runs[:, column_index])
-            if starts.size:
-                curve[column_index] = float(n0 + starts[0])
+        curve = cluster_curves[selected_label]
         for width in widths:
             step = max(10, width // 6)
             starts = list(range(0, len(curve) - width + 1, step))
@@ -1358,6 +1363,8 @@ def _fit_kmeans_sine(context):
                         continue
                     candidate = evaluate(
                         x, y, start, stop, float(period))
+                    if candidate is not None:
+                        candidate['selected_label'] = selected_label
                     if (candidate is not None
                             and (best is None
                                  or candidate['score'] > best['score'])):
@@ -1377,7 +1384,13 @@ def _fit_kmeans_sine(context):
             best['x'], best['y'], best['start'], best['stop'],
             float(period), best['inliers'])
         if candidate is not None and candidate['score'] > refined['score']:
+            candidate['selected_label'] = best['selected_label']
             refined = candidate
+    refined['selected_label'] = best['selected_label']
+    refined['cluster_curves'] = cluster_curves
+    refined['cluster_labels'] = labels
+    refined['cluster_centers_lab'] = centers.copy()
+    refined['cluster_n0'] = int(n0)
     return refined
 
 
@@ -1467,11 +1480,13 @@ def recover_side_by_periodic_attenuation(side, sides, contexts):
                     )
                     if best is None or score > best[0]:
                         best = (score, seeds, local_depth, fits, attenuated,
-                                slope, intercept - band0, amplitude)
+                                attenuation, slope, intercept - band0,
+                                amplitude, phase)
 
     if best is None or best[0][0] < 5:
         return None
-    _, seeds, local_depth, fits, attenuated, slope, local_intercept, amplitude = best
+    (_, seeds, local_depth, fits, attenuated, attenuation, slope,
+     local_intercept, amplitude, selected_phase) = best
     edge = {
         'status': 'review',
         'reason': 'recovered by self-fitted k=3 sinusoidal attenuation',
@@ -1491,6 +1506,41 @@ def recover_side_by_periodic_attenuation(side, sides, contexts):
             or abs(edge['pitch_px'] / pitch - 1) > 0.08
             or circular_arc_count(edge) < 5):
         return None
+
+    if context.get('collect_debug'):
+        edge['debug_sinusoidal_attenuation'] = {
+            'band0': int(band0),
+            'period': float(pitch),
+            'phase': float(selected_phase),
+            'amplitude': float(amplitude),
+            'slope': float(slope),
+            'intercept': float(local_intercept),
+            'positions': positions.copy(),
+            'base_signal': base_signal[:, columns].copy(),
+            'attenuation': attenuation.copy(),
+            'attenuated_signal': attenuated[:, columns].copy(),
+            'sine_depth': local_depth.copy(),
+            'kmeans_x': np.asarray(
+                sine_fit.get('x', []), dtype=float,
+            ).copy(),
+            'kmeans_y': (np.asarray(
+                sine_fit.get('y', []), dtype=float,
+            ) - band0),
+            'kmeans_inliers': np.asarray(
+                sine_fit.get('inliers', []), dtype=bool,
+            ).copy(),
+            'cluster_curves': np.asarray(
+                sine_fit.get('cluster_curves', []), dtype=float,
+            ).copy(),
+            'selected_cluster': int(sine_fit.get('selected_label', -1)),
+            'cluster_labels': np.asarray(
+                sine_fit.get('cluster_labels', []), dtype=np.uint8,
+            ).copy(),
+            'cluster_centers_lab': np.asarray(
+                sine_fit.get('cluster_centers_lab', []), dtype=np.float32,
+            ).copy(),
+            'cluster_n0': int(sine_fit.get('cluster_n0', band0)),
+        }
 
     # Convert the normal coordinate back from the cropped search band into the
     # complete oriented side image used by add_edge_image_geometry().
@@ -1534,6 +1584,8 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
     sides = {}
     contexts = {}
     algorithm_trials = {side: {} for side in SIDES} if collect_trials else None
+    debug_algorithm_edges = ({side: {} for side in SIDES}
+                             if collect_trials else None)
     for side in SIDES:
         brightness_started = time.perf_counter()
         vertical = side in ('left', 'right')
@@ -1563,12 +1615,14 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
             'work_shape': work.shape,
             'normal_search': (n0, n1),
             'expected_normal': margin,
+            'collect_debug': collect_trials,
         }
         edge = measure_profile(positions, depth, min(width, height))
         edge['method'] = 'brightness'
         if 'valleys' in edge:
             refine_edge(edge, gray_work, positions, depth)
         if collect_trials:
+            debug_algorithm_edges[side]['brightness'] = copy.deepcopy(edge)
             algorithm_trials[side]['brightness'] = _algorithm_trial(
                 copy.deepcopy(edge), time.perf_counter() - brightness_started,
             )
@@ -1600,6 +1654,9 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
                     contexts[side]['recovery_depth'] = color_depth
                     contexts[side]['recovery_slope'] = adaptive.get('slope')
                 if collect_trials:
+                    debug_algorithm_edges[side]['adaptive_color'] = copy.deepcopy(
+                        adaptive
+                    )
                     algorithm_trials[side]['adaptive_color'] = _algorithm_trial(
                         copy.deepcopy(adaptive), time.perf_counter() - color_started,
                     )
@@ -1634,6 +1691,10 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
         for side in SIDES:
             recovery_started = time.perf_counter()
             recovered = recover_missing_side(side, baseline_sides, contexts)
+            if recovered is not None:
+                debug_algorithm_edges[side]['parallel_edge_recovery'] = (
+                    copy.deepcopy(recovered)
+                )
             algorithm_trials[side]['parallel_edge_recovery'] = _algorithm_trial(
                 recovered, time.perf_counter() - recovery_started,
                 None if recovered is not None
@@ -1643,6 +1704,10 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
             scanned = recover_side_by_parallel_scan(
                 side, baseline_sides, contexts,
             )
+            if scanned is not None:
+                debug_algorithm_edges[side]['parallel_normal_scan'] = (
+                    copy.deepcopy(scanned)
+                )
             algorithm_trials[side]['parallel_normal_scan'] = _algorithm_trial(
                 scanned, time.perf_counter() - scan_started,
                 None if scanned is not None else (
@@ -1664,6 +1729,10 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
                 attenuated, time.perf_counter() - attenuation_started,
                 attenuation_reason,
             )
+            if attenuated is not None:
+                debug_algorithm_edges[side]['sinusoidal_attenuation'] = (
+                    copy.deepcopy(attenuated)
+                )
 
     # Rebuild not only absent sides, but every side unsupported by five
     # magenta arc points and the weaker member of a non-parallel opposite pair.
@@ -1758,6 +1827,7 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
                 sides.get(side), 0.0,
             )
         result['algorithm_trials'] = algorithm_trials
+        result['debug_algorithm_edges'] = debug_algorithm_edges
     return result
 
 
