@@ -1,5 +1,4 @@
 """Geometry tests with known hole pitch, valley depth, rotation and damage."""
-import csv
 import json
 import tempfile
 import unittest
@@ -15,8 +14,7 @@ from perforation import (circular_arc_count, draw_measurement, fit_arc_lattice,
                          measure_stamp, refine_edge, refine_edge_from_arc_lattice,
                          recover_missing_side, recover_side_by_parallel_scan,
                          recover_side_by_periodic_attenuation,
-                         recovery_targets,
-                         save_measurements, measure_profile)
+                         recovery_targets, measure_profile)
 from segment_stamps import (average_perforation, summary_row, write_perf_json,
                             detect_stamps_2d, estimate_orientation,
                             perforation_label, reconcile_perforation,
@@ -144,22 +142,6 @@ class PerforationTests(unittest.TestCase):
         self.assertEqual(set(refined['orientation_inlier_sides']),
                          {'top', 'bottom', 'left'})
         self.assertNotIn('right', refined['orientation_inlier_sides'])
-
-    def test_exports_coordinates_and_scale(self):
-        result = self.sample()
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)/'perforation.csv'
-            save_measurements(path, [result], offset=np.array([100, 200]), dpi=1200)
-            with path.open(encoding='utf-8-sig') as stream:
-                row = next(csv.DictReader(stream))
-            self.assertAlmostEqual(float(row['top_per_20mm']), 20*1200/(25.4*28), delta=0.1)
-            self.assertAlmostEqual(float(row['valley_width_mm']), result['valley_width_px']*25.4/1200, places=3)
-            details = json.loads(path.with_suffix('.json').read_text())
-            point = details['stamps'][0]['sides']['top']['points'][0]
-            np.testing.assert_allclose(point, result['sides']['top']['points_image'][0]+[100, 200])
-            save_measurements(path, [result])
-            with path.open(encoding='utf-8-sig') as stream:
-                self.assertNotIn('valley_width_mm', next(csv.DictReader(stream)))
 
     def test_per_image_json_contains_summary_and_detailed_hole_ids(self):
         result = self.sample()

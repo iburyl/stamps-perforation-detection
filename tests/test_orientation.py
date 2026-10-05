@@ -1,4 +1,4 @@
-"""Deterministic geometry checks: python build/test_orientation.py."""
+"""Deterministic geometry checks: python -m unittest tests.test_orientation."""
 import unittest
 
 import cv2

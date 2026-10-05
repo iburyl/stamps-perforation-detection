@@ -1,4 +1,4 @@
-"""2-D detector regression checks: python build/test_detection.py."""
+"""2-D detector regression checks: python -m unittest tests.test_detection."""
 import unittest
 
 import cv2

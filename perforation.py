@@ -4,10 +4,7 @@ Only OpenCV and NumPy are required. No closing/dilation is applied to the
 measurement image. Pixel coordinates refer to the input image supplied by caller.
 """
 import copy
-import csv
-import json
 import time
-from pathlib import Path
 
 import cv2
 import numpy as np
@@ -106,12 +103,7 @@ def adaptive_color_edge(lab, gray, threshold, positions, n0, n1, short_size):
             stable.append((score, edge))
     if not stable:
         return None
-    edge = max(stable, key=lambda item: item[0])[1]
-    channel = 1 if edge['method'].endswith('_a') else 2
-    selected = ((region[:, :, channel] > edge['color_threshold']) if edge['color_polarity'] == 1
-                else (region[:, :, channel] < edge['color_threshold']))
-    edge['debug_mask'] = ((selected & light)*255).astype(np.uint8)
-    return edge
+    return max(stable, key=lambda item: item[0])[1]
 
 
 def robust_line(x, y, tolerance=2.0):
@@ -629,18 +621,6 @@ def side_to_patch(points, side, work_normal_size):
         normal = work_normal_size - 1 - normal
     if side in ('left', 'right'):
         return np.column_stack([normal, along])
-    return np.column_stack([along, normal])
-
-
-def patch_to_side(points, side, work_normal_size):
-    """Convert rectified patch x/y to side coordinates (along, inward)."""
-    points = np.asarray(points, dtype=float).reshape(-1, 2)
-    if side in ('left', 'right'):
-        along, normal = points[:, 1], points[:, 0]
-    else:
-        along, normal = points[:, 0], points[:, 1]
-    if side in ('bottom', 'right'):
-        normal = work_normal_size - 1 - normal
     return np.column_stack([along, normal])
 
 
@@ -1651,7 +1631,6 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
                     # but it can supply a cleaner signal and slope hypothesis
                     # to the later recovery, which still requires five circles.
                     contexts[side]['recovery_signal'] = color_signal
-                    contexts[side]['recovery_depth'] = color_depth
                     contexts[side]['recovery_slope'] = adaptive.get('slope')
                 if collect_trials:
                     debug_algorithm_edges[side]['adaptive_color'] = copy.deepcopy(
@@ -1857,66 +1836,3 @@ def draw_measurement(image, result, offset=(0, 0), thickness=2):
             cv2.circle(image, center, max(3, thickness*2), color, -1, cv2.LINE_AA)
         line = np.rint(edge['line_image']+offset).astype(int)
         cv2.line(image, tuple(line[0]), tuple(line[1]), (255, 220, 0), thickness, cv2.LINE_AA)
-
-
-def save_measurements(path, measurements, offset=(0, 0), dpi=None):
-    fields = ['stamp', 'valley_width_px', 'valley_height_px',
-              'width_variation_px', 'height_variation_px',
-              'width_edge_angle_difference_deg', 'height_edge_angle_difference_deg']
-    if dpi:
-        fields += ['valley_width_mm', 'valley_height_mm']
-    for side in SIDES:
-        fields += [f'{side}_{key}' for key in ('method', 'color_threshold', 'color_polarity', 'count', 'refined_count', 'pitch_px',
-                   'coverage', 'autocorrelation', 'spacing_rms_px', 'depth_rms_px')]
-        if dpi:
-            fields += [f'{side}_per_20mm']
-    details = []
-    with open(path, 'w', newline='', encoding='utf-8-sig') as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields)
-        writer.writeheader()
-        for number, result in enumerate(measurements, 1):
-            row = {'stamp': number, **{
-                key: value for key, value in result.items()
-                if key != 'sides' and key in fields
-            }}
-            if dpi:
-                for dim in ('width', 'height'):
-                    if f'valley_{dim}_px' in result:
-                        row[f'valley_{dim}_mm'] = result[f'valley_{dim}_px']*25.4/dpi
-            detail = {'stamp': number, 'sides': {}}
-            for name in SIDES:
-                edge = result['sides'].get(name, {'status': 'unavailable', 'reason': 'no orientation'})
-                for key, value in edge.items():
-                    if f'{name}_{key}' in fields:
-                        row[f'{name}_{key}'] = value
-                if dpi and 'pitch_px' in edge:
-                    row[f'{name}_per_20mm'] = 20*dpi/(25.4*edge['pitch_px'])
-                detail['sides'][name] = {
-                    'method': edge.get('method', 'unavailable')
-                }
-                if 'debug_mask' in edge:
-                    directory = Path(path).with_suffix('')
-                    directory = directory.with_name(directory.name + '_edge_masks')
-                    directory.mkdir(parents=True, exist_ok=True)
-                    mask_path = directory/f'stamp_{number:02}_{name}.png'
-                    if not cv2.imwrite(str(mask_path), edge['debug_mask']):
-                        raise RuntimeError(f'Cannot write {mask_path}')
-                    detail['sides'][name].update(color_threshold=edge['color_threshold'],
-                                               color_polarity=edge['color_polarity'],
-                                               mask=str(mask_path.resolve()),
-                                               mask_axes='x along edge; y inward toward stamp')
-                if 'points_image' in edge:
-                    detail['sides'][name].update(
-                        points=(edge['points_image']+offset).tolist(),
-                        initial_points=(edge['initial_points_image']+offset).tolist(),
-                        refinement=[None if fit is None else {
-                            'model': fit['model'], 'rms_px': fit['rms_px'],
-                            'curve': (fit['curve_image']+offset).tolist()
-                        } for fit in edge['refinement_fits']],
-                        accepted=edge['accepted'].tolist(),
-                        line=(edge['line_image']+offset).tolist())
-            writer.writerow({k: round(v, 4) if isinstance(v, float) else v for k, v in row.items()})
-            details.append(detail)
-    Path(path).with_suffix('.json').write_text(json.dumps(
-        {'coordinate_system': 'original image pixels; x right, y down',
-         'dpi': dpi, 'stamps': details}, ensure_ascii=False, indent=2), encoding='utf-8')
