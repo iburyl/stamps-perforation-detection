@@ -12,6 +12,48 @@ from refine_perforation import refine_valleys
 
 SIDES = ('top', 'bottom', 'left', 'right')
 
+# Which phase of the fallback ladder produced a side. This single table drives
+# the edge-line colour in the annotated scan, the ``phase`` field in the results
+# JSON, and the file-name prefix of the --stamp --side diagnostics, so a side's
+# provenance is visible without cross-referencing anything.
+METHOD_PHASES = {
+    'brightness': 1,
+    'adaptive_lab_a': 2,
+    'adaptive_lab_b': 2,
+    'parallel_edge_arc_recovery': 3,
+    'parallel_normal_scan_recovery': 3,
+    'sinusoidal_attenuation_recovery': 4,
+}
+PHASE_NAMES = {
+    0: 'stamp_localization',
+    1: 'brightness',
+    2: 'adaptive_colour',
+    3: 'geometric_recovery',
+    4: 'sinusoidal_attenuation',
+}
+PHASE_COLORS = {
+    1: (0, 190, 0),      # green: main method
+    2: (0, 255, 255),    # yellow: first fallback
+    3: (0, 165, 255),    # orange: second fallback
+    4: (0, 0, 255),      # red: last resort
+}
+# Phases 1 and 2 seed the arc search from the measured image boundary. Phases 3
+# and 4 seed it from a pitch hypothesis, so their arcs are constrained to agree
+# with that hypothesis and are not independent evidence of it.
+PHASE_SEED_SOURCES = {1: 'image', 2: 'image', 3: 'hypothesis', 4: 'hypothesis'}
+
+
+def method_phase(edge):
+    """Phase that produced the published edge, or None when none did."""
+    if 'line' not in edge:
+        return None
+    return METHOD_PHASES.get(edge.get('method'))
+
+
+def phase_color(phase):
+    """BGR colour for a phase; grey marks an unrecognised method."""
+    return PHASE_COLORS.get(phase, (180, 180, 180))
+
 
 def _algorithm_trial(edge, elapsed_seconds, reason=None):
     """Return a compact, JSON-friendly record for a shadow algorithm run."""
@@ -1835,4 +1877,7 @@ def draw_measurement(image, result, offset=(0, 0), thickness=2):
                 color = (0, 120, 255)
             cv2.circle(image, center, max(3, thickness*2), color, -1, cv2.LINE_AA)
         line = np.rint(edge['line_image']+offset).astype(int)
-        cv2.line(image, tuple(line[0]), tuple(line[1]), (255, 220, 0), thickness, cv2.LINE_AA)
+        # Green/yellow/orange/red encode phase 1..4, so a side measured by a
+        # late fallback is distinguishable from a cleanly measured one.
+        cv2.line(image, tuple(line[0]), tuple(line[1]),
+                 phase_color(method_phase(edge)), thickness, cv2.LINE_AA)

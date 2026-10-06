@@ -17,9 +17,31 @@ Outputs, written next to the input:
 | `scan_detected.jpg` | the scan with fitted edge lines, hole markers and a per-stamp gauge label |
 | `scan_perf.json` | every numeric result: per stamp, per side, per hole |
 
+`scan_detected.jpg` is the result meant to be read. Each edge line is coloured by the
+phase of the fallback ladder that produced it, so a side that needed a late fallback is
+visible without opening anything else:
+
+| colour | phase | method |
+| --- | --- | --- |
+| green | 1 — main method | `brightness` |
+| yellow | 2 — first fallback | `adaptive_lab_a` / `adaptive_lab_b` |
+| orange | 3 — second fallback | `parallel_edge_arc_recovery`, `parallel_normal_scan_recovery` |
+| red | 4 — last resort | `sinusoidal_attenuation_recovery` |
+| grey | — | no measurement on that side |
+
+The per-stamp gauge label takes the worst phase on the stamp, so a sheet can be triaged
+at a glance.
+
+`scan_perf.json` is written for the next processing stage and for agent-driven debugging.
+It is deliberately exhaustive and is not intended to be read by hand.
+
 Diagnostics for one stamp/side/hole are written to `scan_details/` when `--stamp`,
-`--side` and `--spot` are given. `--stamp` alone also records a shadow run of every
-algorithm (`algorithm_trials.json`) so the alternatives can be compared on one baseline.
+`--side` and `--spot` are given. Every file name starts with the phase that produced it
+(`0` for stamp localization and rectification, then `1`–`4` as above), so sorting the
+directory walks the algorithm in order, and a phase that did not run leaves no files.
+Each panel carries a banner naming its phase, its method, its status, and whether it was
+the one selected. `--stamp` alone also records a shadow run of every algorithm
+(`algorithm_trials.json`) so the alternatives can be compared on one baseline.
 
 ---
 
@@ -58,6 +80,9 @@ are reported as failures; see *Known limitations*.
 ---
 
 ## Algorithmic flow
+
+Stages 1–3 are the phase 0 localization common to every side; stages 4–7 are the phase 1
+main method; stage 8 is the phase 2–4 fallback ladder.
 
 ### 1. Scan-wide stamp detection — `detect_stamps_2d()`
 
@@ -182,25 +207,25 @@ If the brightness path did not reach five arcs, progressively more assumptive me
 tried. **Every one of them still has to produce five circular arcs.** See
 *Fallback characteristics* below for how much each is used and how much it shifts the answer.
 
-1. **`adaptive_lab_a` / `adaptive_lab_b`** — the paper/mount boundary is recovered from
+1. **`adaptive_lab_a` / `adaptive_lab_b`** *(phase 2, yellow)* — the paper/mount boundary is recovered from
    colour instead of brightness. Lab channel a or b, both polarities, and ~21 threshold
    levels are tried, restricted to the outer 7% of the stamp so the printed design is not
    mistaken for the edge. A candidate survives only if neighbouring thresholds (±3 levels)
    agree on pitch and line position. Intended for hinges and mounts that are nearly as
    bright as the paper.
 
-2. **`parallel_edge_arc_recovery`** — the side's line is reconstructed from the extreme
+2. **`parallel_edge_arc_recovery`** *(phase 3, orange)* — the side's line is reconstructed from the extreme
    confirmed arcs of the two adjacent sides (or one adjacent plus a reliable opposite side
    for the direction), then a lattice is seeded along it and arcs are fitted. A bounded
    search over candidate pitches, phases and normal offsets picks the hypothesis yielding
    the most circles.
 
-3. **`parallel_normal_scan_recovery`** — for the case where a bright scanner or background
+3. **`parallel_normal_scan_recovery`** *(phase 3, orange)* — for the case where a bright scanner or background
    strip sits outside the real stamp edge, so the first-light boundary is simply wrong. Using
    the reliable opposite side's pitch, lines are scanned inward in steps of 1/8 period across
    the whole search band, at two candidate slopes and four phases.
 
-4. **`sinusoidal_attenuation_recovery`** — the most assumptive path. A k=3 colour clustering
+4. **`sinusoidal_attenuation_recovery`** *(phase 4, red)* — the most assumptive path. A k=3 colour clustering
    of the edge band yields a boundary curve; a sinusoid is fitted to it over a search of
    cluster × window × period; the image signal above that sinusoid is then **attenuated**,
    and arcs are fitted to the modified signal.
@@ -273,11 +298,14 @@ Per-hole `category` in the JSON:
 | `ignored_perforation` | arc fitted but rejected (outlier, outside corner bounds) | hollow magenta |
 | `approximation` | no arc; a working seed only, contributes nothing | orange |
 
-Fitted edge lines are drawn in yellow.
+Fitted edge lines are drawn in the phase colour of the method that produced them.
 
-> **Note:** `status` and `reason` are currently *excluded* from `scan_perf.json`. The
-> published summary therefore does not indicate which sides were only `review`, nor which
-> method produced them without inspecting `measurement.sides.<side>.method`.
+Each side in `scan_perf.json` also carries `status`, `reason`, `phase`, `phase_name` and
+`seed_source`. The last of these records whether the arcs behind that side were searched
+for against the image (`image`, phases 1–2) or at positions predicted by a pitch
+hypothesis (`hypothesis`, phases 3–4). A consumer that needs independent evidence should
+filter on `seed_source == 'image'`, because `geometry_source` alone does not distinguish
+the two (see below).
 
 ---
 

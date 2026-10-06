@@ -10,8 +10,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from perforation import (SIDES, boundary_profile, draw_measurement,
-                         fit_extreme_arc_lattice, measure_stamp)
+from perforation import (PHASE_NAMES, PHASE_SEED_SOURCES, SIDES,
+                         boundary_profile, draw_measurement,
+                         fit_extreme_arc_lattice, measure_stamp, method_phase,
+                         phase_color)
 from refine_perforation import fit_arc, fit_parabola
 
 
@@ -603,12 +605,18 @@ def _hole_indices(edge):
 
 
 def measurement_details(measurement):
-    """Serialize all numeric results and give every attempted hole a stable id."""
+    """Serialize all numeric results and give every attempted hole a stable id.
+
+    This block is written for downstream aggregation and for agent-driven
+    debugging, not for direct human reading: ``status``, ``reason``, ``phase``
+    and ``seed_source`` are included so a consumer can tell which phase of the
+    fallback ladder produced each side and whether its arcs were seeded from
+    the image or from a pitch hypothesis.
+    """
     details = {
         key: _json_value(value)
         for key, value in measurement.items()
-        if key not in {'sides', 'status', 'reason'}
-        and not key.startswith('debug_')
+        if key != 'sides' and not key.startswith('debug_')
     }
     details['sides'] = {}
     for side in SIDES:
@@ -621,9 +629,13 @@ def measurement_details(measurement):
             if key not in {
                 'valleys', 'initial_valleys', 'points_image',
                 'initial_points_image', 'accepted', 'inside_corner_bounds',
-                'refinement_fits', 'status', 'reason',
+                'refinement_fits',
             } and not key.startswith('debug_')
         }
+        phase = method_phase(edge)
+        side_result['phase'] = phase
+        side_result['phase_name'] = PHASE_NAMES.get(phase)
+        side_result['seed_source'] = PHASE_SEED_SOURCES.get(phase)
         points = edge.get('points_image', np.empty((0, 2)))
         initial = edge.get('initial_points_image', points)
         accepted = edge.get('accepted', np.zeros(len(points), dtype=bool))
@@ -664,10 +676,9 @@ def measurement_details(measurement):
 def write_perf_json(path, input_path, boxes, orientations, measurements, dpi,
                     parameters, coarse_orientations=None):
     def public_orientation(value):
-        if value is None:
-            return None
-        return _json_value({key: item for key, item in value.items()
-                            if key != 'status'})
+        # ``status`` is retained: a weak angle consensus explains a weak
+        # measurement, and that link is wanted for automated debugging.
+        return None if value is None else _json_value(value)
 
     stamps = []
     for number, (box, orientation, measurement) in enumerate(
@@ -739,8 +750,14 @@ def _display_gray(values):
     return result.astype(np.uint8)
 
 
-def analysis_context(image, orientation, measurement, side, threshold):
-    """Rebuild the exact side-oriented arrays supplied to edge analysis."""
+def analysis_context(image, orientation, measurement, side, threshold,
+                     edge=None):
+    """Rebuild the exact side-oriented arrays supplied to edge analysis.
+
+    ``edge`` selects whose input signal is rebuilt and defaults to the side's
+    published edge. Pass a shadow-trial edge to inspect a phase that ran but
+    was not selected, or ``{}`` to force the plain brightness input.
+    """
     angle = np.deg2rad(orientation['angle_deg'])
     basis = np.array([[np.cos(angle), -np.sin(angle)],
                       [np.sin(angle), np.cos(angle)]])
@@ -771,7 +788,8 @@ def analysis_context(image, orientation, measurement, side, threshold):
     end = int(margin + along_length * 0.99)
     n0 = max(0, int(margin - normal_length * 0.055))
     n1 = min(work_binary.shape[0] - 3, int(margin + normal_length * 0.13))
-    edge = measurement.get('sides', {}).get(side, {})
+    if edge is None:
+        edge = measurement.get('sides', {}).get(side, {})
     signal = work_gray.astype(float)
     analysis_binary = work_binary
     if edge.get('method', '').startswith('adaptive_lab_'):
@@ -795,6 +813,16 @@ def analysis_context(image, orientation, measurement, side, threshold):
         'start': start, 'end': end, 'n0': n0, 'n1': n1,
         'edge': edge,
     }
+
+
+def _phase_banner(image, text, color):
+    """Prefix a panel with its phase, so a sheet of images is self-describing."""
+    scale, thickness = 0.62, 2
+    size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0]
+    bar = np.full((size[1] + 24, image.shape[1], 3), 245, np.uint8)
+    cv2.putText(bar, text, (12, size[1] + 11), cv2.FONT_HERSHEY_SIMPLEX,
+                scale, color, thickness, cv2.LINE_AA)
+    return np.vstack([bar, image])
 
 
 def _numbered_side_image(context):
@@ -1001,13 +1029,13 @@ def _message_image(lines, width=1200, height=360):
     return image
 
 
-def save_spot_diagnostics(directory, context, spot):
+def save_spot_diagnostics(directory, context, spot, prefix='spot'):
     edge = context['edge']
     seeds = edge.get('initial_valleys', edge.get('valleys', np.empty((0, 2))))
     order = _hole_indices(edge)
     if spot < 1 or spot > len(order):
         available = f'available identifiers: 1..{len(order)}' if len(order) else 'no hole candidates'
-        _write_image(directory / f'spot_{spot:02}_not_available.png', _message_image([
+        _write_image(directory / f'{prefix}_{spot:02}_not_available.png', _message_image([
             f'Hole candidate {spot} was not attempted on this side.', available,
             f"Side status: {edge.get('status', 'unavailable')}",
             f"Reason: {edge.get('reason', '')}",
@@ -1026,7 +1054,7 @@ def save_spot_diagnostics(directory, context, spot):
     positions, depth = context['positions'], context['depth']
     valid = np.isfinite(depth)
     if valid.sum() < 3:
-        _write_image(directory / f'spot_{spot:02}_insufficient_profile.png',
+        _write_image(directory / f'{prefix}_{spot:02}_insufficient_profile.png',
                      _message_image([f'Hole candidate {spot}', 'Insufficient boundary profile.']))
         return
     prior = np.interp(positions, positions[valid], depth[valid])
@@ -1102,7 +1130,7 @@ def save_spot_diagnostics(directory, context, spot):
         f'Initial seed s={seed[0]:.2f}, d={seed[1]:.2f}; pitch={pitch:.2f}px',
         'Orange: working approximation; magenta: accepted circle; hollow magenta: ignored circle.',
     ], width=sheet.shape[1], height=190)
-    _write_image(directory / f'spot_{spot:02}_all_search_windows.png',
+    _write_image(directory / f'{prefix}_{spot:02}_all_search_windows.png',
                  np.vstack([header, sheet]))
     gx0 = max(0, int(seed[0] - pitch))
     gx1 = min(gradient.shape[1], int(seed[0] + pitch) + 1)
@@ -1110,7 +1138,7 @@ def save_spot_diagnostics(directory, context, spot):
     gy1 = min(gradient.shape[0], int(seed[1] + pitch * 0.6) + 1)
     heat = cv2.applyColorMap(_display_gray(gradient[gy0:gy1, gx0:gx1]), cv2.COLORMAP_TURBO)
     heat = cv2.resize(heat, None, fx=5, fy=5, interpolation=cv2.INTER_NEAREST)
-    _write_image(directory / f'spot_{spot:02}_normal_gradient.png', heat)
+    _write_image(directory / f'{prefix}_{spot:02}_normal_gradient.png', heat)
 
 
 def _stage_outline_image(image, box, stamp_number, orientation=None):
@@ -1210,56 +1238,108 @@ def _stage_outline_image(image, box, stamp_number, orientation=None):
     return result
 
 
+def _side_input_panels(context):
+    """The grey/colour signal and the threshold mask actually fed to a phase."""
+    start, end, n0, n1 = (context[key] for key in ('start', 'end', 'n0', 'n1'))
+    return (_display_gray(context['signal'][n0:n1 + 3, start:end]),
+            context['binary'][n0:n1 + 3, start:end] * 255)
+
+
 def save_details(directory, image, box, stamp_number, coarse_orientation,
                  orientation, measurement, side, threshold, spot=None):
+    """Write diagnostic images for one stamp side, grouped by algorithm phase.
+
+    Every file name starts with the phase that produced it, so sorting the
+    directory walks the algorithm in order:
+
+        0  stamp localization and rectification
+        1  brightness (green on the annotated scan)
+        2  adaptive colour, first fallback (yellow)
+        3  geometric recovery, second fallback (orange)
+        4  sinusoidal attenuation, last resort (red)
+
+    A phase that did not run for this side leaves no images, so the set of
+    files present is itself a record of how far the ladder was climbed. Each
+    panel is banner-labelled with its phase and whether it was selected.
+    """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    for filename in (
-        '04_holes_numbered.png', '05_boundary_profile.png',
-        '04_boundary_profile.png', '05_holes_numbered.png',
-        '04_brightness_profile.png', '05_brightness_holes_numbered.png',
-        '06_k3_sinusoid.png', '06_k3_clusters_sinusoid.png',
-        '07_attenuation_mask.png',
-        '08_attenuated_signal.png', '09_attenuated_holes_numbered.png',
-        '10_algorithm_trials.png',
-    ):
-        (directory / filename).unlink(missing_ok=True)
-    _write_image(directory / '00_detection_bbox.png',
-                 _stage_outline_image(image, box, stamp_number))
-    _write_image(directory / '00_orientation_coarse.png',
-                 _stage_outline_image(image, box, stamp_number,
-                                      coarse_orientation))
-    _write_image(directory / '00_orientation_refined.png',
-                 _stage_outline_image(image, box, stamp_number, orientation))
-    context = analysis_context(image, orientation, measurement, side, threshold)
-    numbered = _numbered_side_image(context)
-    trial_edges = measurement.get('debug_algorithm_edges', {}).get(side, {})
-    brightness_context = dict(context)
-    brightness_context['edge'] = trial_edges.get('brightness', context['edge'])
-    brightness_numbered = _numbered_side_image(brightness_context)
-    if context['edge'].get('method') == 'parallel_normal_scan_recovery':
-        _write_image(directory / '06_parallel_scan_recovery.png', numbered)
-    _write_image(directory / '01_rectified_stamp.png', context['patch'])
-    start, end, n0, n1 = (context[key] for key in ('start', 'end', 'n0', 'n1'))
-    signal = _display_gray(context['signal'][n0:n1 + 3, start:end])
-    _write_image(directory / '02_side_analysis_input.png', signal)
-    _write_image(directory / '03_side_threshold_input.png',
-                 context['binary'][n0:n1 + 3, start:end] * 255)
-    _write_image(directory / '04_brightness_profile.png',
-                 _profile_image(brightness_context))
-    _write_image(directory / '05_brightness_holes_numbered.png',
-                 brightness_numbered)
-    sine_images = _sinusoidal_detail_images(context['edge'])
+    trials = measurement.get('debug_algorithm_edges', {}).get(side, {})
+    selected = measurement.get('sides', {}).get(side, {})
+    selected_phase = method_phase(selected)
+
+    def banner(phase, edge):
+        mark = ('SELECTED' if phase == selected_phase and
+                edge.get('method') == selected.get('method') else 'not selected')
+        return (f'PHASE {phase} - {PHASE_NAMES[phase]}'
+                f" - {edge.get('method', 'n/a')} - {mark}"
+                f" - status={edge.get('status', 'unavailable')}")
+
+    def write(phase, name, panel, edge=None):
+        if edge is not None and panel.ndim == 3:
+            panel = _phase_banner(panel, banner(phase, edge), phase_color(phase))
+        _write_image(directory / f'{phase}_{name}.png', panel)
+
+    # Phase 0: where the stamp is and how it was rectified.
+    write(0, 'detection_bbox', _stage_outline_image(image, box, stamp_number))
+    write(0, 'orientation_coarse',
+          _stage_outline_image(image, box, stamp_number, coarse_orientation))
+    write(0, 'orientation_refined',
+          _stage_outline_image(image, box, stamp_number, orientation))
+    gray_context = analysis_context(image, orientation, measurement, side,
+                                    threshold, edge={})
+    write(0, 'rectified_stamp', gray_context['patch'])
+
+    # Phase 1: brightness, the only path whose seeds come from an unmodified
+    # grey profile.
+    brightness = dict(gray_context, edge=trials.get('brightness', selected))
+    signal, mask = _side_input_panels(brightness)
+    write(1, 'input_gray', signal)
+    write(1, 'input_threshold', mask)
+    write(1, 'brightness_profile', _profile_image(brightness),
+          brightness['edge'])
+    write(1, 'holes_numbered', _numbered_side_image(brightness),
+          brightness['edge'])
+
+    # Phase 2: adaptive Lab colour boundary, still image-seeded.
+    colour_edge = trials.get('adaptive_color')
+    if colour_edge and 'color_threshold' in colour_edge:
+        colour = analysis_context(image, orientation, measurement, side,
+                                  threshold, edge=colour_edge)
+        colour['edge'] = colour_edge
+        signal, mask = _side_input_panels(colour)
+        write(2, 'input_colour', signal)
+        write(2, 'input_threshold', mask)
+        write(2, 'colour_profile', _profile_image(colour), colour_edge)
+        write(2, 'holes_numbered', _numbered_side_image(colour), colour_edge)
+
+    # Phase 3: geometric reconstruction from neighbouring sides. Both variants
+    # are recorded when both ran, since they are tried in order.
+    for name, key in (('edge_recovery', 'parallel_edge_recovery'),
+                      ('normal_scan', 'parallel_normal_scan')):
+        recovery_edge = trials.get(key)
+        if not recovery_edge:
+            continue
+        recovery = dict(gray_context, edge=recovery_edge)
+        write(3, f'{name}_holes_numbered', _numbered_side_image(recovery),
+              recovery_edge)
+
+    # Phase 4: the sinusoidal attenuation last resort, which is the only path
+    # that modifies the signal it then measures.
+    sine_edge = trials.get('sinusoidal_attenuation', selected)
+    sine_images = _sinusoidal_detail_images(sine_edge)
     if sine_images is not None:
-        _write_image(directory / '06_k3_clusters_sinusoid.png',
-                     sine_images['sine'])
-        _write_image(directory / '07_attenuation_mask.png', sine_images['mask'])
-        _write_image(directory / '08_attenuated_signal.png',
-                     sine_images['attenuated'])
-        _write_image(directory / '09_attenuated_holes_numbered.png',
-                     sine_images['holes'])
+        write(4, 'k3_clusters_sinusoid', sine_images['sine'], sine_edge)
+        write(4, 'attenuation_mask', sine_images['mask'], sine_edge)
+        write(4, 'attenuated_signal', sine_images['attenuated'], sine_edge)
+        write(4, 'holes_numbered', sine_images['holes'], sine_edge)
+
     if spot is not None:
-        save_spot_diagnostics(directory, context, spot)
+        # Drill into one hole of whichever phase was actually selected.
+        context = analysis_context(image, orientation, measurement, side,
+                                   threshold)
+        save_spot_diagnostics(directory, context, spot,
+                              prefix=f'{selected_phase or 1}_spot')
 
 
 def save_stamp_trial_details(directory, image, box, stamp_number,
@@ -1268,12 +1348,12 @@ def save_stamp_trial_details(directory, image, box, stamp_number,
     """Save compact diagnostics for a selected stamp without normal outputs."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    _write_image(directory / '00_detection_bbox.png',
+    _write_image(directory / '0_detection_bbox.png',
                  _stage_outline_image(image, box, stamp_number))
-    _write_image(directory / '00_orientation_coarse.png',
+    _write_image(directory / '0_orientation_coarse.png',
                  _stage_outline_image(image, box, stamp_number,
                                       coarse_orientation))
-    _write_image(directory / '00_orientation_refined.png',
+    _write_image(directory / '0_orientation_refined.png',
                  _stage_outline_image(image, box, stamp_number, orientation))
     trials = measurement.get('algorithm_trials', {})
     payload = {
@@ -1282,6 +1362,11 @@ def save_stamp_trial_details(directory, image, box, stamp_number,
         'coarse_orientation': _json_value(coarse_orientation),
         'refined_orientation': _json_value(orientation),
         'measurement_status': measurement.get('status'),
+        'selected_phase': {
+            name: method_phase(edge)
+            for name, edge in measurement.get('sides', {}).items()
+            if side is None or name == side
+        },
         'algorithm_trials': (
             {side: trials.get(side, {})} if side is not None else trials
         ),
@@ -1530,7 +1615,9 @@ def main():
     )
 
     #
-    # Red = stamps.
+    # Edge lines and the stamp label are coloured by phase: green for the main
+    # method through red for the last resort.  The label takes the worst phase
+    # on the stamp, so a sheet can be triaged without zooming in.
     #
 
     for i, (
@@ -1553,6 +1640,15 @@ def main():
             y0 - thickness * 3,
         )
 
+        phases = [
+            method_phase(edge)
+            for edge in measurements[i - 1].get('sides', {}).values()
+        ]
+        measured = [phase for phase in phases if phase is not None]
+        # A side that produced nothing is worse than any fallback that did.
+        label_color = (phase_color(max(measured)) if measured
+                       and len(measured) == len(phases) else (180, 180, 180))
+
         label = f"{i}: {perforation_label(measurements[i - 1], args.dpi)}"
         # Keep labels inside each stamp's horizontal allocation.
         label_width = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0][0]
@@ -1566,7 +1662,7 @@ def main():
             ),
             cv2.FONT_HERSHEY_SIMPLEX,
             label_scale,
-            (0, 0, 255),
+            label_color,
             thickness,
             cv2.LINE_AA,
         )
