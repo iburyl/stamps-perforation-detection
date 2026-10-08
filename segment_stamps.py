@@ -10,6 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from edge_profiles import profile_depth
 from perforation import (PHASE_NAMES, PHASE_SEED_SOURCES, SIDES,
                          boundary_profile, draw_measurement,
                          fit_extreme_arc_lattice, measure_stamp, method_phase,
@@ -756,7 +757,7 @@ def analysis_context(image, orientation, measurement, side, threshold,
 
     ``edge`` selects whose input signal is rebuilt and defaults to the side's
     published edge. Pass a shadow-trial edge to inspect a phase that ran but
-    was not selected, or ``{}`` to force the plain brightness input.
+    was not selected, or ``{}`` to force the raw threshold input.
     """
     angle = np.deg2rad(orientation['angle_deg'])
     basis = np.array([[np.cos(angle), -np.sin(angle)],
@@ -792,7 +793,11 @@ def analysis_context(image, orientation, measurement, side, threshold,
         edge = measurement.get('sides', {}).get(side, {})
     signal = work_gray.astype(float)
     analysis_binary = work_binary
-    if edge.get('method', '').startswith('adaptive_lab_'):
+    if (edge.get('method') == 'cross_support'
+            and edge.get('debug_mask_band') is not None):
+        analysis_binary = np.zeros_like(work_binary)
+        analysis_binary[n0:n1 + 3, start:end] = edge['debug_mask_band']
+    elif edge.get('method', '').startswith('adaptive_lab_'):
         lab = cv2.cvtColor(cv2.GaussianBlur(patch, (5, 5), 1.0), cv2.COLOR_BGR2LAB)
         color_work = lab.transpose(1, 0, 2) if vertical else lab
         if flipped:
@@ -803,7 +808,13 @@ def analysis_context(image, orientation, measurement, side, threshold,
         analysis_binary = ((signal > edge['color_threshold'] * polarity)
                            & (work_gray > threshold)).astype(np.uint8)
         n1 = min(n1, int(margin + normal_length * 0.07))
-    depth = boundary_profile(analysis_binary, n0, n1, start, end)
+    if edge.get('method') == 'cross_support' and edge.get('profile_ridge'):
+        depth = profile_depth(
+            analysis_binary[n0:n1 + 3, start:end], n0,
+            edge['profile_ridge'],
+        )
+    else:
+        depth = boundary_profile(analysis_binary, n0, n1, start, end)
     return {
         'patch': patch,
         'signal': signal,
@@ -907,117 +918,6 @@ def _profile_image(context):
                 (margin, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (30, 30, 30), 2,
                 cv2.LINE_AA)
     return canvas
-
-
-def _sinusoidal_detail_images(edge):
-    """Render the actual signal, sinusoid and attenuation used by k=3 recovery."""
-    debug = edge.get('debug_sinusoidal_attenuation')
-    if not debug:
-        return None
-    positions = np.asarray(debug['positions'], dtype=float)
-    base = np.asarray(debug['base_signal'], dtype=np.float32)
-    attenuation = np.asarray(debug['attenuation'], dtype=np.float32)
-    attenuated = np.asarray(debug['attenuated_signal'], dtype=np.float32)
-    sine = np.asarray(debug['sine_depth'], dtype=float)
-    if (base.ndim != 2 or base.shape != attenuation.shape
-            or base.shape != attenuated.shape or len(positions) != base.shape[1]
-            or len(sine) != len(positions)):
-        return None
-
-    scale = max(1.0, 1800 / max(1, base.shape[1]))
-    def shown_gray(values):
-        gray = _display_gray(values)
-        return cv2.resize(gray, None, fx=scale, fy=scale,
-                          interpolation=cv2.INTER_CUBIC)
-
-    def project(x, y):
-        return (int(round((x - positions[0]) * scale)),
-                int(round(y * scale)))
-
-    cluster_labels = np.asarray(debug.get('cluster_labels', []), dtype=np.uint8)
-    if cluster_labels.ndim != 2 or cluster_labels.shape[1] != len(positions):
-        return None
-    cluster_centers_lab = np.asarray(
-        debug.get('cluster_centers_lab', []), dtype=np.float32,
-    )
-    if cluster_centers_lab.shape != (3, 3):
-        return None
-    centers_lab_image = np.clip(
-        np.rint(cluster_centers_lab), 0, 255,
-    ).astype(np.uint8).reshape(1, 3, 3)
-    cluster_colors = cv2.cvtColor(
-        centers_lab_image, cv2.COLOR_LAB2BGR,
-    ).reshape(3, 3)
-    sine_image = cv2.resize(
-        cluster_colors[cluster_labels], None, fx=scale, fy=scale,
-        interpolation=cv2.INTER_NEAREST,
-    )
-    cluster_offset = float(debug['cluster_n0']) - float(debug['band0'])
-    cluster_sine = sine - cluster_offset
-    def project_cluster(x, y):
-        return (int(round((x - positions[0]) * scale)),
-                int(round(y * scale)))
-    for first, second in zip(zip(positions[:-1], cluster_sine[:-1]),
-                             zip(positions[1:], cluster_sine[1:])):
-        cv2.line(sine_image, project_cluster(*first), project_cluster(*second),
-                 (255, 255, 0), 2, cv2.LINE_AA)
-    label = (f"k=3 sine: period={debug['period']:.1f}px  "
-             f"amplitude={debug['amplitude']:.1f}px  "
-             f"clusters: Lab centroid colours; selected="
-             f"{debug.get('selected_cluster', '?')}")
-    cv2.rectangle(sine_image, (0, 0),
-                  (min(sine_image.shape[1] - 1, 1050), 34),
-                  (245, 245, 245), -1)
-    cv2.putText(sine_image, label, (10, 24), cv2.FONT_HERSHEY_SIMPLEX,
-                0.62, (20, 20, 20), 1, cv2.LINE_AA)
-
-    mask_image = cv2.cvtColor(
-        cv2.resize(np.uint8(np.clip(attenuation, 0, 1) * 255), None,
-                   fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST),
-        cv2.COLOR_GRAY2BGR,
-    )
-    for first, second in zip(zip(positions[:-1], sine[:-1]),
-                             zip(positions[1:], sine[1:])):
-        cv2.line(mask_image, project(*first), project(*second),
-                 (255, 220, 0), 2, cv2.LINE_AA)
-
-    attenuated_image = cv2.cvtColor(
-        shown_gray(attenuated), cv2.COLOR_GRAY2BGR,
-    )
-    holes_image = attenuated_image.copy()
-    band0 = float(debug['band0'])
-    points = np.asarray(edge.get('valleys', []), dtype=float).reshape(-1, 2)
-    initial = np.asarray(edge.get('initial_valleys', points),
-                         dtype=float).reshape(-1, 2)
-    accepted = np.asarray(edge.get('accepted', []), dtype=bool)
-    fits = edge.get('refinement_fits', [])
-    for public_id, index in enumerate(_hole_indices(edge), 1):
-        point = points[index] if index < len(points) else initial[index]
-        fit = fits[index] if index < len(fits) else None
-        is_accepted = bool(accepted[index]) if index < len(accepted) else False
-        if fit is not None and fit.get('model') == 'circle':
-            curve = np.asarray(fit.get('curve', []), dtype=float).reshape(-1, 2)
-            for first, second in zip(curve[:-1], curve[1:]):
-                cv2.line(holes_image,
-                         project(first[0], first[1] - band0),
-                         project(second[0], second[1] - band0),
-                         (255, 0, 255), 2, cv2.LINE_AA)
-            color = (255, 0, 255)
-        else:
-            color = (0, 120, 255)
-        center = project(point[0], point[1] - band0)
-        cv2.circle(holes_image, center, 7, color,
-                   -1 if is_accepted or fit is None else 2, cv2.LINE_AA)
-        cv2.putText(holes_image, str(public_id),
-                    (center[0] + 8, max(18, center[1] - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
-
-    return {
-        'sine': sine_image,
-        'mask': mask_image,
-        'attenuated': attenuated_image,
-        'holes': holes_image,
-    }
 
 
 def _message_image(lines, width=1200, height=360):
@@ -1253,10 +1153,10 @@ def save_details(directory, image, box, stamp_number, coarse_orientation,
     directory walks the algorithm in order:
 
         0  stamp localization and rectification
-        1  brightness (green on the annotated scan)
+        1  one-pass cross-support (green on the annotated scan)
         2  adaptive colour, first fallback (yellow)
         3  geometric recovery, second fallback (orange)
-        4  sinusoidal attenuation, last resort (red)
+        4  sequential k=3/4 Lab arc fitting, last resort (red)
 
     A phase that did not run for this side leaves no images, so the set of
     files present is itself a record of how far the ladder was climbed. Each
@@ -1290,16 +1190,17 @@ def save_details(directory, image, box, stamp_number, coarse_orientation,
                                     threshold, edge={})
     write(0, 'rectified_stamp', gray_context['patch'])
 
-    # Phase 1: brightness, the only path whose seeds come from an unmodified
-    # grey profile.
-    brightness = dict(gray_context, edge=trials.get('brightness', selected))
-    signal, mask = _side_input_panels(brightness)
+    # Phase 1: fourteen cheap profiles select one binary boundary, followed by
+    # the primary method's only greyscale arc pass.
+    primary_edge = trials.get('cross_support', selected)
+    primary = analysis_context(image, orientation, measurement, side,
+                               threshold, edge=primary_edge)
+    primary['edge'] = primary_edge
+    signal, mask = _side_input_panels(primary)
     write(1, 'input_gray', signal)
-    write(1, 'input_threshold', mask)
-    write(1, 'brightness_profile', _profile_image(brightness),
-          brightness['edge'])
-    write(1, 'holes_numbered', _numbered_side_image(brightness),
-          brightness['edge'])
+    write(1, 'selected_binary_map', mask)
+    write(1, 'cross_support_profile', _profile_image(primary), primary_edge)
+    write(1, 'holes_numbered', _numbered_side_image(primary), primary_edge)
 
     # Phase 2: adaptive Lab colour boundary, still image-seeded.
     colour_edge = trials.get('adaptive_color')
@@ -1324,15 +1225,13 @@ def save_details(directory, image, box, stamp_number, coarse_orientation,
         write(3, f'{name}_holes_numbered', _numbered_side_image(recovery),
               recovery_edge)
 
-    # Phase 4: the sinusoidal attenuation last resort, which is the only path
-    # that modifies the signal it then measures.
-    sine_edge = trials.get('sinusoidal_attenuation', selected)
-    sine_images = _sinusoidal_detail_images(sine_edge)
-    if sine_images is not None:
-        write(4, 'k3_clusters_sinusoid', sine_images['sine'], sine_edge)
-        write(4, 'attenuation_mask', sine_images['mask'], sine_edge)
-        write(4, 'attenuated_signal', sine_images['attenuated'], sine_edge)
-        write(4, 'holes_numbered', sine_images['holes'], sine_edge)
+    # Phase 4: sequential k=3/4 profiles, with each candidate fitted in Lab
+    # L/a/b order until five post-corner circular arcs survive.
+    sequential_edge = trials.get('sequential_kmeans_lab')
+    if sequential_edge:
+        sequential = dict(gray_context, edge=sequential_edge)
+        write(4, 'sequential_kmeans_lab_holes_numbered',
+              _numbered_side_image(sequential), sequential_edge)
 
     if spot is not None:
         # Drill into one hole of whichever phase was actually selected.

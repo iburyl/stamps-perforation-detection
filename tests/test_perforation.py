@@ -13,17 +13,17 @@ from perforation import (circular_arc_count, draw_measurement, fit_arc_lattice,
                          exclude_points_outside_corners,
                          measure_stamp, refine_edge, refine_edge_from_arc_lattice,
                          recover_missing_side, recover_side_by_parallel_scan,
-                         recover_side_by_periodic_attenuation,
-                         recovery_targets, measure_profile)
+                         recover_side_by_sequential_kmeans_lab,
+                         recovery_targets, measure_profile,
+                         select_cross_support_candidate)
 from segment_stamps import (average_perforation, summary_row, write_perf_json,
-                            detect_stamps_2d, estimate_orientation,
                             perforation_label, reconcile_perforation,
                             refine_orientation_from_measurement)
 
 
 class PerforationTests(unittest.TestCase):
     def sample(self, angle=0, damaged=False, perforated=True, hinge=False,
-               paper_color=(125, 180, 200)):
+               paper_color=(125, 180, 200), collect_trials=False):
         mask = np.zeros((900, 900), np.uint8)
         cv2.rectangle(mask, (250, 170), (650, 730), 255, -1)
         if perforated:
@@ -52,7 +52,48 @@ class PerforationTests(unittest.TestCase):
                                    borderMode=cv2.BORDER_CONSTANT, borderValue=(30, 30, 30))
         orientation = dict(angle_deg=angle, width_px=400., height_px=560.,
                            center_x=450., center_y=450.)
-        return measure_stamp(image, orientation, 100)
+        return measure_stamp(
+            image, orientation, 100, collect_trials=collect_trials,
+        )
+
+    def test_diagnostic_run_forces_last_fallback_and_records_it(self):
+        forced_trial = {
+            'status': 'review',
+            'reason': 'forced diagnostic trial',
+            'method': 'sequential_kmeans_lab',
+            'slope': 0.,
+            'intercept': 10.,
+            'pitch_px': 20.,
+            'geometry_source': 'circle_arcs',
+            'refinement_fits': [
+                {'model': 'circle', 'rms_px': .1} for _ in range(5)
+            ],
+        }
+        with (patch('perforation.recover_missing_side', return_value=None),
+              patch('perforation.recover_side_by_parallel_scan',
+                    return_value=None),
+              patch('perforation.recover_side_by_sequential_kmeans_lab',
+                    return_value=forced_trial) as sequential):
+            result = self.sample(collect_trials=True)
+
+        self.assertGreaterEqual(sequential.call_count, 4)
+        for side in ('top', 'bottom', 'left', 'right'):
+            self.assertIn('cross_support', result['algorithm_trials'][side])
+            self.assertNotIn('brightness', result['algorithm_trials'][side])
+            primary = result['algorithm_trials'][side]['cross_support']
+            self.assertEqual(len(primary['profile_candidates']), 14)
+            self.assertIn(primary['profile_map'], {
+                'brightness', 'k30', 'k31',
+                'k400', 'k401', 'k410', 'k411',
+            })
+            trial = result['algorithm_trials'][side][
+                'sequential_kmeans_lab'
+            ]
+            self.assertEqual(
+                trial['method'], 'sequential_kmeans_lab',
+            )
+            self.assertEqual(trial['circular_arc_count'], 5)
+            self.assertTrue(trial['reliable'])
 
     def test_known_dimensions_pitch_and_rotation(self):
         for angle in (-6, 0, 5):
@@ -65,7 +106,42 @@ class PerforationTests(unittest.TestCase):
                     for side, pitch in [('top', 28), ('bottom', 28), ('left', 32), ('right', 32)]:
                         edge = result['sides'][side]
                         self.assertGreaterEqual(edge.get('count', 0), 5)
+                        self.assertEqual(edge['method'], 'cross_support')
                         self.assertAlmostEqual(edge['pitch_px'], pitch, delta=0.5)
+
+    def test_primary_method_runs_one_arc_pass_per_side(self):
+        with patch('perforation.refine_edge', wraps=refine_edge) as arc_pass:
+            result = self.sample()
+
+        self.assertEqual(arc_pass.call_count, 4)
+        self.assertEqual(
+            {edge['method'] for edge in result['sides'].values()},
+            {'cross_support'},
+        )
+
+    def test_cross_support_bonus_is_symmetric_and_pre_arc(self):
+        brightness = {
+            'map': 'brightness', 'score': 10.0, 'pitch_px': 64.0,
+            'line_center': 100.0,
+        }
+        kmeans = {
+            'map': 'k31', 'score': 9.5, 'pitch_px': 64.5,
+            'line_center': 103.0,
+        }
+        unsupported = {
+            'map': 'k400', 'score': 10.4, 'pitch_px': 32.0,
+            'line_center': 150.0,
+        }
+
+        chosen = select_cross_support_candidate(
+            [brightness, kmeans, unsupported],
+        )
+
+        self.assertIs(chosen, brightness)
+        self.assertTrue(brightness['cross_supported'])
+        self.assertTrue(kmeans['cross_supported'])
+        self.assertFalse(unsupported['cross_supported'])
+        self.assertAlmostEqual(brightness['adjusted_score'], 11.0)
 
     def test_straight_edges_not_perforation(self):
         result = self.sample(perforated=False)
@@ -78,8 +154,9 @@ class PerforationTests(unittest.TestCase):
                 with self.subTest(angle=angle, color=color):
                     result = self.sample(angle=angle, hinge=True, paper_color=color)
                     top = result['sides']['top']
-                    self.assertTrue(top['method'].startswith('adaptive_lab_'))
-                    self.assertEqual(top['status'], 'review')
+                    self.assertIn(top['method'], (
+                        'cross_support', 'adaptive_lab_a', 'adaptive_lab_b',
+                    ))
                     self.assertGreaterEqual(top['count'], 6)
                     self.assertAlmostEqual(top['pitch_px'], 28, delta=0.5)
                     self.assertAlmostEqual(result['valley_height_px'], 544, delta=3)
@@ -94,25 +171,25 @@ class PerforationTests(unittest.TestCase):
         result = self.sample(perforated=False, hinge=True)
         self.assertEqual(result['status'], 'unavailable')
 
-    def test_1k_stamp_3_right_hinge_falls_back_after_false_brightness_peaks(self):
-        path = Path(__file__).resolve().parent.parent / '1K.png'
-        if not path.exists():
-            self.skipTest('1K scan is not included')
+    def test_1k_stamp_3_right_hinge_uses_cross_support(self):
+        path = (Path(__file__).resolve().parent / 'fixtures'
+                / '1k_stamp_3_hinge.png')
         image = cv2.imread(str(path))
-        boxes, mask = detect_stamps_2d(image)
-        orientation = estimate_orientation(mask, boxes[2])
-        scale = min(1.0, 1500 / image.shape[1])
-        sample = cv2.resize(image, None, fx=scale, fy=scale,
-                            interpolation=cv2.INTER_AREA)
-        threshold = min(250, float(np.percentile(
-            cv2.cvtColor(sample, cv2.COLOR_BGR2GRAY), 10
-        )) + 35)
-        result = measure_stamp(image, orientation, threshold)
+        self.assertIsNotNone(image, f'missing test fixture: {path}')
+        orientation = {
+            'angle_deg': 0.3758811950683594,
+            'width_px': 923.7013009914681,
+            'height_px': 1209.7041932449097,
+            'center_x': 632.9213353648538,
+            'center_y': 778.5192327695399,
+        }
+        result = measure_stamp(image, orientation, 72.0)
         right = result['sides']['right']
-        self.assertTrue(right['method'].startswith('adaptive_lab_'))
+        self.assertEqual(right['method'], 'cross_support')
+        self.assertEqual(right['profile_map'], 'k400')
+        self.assertEqual(right['profile_ridge'], 'stack')
         self.assertGreaterEqual(circular_arc_count(right), 5)
         self.assertAlmostEqual(right['pitch_px'], 63.3, delta=1.0)
-        self.assertNotIn('pitch_px', result['sides']['top'])
 
     def test_empty_profile_and_no_orientation(self):
         self.assertEqual(measure_profile(np.arange(100), np.full(100, np.nan), 100)['status'], 'unavailable')
@@ -147,7 +224,10 @@ class PerforationTests(unittest.TestCase):
         result = self.sample()
         reconcile_perforation(result, ('top', 'bottom'), 1200)
         reconcile_perforation(result, ('left', 'right'), 1200)
-        with tempfile.TemporaryDirectory() as directory:
+        # The system TEMP can be read-only under a Windows sandbox. Keep the
+        # test hermetic by creating its disposable output beside the tests.
+        with tempfile.TemporaryDirectory(
+                dir=Path(__file__).resolve().parent) as directory:
             path = Path(directory) / 'scan_perf.json'
             orientation = dict(angle_deg=0., width_px=400., height_px=560.,
                                center_x=450., center_y=450., corners=np.zeros((4, 2)))
@@ -610,71 +690,6 @@ class PerforationTests(unittest.TestCase):
         self.assertIsNotNone(recovered)
         self.assertAlmostEqual(recovered['slope'], .03, places=4)
         self.assertGreaterEqual(circular_arc_count(recovered), 5)
-
-    def test_periodic_attenuation_uses_its_own_k3_period(self):
-        points = np.column_stack([
-            np.arange(20., 121., 20.), np.full(6, 10.),
-        ])
-        circles = [
-            {'point': point.copy(), 'curve': np.empty((0, 2)),
-             'model': 'circle', 'rms_px': .1}
-            for point in points
-        ]
-        unrelated_opposite = {
-            'status': 'ok', 'line': (0., 60.), 'pitch_px': 31.,
-            'amplitude_px': 3.2, 'geometry_source': 'circle_arcs',
-            'valleys': points, 'accepted': np.ones(len(points), bool),
-            'refinement_fits': circles,
-        }
-        positions = np.arange(10., 141.)
-        context = {
-            'positions': positions,
-            'signal': np.full((80, 150), 180., dtype=np.float32),
-            'depth': np.full(len(positions), 20.),
-            'normal_search': (5, 45), 'expected_normal': 20.,
-            'work_shape': (80, 150), 'collect_debug': True,
-        }
-        sides = {'top': {'status': 'unavailable'},
-                 'bottom': unrelated_opposite}
-
-        def fake_refinement(signal, positions, depth, seeds, pitch):
-            # The fallback must actually pass an attenuated signal.
-            self.assertLess(float(np.min(signal)), 1.0)
-            return [
-                {'point': seed.copy(), 'curve': np.empty((0, 2)),
-                 'model': 'circle', 'rms_px': .1}
-                for seed in seeds
-            ]
-
-        sine_fit = {
-            'period': 20., 'amplitude': 3.2, 'slope': 0.,
-            'intercept': 20., 'phase': 10.,
-            'cluster_curves': np.vstack([
-                np.full(len(positions), 12.),
-                np.full(len(positions), 20.),
-                np.full(len(positions), 28.),
-            ]),
-            'selected_label': 1,
-        }
-        with (patch('perforation._fit_kmeans_sine', return_value=sine_fit),
-              patch('perforation.refine_valleys', side_effect=fake_refinement)):
-            recovered = recover_side_by_periodic_attenuation(
-                'top', sides, {'top': context}
-            )
-
-        self.assertIsNotNone(recovered)
-        self.assertEqual(recovered['method'],
-                         'sinusoidal_attenuation_recovery')
-        self.assertAlmostEqual(recovered['pitch_px'], 20., delta=1.)
-        self.assertGreaterEqual(circular_arc_count(recovered), 5)
-        debug = recovered['debug_sinusoidal_attenuation']
-        self.assertEqual(debug['base_signal'].shape,
-                         debug['attenuated_signal'].shape)
-        self.assertEqual(debug['base_signal'].shape,
-                         debug['attenuation'].shape)
-        self.assertEqual(debug['base_signal'].shape[1], len(positions))
-        self.assertEqual(debug['cluster_curves'].shape, (3, len(positions)))
-        self.assertEqual(debug['selected_cluster'], 1)
 
     def test_arc_poor_and_nonparallel_sides_are_recovery_targets(self):
         def edge(count, slope=0., status='ok'):

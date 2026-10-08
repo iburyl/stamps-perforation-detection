@@ -4,10 +4,13 @@ Only OpenCV and NumPy are required. No closing/dilation is applied to the
 measurement image. Pixel coordinates refer to the input image supplied by caller.
 """
 import copy
+import itertools
+import math
 import time
 
 import cv2
 import numpy as np
+from edge_profiles import profile_depth
 from refine_perforation import refine_valleys
 
 SIDES = ('top', 'bottom', 'left', 'right')
@@ -17,19 +20,22 @@ SIDES = ('top', 'bottom', 'left', 'right')
 # JSON, and the file-name prefix of the --stamp --side diagnostics, so a side's
 # provenance is visible without cross-referencing anything.
 METHOD_PHASES = {
+    'cross_support': 1,
+    # Kept only so older saved fixtures remain readable. Production no longer
+    # runs or publishes a standalone brightness method.
     'brightness': 1,
     'adaptive_lab_a': 2,
     'adaptive_lab_b': 2,
     'parallel_edge_arc_recovery': 3,
     'parallel_normal_scan_recovery': 3,
-    'sinusoidal_attenuation_recovery': 4,
+    'sequential_kmeans_lab': 4,
 }
 PHASE_NAMES = {
     0: 'stamp_localization',
-    1: 'brightness',
+    1: 'cross_support',
     2: 'adaptive_colour',
     3: 'geometric_recovery',
-    4: 'sinusoidal_attenuation',
+    4: 'sequential_kmeans_lab',
 }
 PHASE_COLORS = {
     1: (0, 190, 0),      # green: main method
@@ -40,7 +46,12 @@ PHASE_COLORS = {
 # Phases 1 and 2 seed the arc search from the measured image boundary. Phases 3
 # and 4 seed it from a pitch hypothesis, so their arcs are constrained to agree
 # with that hypothesis and are not independent evidence of it.
-PHASE_SEED_SOURCES = {1: 'image', 2: 'image', 3: 'hypothesis', 4: 'hypothesis'}
+PHASE_SEED_SOURCES = {1: 'image', 2: 'image', 3: 'hypothesis', 4: 'image'}
+
+CROSS_SUPPORT_BONUS = 1.10
+CROSS_SUPPORT_PITCH_TOLERANCE = 0.02
+CROSS_SUPPORT_LINE_FRACTION = 0.08
+CROSS_SUPPORT_RIDGES = ('stack', 'close')
 
 
 def method_phase(edge):
@@ -71,6 +82,12 @@ def _algorithm_trial(edge, elapsed_seconds, reason=None):
         'autocorrelation': edge.get('autocorrelation'),
         'geometry_source': edge.get('geometry_source'),
         'line': edge.get('line'),
+        'profile_map': edge.get('profile_map'),
+        'profile_ridge': edge.get('profile_ridge'),
+        'profile_score': edge.get('profile_score'),
+        'profile_adjusted_score': edge.get('profile_adjusted_score'),
+        'profile_cross_supported': edge.get('profile_cross_supported'),
+        'profile_candidates': edge.get('debug_profile_candidates'),
         'elapsed_ms': float(elapsed_seconds * 1000.0),
     }
     # Shadow recovery results have not yet been mapped back to image geometry,
@@ -95,12 +112,158 @@ def boundary_profile(binary, n0, n1, start, end):
     return depth
 
 
+def _cross_support_maps(brightness_band, lab_band):
+    """Return the brightness peer and all six k=3/4 binary partitions."""
+    maps = [{
+        'name': 'brightness', 'mask': brightness_band.astype(np.uint8),
+        'k': None, 'assignment': None, 'centers_L': None,
+    }]
+    for k in (3, 4):
+        data = np.ascontiguousarray(lab_band, dtype=np.float32)
+        cv2.setRNGSeed(31003)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                    60, 0.25)
+        _, labels, centers = cv2.kmeans(
+            data.reshape(-1, 3), k, None, criteria, 5,
+            cv2.KMEANS_PP_CENTERS,
+        )
+        labels = labels.reshape(data.shape[:2])
+        order = np.argsort(centers[:, 0])
+        brightest = int(order[-1])
+        middles = [int(index) for index in order[1:-1]]
+        for assignment in itertools.product((0, 1), repeat=len(middles)):
+            white = [brightest] + [
+                cluster for cluster, is_white in zip(middles, assignment)
+                if is_white
+            ]
+            suffix = ''.join(str(value) for value in assignment)
+            maps.append({
+                'name': f'k{k}{suffix}',
+                'mask': np.isin(labels, white).astype(np.uint8),
+                'k': k,
+                'assignment': assignment,
+                'centers_L': [round(float(center), 1)
+                              for center in centers[order, 0]],
+            })
+    return maps
+
+
+def _profile_score(edge):
+    return (edge.get('count', 0) * edge.get('coverage', 0.0)
+            * edge.get('autocorrelation', 0.0))
+
+
+def select_cross_support_candidate(candidates,
+                                   bonus=CROSS_SUPPORT_BONUS,
+                                   pitch_tolerance=CROSS_SUPPORT_PITCH_TOLERANCE,
+                                   line_fraction=CROSS_SUPPORT_LINE_FRACTION):
+    """Select one profile before any expensive arc fitting is performed."""
+    pool = [candidate for candidate in candidates if candidate['score'] > 0]
+    if not pool:
+        return None
+
+    def supported(candidate):
+        candidate_is_brightness = candidate['map'] == 'brightness'
+        for other in pool:
+            if (other['map'] == 'brightness') == candidate_is_brightness:
+                continue
+            if (abs(math.log(other['pitch_px'] / candidate['pitch_px']))
+                    <= pitch_tolerance
+                    and abs(other['line_center'] - candidate['line_center'])
+                    <= line_fraction * candidate['pitch_px']):
+                return True
+        return False
+
+    for candidate in pool:
+        candidate['cross_supported'] = supported(candidate)
+        candidate['adjusted_score'] = candidate['score'] * (
+            bonus if candidate['cross_supported'] else 1.0
+        )
+    return max(pool, key=lambda candidate: candidate['adjusted_score'])
+
+
+def cross_support_edge(brightness_band, lab_band, gray_signal, positions,
+                       n0, short_size, collect_debug=False):
+    """Choose among fourteen cheap profiles, then run exactly one arc pass."""
+    maps = _cross_support_maps(brightness_band, lab_band)
+    center = float(np.mean(positions))
+    candidates = []
+    for ridge in CROSS_SUPPORT_RIDGES:
+        for item in maps:
+            depth = profile_depth(item['mask'], n0, ridge)
+            edge = measure_profile(positions, depth, short_size)
+            score = _profile_score(edge) if 'valleys' in edge else -1.0
+            candidates.append({
+                'map': item['name'], 'ridge': ridge,
+                'k': item['k'], 'assignment': item['assignment'],
+                'centers_L': item['centers_L'], 'mask': item['mask'],
+                'depth': depth, 'edge': edge,
+                # The selected edge is refined in-place below. Keep an
+                # untouched profile for the late multi-profile Lab fallback.
+                'profile': copy.deepcopy(edge), 'score': float(score),
+                'pitch_px': edge.get('pitch_px'),
+                'line_center': (
+                    float(edge['slope'] * center + edge['intercept'])
+                    if 'slope' in edge and 'intercept' in edge else None
+                ),
+                'cross_supported': False, 'adjusted_score': float(score),
+            })
+
+    selected = select_cross_support_candidate(candidates)
+    summaries = ([{
+        'map': candidate['map'], 'ridge': candidate['ridge'],
+        'status': candidate['edge'].get('status', 'unavailable'),
+        'score': candidate['score'],
+        'adjusted_score': candidate['adjusted_score'],
+        'cross_supported': candidate['cross_supported'],
+        'pitch_px': candidate['pitch_px'],
+        'line_center': candidate['line_center'],
+        'count': int(candidate['edge'].get('count', 0)),
+        'coverage': float(candidate['edge'].get('coverage', 0.0)),
+        'autocorrelation': float(
+            candidate['edge'].get('autocorrelation', 0.0)
+        ),
+    } for candidate in candidates] if collect_debug else None)
+    if selected is None:
+        return ({
+            'status': 'unavailable',
+            'reason': 'no usable cross-support profile',
+            'method': 'cross_support',
+            **({'debug_profile_candidates': summaries} if collect_debug else {}),
+        }, None, candidates)
+
+    edge = selected['edge']
+    edge.update(
+        method='cross_support',
+        profile_map=selected['map'],
+        profile_ridge=selected['ridge'],
+        profile_score=selected['score'],
+        profile_adjusted_score=selected['adjusted_score'],
+        profile_cross_supported=selected['cross_supported'],
+        profile_k=selected['k'],
+        profile_assignment=(list(selected['assignment'])
+                            if selected['assignment'] is not None else None),
+        profile_centers_L=selected['centers_L'],
+    )
+    if collect_debug:
+        edge['debug_profile_candidates'] = summaries
+        edge['debug_mask_band'] = selected['mask']
+    # Lock the measured arc lattice to the chosen cheap-profile hypothesis.
+    # This is the protection against a half/double-period jump in the only
+    # expensive pass.
+    edge['reference_pitch_px'] = (
+        edge['pitch_px'] / np.sqrt(1 + edge['slope'] ** 2)
+    )
+    refine_edge(edge, gray_signal, positions, selected['depth'])
+    return edge, selected, candidates
+
+
 def adaptive_color_edge(lab, gray, threshold, positions, n0, n1, short_size):
     """Recover a paper/hinge boundary using locally selected Lab thresholds.
 
     Restrict the search to the outer edge band, require periodic valleys and
-    agreement between neighbouring thresholds. Do not replace a usable existing
-    brightness profile. Colour alone never establishes a perforated edge.
+    agreement between neighbouring thresholds. Do not replace a usable primary
+    result. Colour alone never establishes a perforated edge.
     """
     start, end = int(positions[0]), int(positions[-1])+1
     region = lab[n0:n1+3, start:end]
@@ -146,6 +309,126 @@ def adaptive_color_edge(lab, gray, threshold, positions, n0, n1, short_size):
     if not stable:
         return None
     return max(stable, key=lambda item: item[0])[1]
+
+
+def _orient_lab_arc_signal(signal, positions, depth, pitch):
+    """Orient an a/b/L channel so the outer-to-inner edge gradient is positive."""
+    valid = np.isfinite(depth)
+    if valid.sum() < 3:
+        return signal.astype(float), 1
+    prior = np.interp(positions, positions[valid], depth[valid])
+    columns = np.rint(positions).astype(int)
+    gap = max(2, int(round(pitch * 0.08)))
+    outer = np.rint(prior - gap).astype(int)
+    inner = np.rint(prior + gap).astype(int)
+    keep = ((columns >= 0) & (columns < signal.shape[1])
+            & (outer >= 0) & (inner < signal.shape[0]))
+    if keep.sum() < 3:
+        return signal.astype(float), 1
+    change = np.median(
+        signal[inner[keep], columns[keep]]
+        - signal[outer[keep], columns[keep]]
+    )
+    polarity = 1 if change >= 0 else -1
+    return signal.astype(float) * polarity, polarity
+
+
+def recover_side_by_sequential_kmeans_lab(side, sides, contexts,
+                                          basis=None, origin=None):
+    """Try k=3/4 profiles in L/a/b order until five post-corner arcs fit.
+
+    The primary-selected k-means profile is tried first because production has
+    previously fitted it only in greyscale. Remaining profiles are ordered by
+    the same stack-then-close score policy used by the diagnostic experiment.
+    Every attempt is pitch-locked to its cheap profile hypothesis.
+    """
+    context = contexts.get(side, {})
+    candidates = [
+        candidate for candidate in context.get('profile_candidates', [])
+        if candidate.get('map') != 'brightness'
+        and candidate.get('score', -1) > 0
+    ]
+    if not candidates:
+        return None
+
+    selected = context.get('selected_profile')
+    selected_key = (
+        (selected.get('map'), selected.get('ridge'))
+        if selected is not None and selected.get('map') != 'brightness'
+        else None
+    )
+    ordered = []
+    if selected_key is not None:
+        ordered.extend(
+            candidate for candidate in candidates
+            if (candidate['map'], candidate['ridge']) == selected_key
+        )
+    for ridge in CROSS_SUPPORT_RIDGES:
+        ordered.extend(sorted(
+            (candidate for candidate in candidates
+             if candidate['ridge'] == ridge
+             and (candidate['map'], candidate['ridge']) != selected_key),
+            key=lambda candidate: candidate['score'], reverse=True,
+        ))
+
+    lab_signal = context.get('lab_signal')
+    positions = context.get('positions')
+    if lab_signal is None or positions is None:
+        return None
+    channels = (('L', 0), ('a', 1), ('b', 2))
+    for candidate in ordered:
+        profile = candidate.get('profile', candidate.get('edge'))
+        if profile is None or 'valleys' not in profile:
+            continue
+        for channel_name, channel_index in channels:
+            edge = copy.deepcopy(profile)
+            edge['reference_pitch_px'] = (
+                edge['pitch_px'] / np.sqrt(1 + edge['slope'] ** 2)
+            )
+            signal, polarity = _orient_lab_arc_signal(
+                lab_signal[:, :, channel_index], positions,
+                candidate['depth'], edge['pitch_px'],
+            )
+            refine_edge(edge, signal, positions, candidate['depth'])
+            edge.update(
+                method='sequential_kmeans_lab',
+                profile_map=candidate['map'],
+                profile_ridge=candidate['ridge'],
+                profile_score=candidate['score'],
+                profile_k=candidate.get('k'),
+                profile_assignment=(
+                    list(candidate['assignment'])
+                    if candidate.get('assignment') is not None else None
+                ),
+                profile_centers_L=candidate.get('centers_L'),
+                arc_channel=channel_name,
+                arc_channel_polarity=polarity,
+                status='review',
+                reason=(
+                    'sequential k=3/4 profile recovered in Lab channel; '
+                    'verify against photograph'
+                ),
+            )
+            if edge.get('geometry_source') != 'circle_arcs':
+                continue
+
+            # The fallback must survive the same corner test as a primary
+            # side before it is allowed to stop the sequential search.
+            if basis is not None and origin is not None:
+                add_edge_image_geometry(
+                    edge, side, context, basis, origin,
+                )
+                trial_sides = copy.deepcopy(sides)
+                trial_sides[side] = edge
+                exclude_points_outside_corners(trial_sides, contexts)
+                edge = trial_sides[side]
+                if 'valleys' in edge and 'line' in edge:
+                    add_edge_image_geometry(
+                        edge, side, context, basis, origin,
+                    )
+            if reliable_side(edge):
+                return edge
+    return None
 
 
 def robust_line(x, y, tolerance=2.0):
@@ -1262,327 +1545,6 @@ def recover_side_by_parallel_scan(side, sides, contexts):
     return edge
 
 
-def _fit_kmeans_sine(context):
-    """Fit one k=3 colour-boundary sinusoid without external pitch input."""
-    positions = context.get('positions')
-    lab_signal = context.get('lab_signal')
-    bounds = context.get('normal_search')
-    expected_normal = context.get('expected_normal')
-    if (positions is None or lab_signal is None or bounds is None
-            or expected_normal is None or len(positions) < 30):
-        return None
-    n0, n1 = bounds
-    columns = np.rint(positions).astype(int)
-    if (columns.min() < 0 or columns.max() >= lab_signal.shape[1]
-            or n1 <= n0 + 3):
-        return None
-    colour_band = lab_signal[n0:n1 + 1, columns]
-    samples = colour_band.reshape(-1, 3).astype(np.float32)
-    cv2.setRNGSeed(31003)
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
-                60, 0.25)
-    _, labels, centers = cv2.kmeans(
-        samples, 3, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
-    labels = labels.reshape(colour_band.shape[:2])
-
-    span = float(positions[-1] - positions[0])
-    min_pitch = max(8.0, span / 45.0)
-    max_pitch = min(span / 5.0, span / 7.0)
-    if max_pitch <= min_pitch:
-        return None
-
-    def evaluate(x, y, start, stop, period, inliers=None):
-        omega = 2 * np.pi / period
-        matrix = np.column_stack((
-            np.ones_like(x), np.sin(omega * x), np.cos(omega * x)))
-        if inliers is None:
-            inliers = np.ones(len(x), dtype=bool)
-            for _ in range(4):
-                if inliers.sum() < 20:
-                    return None
-                coefficients = np.linalg.lstsq(
-                    matrix[inliers], y[inliers], rcond=None)[0]
-                residual = y - matrix @ coefficients
-                median = np.median(residual[inliers])
-                mad = np.median(np.abs(residual[inliers] - median))
-                cutoff = max(3.0, 2.5 * 1.4826 * mad)
-                updated = np.abs(residual - median) <= cutoff
-                if np.array_equal(updated, inliers):
-                    break
-                inliers = updated
-        if inliers.sum() < 20:
-            return None
-        coefficients = np.linalg.lstsq(
-            matrix[inliers], y[inliers], rcond=None)[0]
-        fitted = matrix @ coefficients
-        residual = y - fitted
-        rmse = float(np.sqrt(np.mean(residual[inliers] ** 2)))
-        baseline = np.ones((len(x), 1), dtype=float)
-        baseline_coefficients = np.linalg.lstsq(
-            baseline[inliers], y[inliers], rcond=None)[0]
-        baseline_residual = (y[inliers]
-                             - baseline[inliers] @ baseline_coefficients)
-        baseline_sse = float(np.sum(baseline_residual ** 2))
-        sine_sse = float(np.sum(residual[inliers] ** 2))
-        improvement = max(0.0, 1.0 - sine_sse / max(baseline_sse, 1e-6))
-        amplitude = float(np.hypot(coefficients[1], coefficients[2]))
-        slope = 0.0
-        mean_normal = float(coefficients[0])
-        if (not period * 0.05 <= amplitude <= period * 0.35
-                or abs(mean_normal - expected_normal) > period * 0.65):
-            return None
-        coverage = float(inliers.sum() / (stop - start))
-        center_factor = np.exp(
-            -abs(mean_normal - expected_normal) / (period * 0.5))
-        amplitude_factor = min(amplitude / max(period * 0.12, 1), 1.5)
-        score = (improvement * coverage * center_factor * amplitude_factor
-                 / (1.0 + rmse / 6.0))
-        phase = float(np.arctan2(coefficients[1], coefficients[2]) / omega)
-        intercept = float(coefficients[0])
-        return {
-            'score': float(score), 'period': float(period),
-            'amplitude': amplitude, 'slope': slope,
-            'intercept': intercept, 'phase': phase,
-            'rmse': rmse, 'improvement': improvement,
-            'x': x, 'y': y, 'inliers': inliers,
-            'start': start, 'stop': stop,
-        }
-
-    cluster_curves = np.full((3, len(positions)), np.nan, dtype=float)
-    for selected_label in range(3):
-        selected = labels == selected_label
-        runs = selected[:-2] & selected[1:-1] & selected[2:]
-        for column_index in range(runs.shape[1]):
-            starts = np.flatnonzero(runs[:, column_index])
-            if starts.size:
-                cluster_curves[selected_label, column_index] = float(
-                    n0 + starts[0]
-                )
-
-    best = None
-    widths = sorted(set(
-        max(90, min(len(positions), int(round(len(positions) * fraction))))
-        for fraction in (0.22, 0.30, 0.38, 0.46)
-    ))
-    period_grid = np.arange(np.ceil(min_pitch), np.floor(max_pitch) + 1, 1.0)
-    for selected_label in range(3):
-        curve = cluster_curves[selected_label]
-        for width in widths:
-            step = max(10, width // 6)
-            starts = list(range(0, len(curve) - width + 1, step))
-            final_start = len(curve) - width
-            if final_start not in starts:
-                starts.append(final_start)
-            for start in starts:
-                stop = start + width
-                valid = np.isfinite(curve[start:stop])
-                if valid.sum() < int(width * 0.70):
-                    continue
-                x = positions[start:stop][valid].astype(float)
-                y = curve[start:stop][valid]
-                for period in period_grid:
-                    if width / period < 3.0:
-                        continue
-                    candidate = evaluate(
-                        x, y, start, stop, float(period))
-                    if candidate is not None:
-                        candidate['selected_label'] = selected_label
-                    if (candidate is not None
-                            and (best is None
-                                 or candidate['score'] > best['score'])):
-                        best = candidate
-    # With no linear trend term, residual edge tilt lowers the sinusoid's
-    # global score.  Keep this gate permissive and let the subsequent circle
-    # fits, coverage and spacing checks decide whether the hypothesis is real.
-    if best is None or best['score'] < 0.06 or best['improvement'] < 0.10:
-        return None
-
-    refined = best
-    for period in np.round(np.arange(best['period'] - 1.0,
-                                     best['period'] + 1.01, 0.1), 1):
-        if not min_pitch <= period <= max_pitch:
-            continue
-        candidate = evaluate(
-            best['x'], best['y'], best['start'], best['stop'],
-            float(period), best['inliers'])
-        if candidate is not None and candidate['score'] > refined['score']:
-            candidate['selected_label'] = best['selected_label']
-            refined = candidate
-    refined['selected_label'] = best['selected_label']
-    refined['cluster_curves'] = cluster_curves
-    refined['cluster_labels'] = labels
-    refined['cluster_centers_lab'] = centers.copy()
-    refined['cluster_n0'] = int(n0)
-    return refined
-
-
-def recover_side_by_periodic_attenuation(side, sides, contexts):
-    """Recover circle arcs after a self-fitted k=3 sinusoidal attenuation."""
-    context = contexts.get(side, {})
-    positions = context.get('positions')
-    signal = context.get('recovery_signal', context.get('signal'))
-    bounds = context.get('normal_search')
-    expected_normal = context.get('expected_normal')
-    if (positions is None or signal is None or bounds is None
-            or expected_normal is None or len(positions) < 5):
-        return None
-
-    sine_fit = _fit_kmeans_sine(context)
-    if sine_fit is None:
-        return None
-    pitch = sine_fit['period']
-
-    n0, n1 = bounds
-    pad = int(np.ceil(pitch * 0.75))
-    band0 = max(0, int(np.floor(n0)) - pad)
-    band1 = min(signal.shape[0], int(np.ceil(n1)) + pad + 1)
-    if band1 - band0 < 9:
-        return None
-    base_signal = signal[band0:band1].astype(np.float32)
-
-    slope_candidates = [sine_fit['slope']]
-
-    center_along = float(np.mean(positions))
-    fitted_center = float(sine_fit['slope'] * center_along
-                          + sine_fit['intercept'])
-    normal_centers = [
-        fitted_center + offset * pitch for offset in (-0.10, 0.0, 0.10)
-    ]
-    if not normal_centers:
-        return None
-
-    phase_values = [
-        float(sine_fit['phase']) + offset * pitch
-        for offset in (-0.10, 0.0, 0.10)
-    ]
-    amplitudes = [float(sine_fit['amplitude'])]
-
-    columns = np.rint(positions).astype(int)
-    valid_columns = ((columns >= 0) & (columns < signal.shape[1]))
-    if not valid_columns.all():
-        return None
-    local_rows = np.arange(band1 - band0, dtype=np.float32)[:, None]
-    best = None
-    for slope_index, slope in enumerate(slope_candidates):
-        pitch_axis = pitch / np.sqrt(1 + slope*slope)
-        for center_normal in normal_centers:
-            intercept = float(center_normal - slope * center_along)
-            line_depth = slope * positions + intercept
-            for amplitude in amplitudes:
-                for phase in phase_values:
-                    angle = 2 * np.pi * (positions - phase) / pitch_axis
-                    sine_depth = line_depth + amplitude * np.cos(angle)
-                    local_depth = sine_depth - band0
-                    distance_above = local_depth[None, :] - local_rows
-                    fade = np.clip(
-                        1.0 - distance_above / (0.5 * pitch), 0.0, 1.0)
-                    attenuation = np.where(distance_above > 0,
-                                           fade * fade, 1.0)
-                    attenuated = base_signal.copy()
-                    attenuated[:, columns] *= attenuation
-
-                    first = int(np.ceil((positions[0] - phase) / pitch_axis))
-                    last = int(np.floor((positions[-1] - phase) / pitch_axis))
-                    seed_x = phase + np.arange(first, last + 1) * pitch_axis
-                    seed_y = (slope * seed_x + intercept + amplitude - band0)
-                    seeds = np.column_stack((seed_x, seed_y))
-                    if len(seeds) < 5:
-                        continue
-                    fits = refine_valleys(
-                        attenuated, positions, local_depth, seeds, pitch)
-                    circles = [
-                        fit for fit in fits
-                        if fit is not None and fit.get('model') == 'circle'
-                    ]
-                    score = (
-                        len(circles),
-                        -sum(fit.get('rms_px', 0) for fit in circles),
-                        -slope_index,
-                        -abs(center_normal - expected_normal),
-                    )
-                    if best is None or score > best[0]:
-                        best = (score, seeds, local_depth, fits, attenuated,
-                                attenuation, slope, intercept - band0,
-                                amplitude, phase)
-
-    if best is None or best[0][0] < 5:
-        return None
-    (_, seeds, local_depth, fits, attenuated, attenuation, slope,
-     local_intercept, amplitude, selected_phase) = best
-    edge = {
-        'status': 'review',
-        'reason': 'recovered by self-fitted k=3 sinusoidal attenuation',
-        'method': 'sinusoidal_attenuation_recovery',
-        'slope': float(slope),
-        'intercept': float(local_intercept),
-        'pitch_px': float(pitch),
-        'amplitude_px': float(amplitude),
-        'valleys': seeds,
-        'accepted': np.zeros(len(seeds), dtype=bool),
-    }
-    if not refine_edge_from_arc_lattice(
-            edge, attenuated, positions, local_depth, seeds, fits):
-        return None
-    if (edge['coverage'] < 0.50
-            or edge['spacing_rms_px'] / edge['pitch_px'] >= 0.06
-            or abs(edge['pitch_px'] / pitch - 1) > 0.08
-            or circular_arc_count(edge) < 5):
-        return None
-
-    if context.get('collect_debug'):
-        edge['debug_sinusoidal_attenuation'] = {
-            'band0': int(band0),
-            'period': float(pitch),
-            'phase': float(selected_phase),
-            'amplitude': float(amplitude),
-            'slope': float(slope),
-            'intercept': float(local_intercept),
-            'positions': positions.copy(),
-            'base_signal': base_signal[:, columns].copy(),
-            'attenuation': attenuation.copy(),
-            'attenuated_signal': attenuated[:, columns].copy(),
-            'sine_depth': local_depth.copy(),
-            'kmeans_x': np.asarray(
-                sine_fit.get('x', []), dtype=float,
-            ).copy(),
-            'kmeans_y': (np.asarray(
-                sine_fit.get('y', []), dtype=float,
-            ) - band0),
-            'kmeans_inliers': np.asarray(
-                sine_fit.get('inliers', []), dtype=bool,
-            ).copy(),
-            'cluster_curves': np.asarray(
-                sine_fit.get('cluster_curves', []), dtype=float,
-            ).copy(),
-            'selected_cluster': int(sine_fit.get('selected_label', -1)),
-            'cluster_labels': np.asarray(
-                sine_fit.get('cluster_labels', []), dtype=np.uint8,
-            ).copy(),
-            'cluster_centers_lab': np.asarray(
-                sine_fit.get('cluster_centers_lab', []), dtype=np.float32,
-            ).copy(),
-            'cluster_n0': int(sine_fit.get('cluster_n0', band0)),
-        }
-
-    # Convert the normal coordinate back from the cropped search band into the
-    # complete oriented side image used by add_edge_image_geometry().
-    edge['intercept'] += band0
-    for key in ('valleys', 'initial_valleys'):
-        if key in edge:
-            edge[key] = np.asarray(edge[key], dtype=float).copy()
-            edge[key][:, 1] += band0
-    for arc_fit in edge.get('refinement_fits', []):
-        if arc_fit is None:
-            continue
-        if 'point' in arc_fit:
-            arc_fit['point'] = np.asarray(arc_fit['point'], dtype=float).copy()
-            arc_fit['point'][1] += band0
-        if 'curve' in arc_fit:
-            arc_fit['curve'] = np.asarray(arc_fit['curve'], dtype=float).copy()
-            arc_fit['curve'][:, 1] += band0
-    return edge
-
-
 def measure_stamp(image, orientation, threshold, collect_trials=False):
     if orientation is None:
         return {'status': 'unavailable', 'sides': {}}
@@ -1609,7 +1571,7 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
     debug_algorithm_edges = ({side: {} for side in SIDES}
                              if collect_trials else None)
     for side in SIDES:
-        brightness_started = time.perf_counter()
+        primary_started = time.perf_counter()
         vertical = side in ('left', 'right')
         flipped = side in ('bottom', 'right')
         work = binary.T if vertical else binary
@@ -1622,13 +1584,20 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
         end = int(margin+along_length*0.99)
         n0 = max(0, int(margin-normal_length*0.055))
         n1 = min(work.shape[0]-3, int(margin+normal_length*0.13))
-        depth = boundary_profile(work, n0, n1, start, end)
         positions = np.arange(start, end, dtype=float)
         gray_work = gray.T if vertical else gray
         lab_work = lab.transpose(1, 0, 2) if vertical else lab
         if flipped:
             gray_work = gray_work[::-1]
             lab_work = lab_work[::-1]
+        brightness_band = work[n0:n1 + 3, start:end]
+        lab_band = lab_work[n0:n1 + 3, start:end]
+        edge, selected_profile, profile_candidates = cross_support_edge(
+            brightness_band, lab_band, gray_work, positions, n0,
+            min(width, height), collect_debug=collect_trials,
+        )
+        depth = (selected_profile['depth'] if selected_profile is not None
+                 else np.full(len(positions), np.nan))
         contexts[side] = {
             'positions': positions,
             'signal': gray_work,
@@ -1638,21 +1607,18 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
             'normal_search': (n0, n1),
             'expected_normal': margin,
             'collect_debug': collect_trials,
+            'profile_candidates': profile_candidates,
+            'selected_profile': selected_profile,
         }
-        edge = measure_profile(positions, depth, min(width, height))
-        edge['method'] = 'brightness'
-        if 'valleys' in edge:
-            refine_edge(edge, gray_work, positions, depth)
         if collect_trials:
-            debug_algorithm_edges[side]['brightness'] = copy.deepcopy(edge)
-            algorithm_trials[side]['brightness'] = _algorithm_trial(
-                copy.deepcopy(edge), time.perf_counter() - brightness_started,
+            debug_algorithm_edges[side]['cross_support'] = copy.deepcopy(edge)
+            algorithm_trials[side]['cross_support'] = _algorithm_trial(
+                copy.deepcopy(edge), time.perf_counter() - primary_started,
             )
 
-        # A brightness profile may look periodic along a translucent hinge or
-        # other obstruction while none of its candidates fits a true hole arc.
-        # In that case the colour boundary deserves the same fallback search
-        # as a completely missing brightness profile.
+        # Cross-support is the only primary arc pass. If it cannot establish
+        # five arcs, the existing colour/geometric recovery ladder remains
+        # available; no standalone brightness pass is attempted.
         if collect_trials or circular_arc_count(edge) < 5:
             color_started = time.perf_counter()
             color_work = lab_work
@@ -1683,7 +1649,7 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
                     )
                 if circular_arc_count(adaptive) >= 5 and adaptive.get('geometry_source') == 'circle_arcs':
                     # A forced diagnostic trial must not replace a successful
-                    # brightness result merely because it was also evaluated.
+                    # primary result merely because it was also evaluated.
                     if circular_arc_count(edge) < 5:
                         edge = adaptive
                         contexts[side]['signal'] = color_signal
@@ -1735,30 +1701,24 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
                     'reliable opposite side unavailable or quality gates failed'
                 ),
             )
-            attenuation_started = time.perf_counter()
-            if circular_arc_count(baseline_sides.get(side, {})) < 5:
-                attenuated = recover_side_by_periodic_attenuation(
-                    side, baseline_sides, contexts,
-                )
-                attenuation_reason = None if attenuated is not None else (
-                    'k=3 sinusoid unavailable or circle quality gates failed'
-                )
-            else:
-                attenuated = None
-                attenuation_reason = 'existing side already has five circular arcs'
-            algorithm_trials[side]['sinusoidal_attenuation'] = _algorithm_trial(
-                attenuated, time.perf_counter() - attenuation_started,
-                attenuation_reason,
+            sequential_started = time.perf_counter()
+            sequential = recover_side_by_sequential_kmeans_lab(
+                side, baseline_sides, contexts, basis, origin,
             )
-            if attenuated is not None:
-                debug_algorithm_edges[side]['sinusoidal_attenuation'] = (
-                    copy.deepcopy(attenuated)
+            algorithm_trials[side]['sequential_kmeans_lab'] = _algorithm_trial(
+                sequential, time.perf_counter() - sequential_started,
+                None if sequential is not None else (
+                    'no k=3/4 profile produced five post-corner Lab arcs'
+                ),
+            )
+            if sequential is not None:
+                debug_algorithm_edges[side]['sequential_kmeans_lab'] = (
+                    copy.deepcopy(sequential)
                 )
 
-    # Rebuild not only absent sides, but every side unsupported by five
-    # magenta arc points and the weaker member of a non-parallel opposite pair.
-    # Recovery requires two reliable adjacent sides; a reliable opposite side
-    # improves the hypothesis but is no longer mandatory.
+    # First use the cheaper geometry-driven recovery. It can establish sides
+    # that no image-boundary profile sees, and each recovered side may support
+    # another one in the following pass.
     pending = recovery_targets(sides)
     for _ in range(2):
         progress = False
@@ -1768,32 +1728,72 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
             recovered = recover_missing_side(side, sides, contexts)
             if recovered is None:
                 recovered = recover_side_by_parallel_scan(side, sides, contexts)
-            attenuated = recover_side_by_periodic_attenuation(
-                side, sides, contexts,
-            )
-            if attenuated is not None:
-                recovered_arcs = circular_arc_count(recovered or {})
-                attenuated_arcs = circular_arc_count(attenuated)
-                recovered_pitch = (recovered or {}).get('pitch_px')
-                attenuated_pitch = attenuated.get('pitch_px')
-                doubled_period = (
-                    recovered_pitch is not None
-                    and attenuated_pitch is not None
-                    and 1.75 <= recovered_pitch / attenuated_pitch <= 2.25
-                    and attenuated_arcs >= recovered_arcs
-                )
-                if (recovered is None or doubled_period
-                        or _side_confidence(attenuated)
-                        > _side_confidence(recovered)):
-                    recovered = attenuated
             if recovered is None:
                 continue
-            add_edge_image_geometry(recovered, side, contexts[side], basis, origin)
+            add_edge_image_geometry(
+                recovered, side, contexts[side], basis, origin,
+            )
             sides[side] = recovered
             pending.remove(side)
             progress = True
         if not progress or not pending:
             break
+
+    # The expensive independent fallback runs only for unresolved sides and
+    # for geometric results whose opposite pitch disagrees by about 0.15 gauge
+    # at gauge 15 (~1%). A successful image-profile result outranks a geometric
+    # hypothesis; a failed challenge leaves that hypothesis untouched.
+    sequential_targets = recovery_targets(sides)
+    opposite_names = {
+        'top': 'bottom', 'bottom': 'top',
+        'left': 'right', 'right': 'left',
+    }
+    for side, edge in sides.items():
+        if edge.get('method') not in (
+                'parallel_edge_arc_recovery',
+                'parallel_normal_scan_recovery'):
+            continue
+        opposite = sides.get(opposite_names[side], {})
+        pitch = edge.get('pitch_px')
+        opposite_pitch = opposite.get('pitch_px')
+        if (pitch and opposite_pitch
+                and abs(math.log(pitch / opposite_pitch)) > 0.01):
+            sequential_targets.add(side)
+    for side in SIDES:
+        if side not in sequential_targets:
+            continue
+        recovered = recover_side_by_sequential_kmeans_lab(
+            side, sides, contexts, basis, origin,
+        )
+        if recovered is not None:
+            sides[side] = recovered
+
+    # One final geometry pass lets a newly measured k-means side support a
+    # neighbour that was impossible during the first two passes.
+    pending = recovery_targets(sides)
+    for side in SIDES:
+        if side not in pending:
+            continue
+        recovered = recover_missing_side(side, sides, contexts)
+        if recovered is None:
+            recovered = recover_side_by_parallel_scan(side, sides, contexts)
+        if recovered is None:
+            continue
+        add_edge_image_geometry(
+            recovered, side, contexts[side], basis, origin,
+        )
+        sides[side] = recovered
+
+    # Re-apply corner clipping after every fallback has established its final
+    # line. A nominal five-arc recovery is not publishable if a corner owns one
+    # of those arcs.
+    exclude_points_outside_corners(sides, contexts)
+    for side, edge in sides.items():
+        if 'valleys' in edge and 'line' in edge:
+            add_edge_image_geometry(
+                edge, side, contexts[side], basis, origin,
+            )
+    pending = recovery_targets(sides)
     for side in pending:
         edge = sides[side]
         if 'line' not in edge:

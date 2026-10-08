@@ -23,10 +23,10 @@ visible without opening anything else:
 
 | colour | phase | method |
 | --- | --- | --- |
-| green | 1 — main method | `brightness` |
+| green | 1 — main method | `cross_support` |
 | yellow | 2 — first fallback | `adaptive_lab_a` / `adaptive_lab_b` |
 | orange | 3 — second fallback | `parallel_edge_arc_recovery`, `parallel_normal_scan_recovery` |
-| red | 4 — last resort | `sinusoidal_attenuation_recovery` |
+| red | 4 — last resort | `sequential_kmeans_lab` |
 | grey | — | no measurement on that side |
 
 The per-stamp gauge label takes the worst phase on the stamp, so a sheet can be triaged
@@ -40,8 +40,9 @@ Diagnostics for one stamp/side/hole are written to `scan_details/` when `--stamp
 (`0` for stamp localization and rectification, then `1`–`4` as above), so sorting the
 directory walks the algorithm in order, and a phase that did not run leaves no files.
 Each panel carries a banner naming its phase, its method, its status, and whether it was
-the one selected. `--stamp` alone also records a shadow run of every algorithm
-(`algorithm_trials.json`) so the alternatives can be compared on one baseline.
+the one selected. A diagnostic run selected with `--stamp` (optionally narrowed in the
+report with `--side`) executes and records a shadow run of every current fallback
+(`algorithm_trials.json`), so the alternatives can be compared on one baseline.
 
 ---
 
@@ -68,7 +69,7 @@ geometry came from fitted circular arcs, with at least five of them accepted on 
 
 Perforation holes are round punches, so a circle fitted to the local paper boundary is a
 physically justified model, and its apex is a well-defined point. Everything cheaper — the
-brightness profile, the autocorrelation period, parabola fits — is treated as a *search
+binary profiles, the autocorrelation period, parabola fits — is treated as a *search
 hypothesis* only. In particular the autocorrelation pitch that drives the search is deleted
 from the result before output if the side never reached five arcs, so it cannot leak out as
 a measurement (`reliable_side()`, and the `pitch_px` removal at the end of `measure_stamp`).
@@ -126,21 +127,28 @@ Each stamp is rotated into an axis-aligned patch with a margin of 12% of its sho
 the whole perforated edge plus surrounding background is available. The patch is converted
 to grey (Gaussian σ 0.6) and thresholded once with a single scan-global threshold
 (10th percentile of grey + `--stamp-delta`). A Lab copy is kept with slightly stronger
-smoothing (σ 1.0) for the colour fallback.
+smoothing (σ 1.0) for the k-means primary maps and the colour fallback.
 
 **No morphological closing or dilation is applied to the measurement image** — closing would
 partially fill the very holes being measured.
 
-### 4. Boundary profile — `boundary_profile()`
+### 4. Binary maps and boundary profiles — `cross_support_edge()`
 
 Each side is transposed/flipped so it can be processed as "top": *along* the edge is x,
 *inward* is increasing y. Along the edge, 1% to 99% is used. Across the edge the search band
 runs from 5.5% of the stamp outside the nominal border to 13% inside.
 
-For every column the profile records the first **sustained** run of paper pixels (four
-consecutive rows), which rejects isolated bright noise outside the paper.
+The old standalone brightness boundary is no longer run. Instead, phase 1 builds seven
+peer binary maps: the scan-wide brightness mask plus every legal assignment of the
+intermediate Lab centroids at k=3 and k=4. The darkest centroid is always background and
+the lightest is always paper, giving two k=3 and four k=4 maps.
 
-### 5. Periodic valley hypothesis — `measure_profile()`
+Each map produces a `stack` and a `close` depth profile, fourteen profiles in total.
+`close` removes narrow outward spikes from the first-sustained-run depth. `stack` also
+removes components below the physical perforation scale, keeps paper connected to the
+stamp interior, fills enclosed design holes and measures paper count before closing.
+
+### 5. Periodic valley hypothesis and cross-support selection — `measure_profile()`
 
 The profile is detrended against a robust baseline, and its amplitude must exceed
 `max(2.5 px, 0.3% of the short side)` or the side is declared to have no distinct valleys.
@@ -158,9 +166,17 @@ Finally a robust line is fitted through the valley bases.
 This stage produces the **seeds** for arc fitting, plus the quality figures `coverage`,
 `autocorrelation`, `spacing_rms_px` and `depth_rms_px`.
 
+Every profile is scored as `count × coverage × autocorrelation`. A brightness profile and
+a k-means profile receive a symmetric 1.1× bonus when their periods agree within 2% and
+their edge positions agree within 0.08 period. The highest adjusted score is selected
+before any arcs are fitted. Brightness has no priority and is never fitted separately.
+
 ### 6. Sub-pixel arc refinement — `refine_valleys()`, `fit_arc()`, `fit_parabola()`
 
-This is where the actual measurement happens. For each seed the side image is blurred
+This is where the actual measurement happens. Exactly one primary arc pass is run per
+side, using the selected profile but the original greyscale pixels. Its final lattice is
+constrained to within 5% of the selected profile period to prevent a half/double-period
+jump. For each seed the side image is blurred
 (σ 1.2) and differentiated along the inward axis with a Sobel kernel. For every column in a
 window around the seed, the boundary point is the gradient maximum weighted by a Gaussian
 prior around the first-pass boundary, refined to sub-pixel by quadratic interpolation on
@@ -203,7 +219,7 @@ Otherwise it is `review`.
 
 ### 8. Fallback ladder
 
-If the brightness path did not reach five arcs, progressively more assumptive methods are
+If the one-pass cross-support path did not reach five arcs, progressively more assumptive methods are
 tried. **Every one of them still has to produce five circular arcs.** See
 *Fallback characteristics* below for how much each is used and how much it shifts the answer.
 
@@ -225,10 +241,12 @@ tried. **Every one of them still has to produce five circular arcs.** See
    the reliable opposite side's pitch, lines are scanned inward in steps of 1/8 period across
    the whole search band, at two candidate slopes and four phases.
 
-4. **`sinusoidal_attenuation_recovery`** *(phase 4, red)* — the most assumptive path. A k=3 colour clustering
-   of the edge band yields a boundary curve; a sinusoid is fitted to it over a search of
-   cluster × window × period; the image signal above that sinusoid is then **attenuated**,
-   and arcs are fitted to the modified signal.
+4. **`sequential_kmeans_lab`** *(phase 4, red)* — the remaining k=3/4 `stack` and `close`
+   profiles are tried in score order. For each profile, arcs are fitted in Lab L, a and b
+   order, with the a/b polarity inferred from the colour transition across the proposed
+   boundary. Search stops only when five circular arcs survive corner filtering. This phase
+   also challenges a geometric result when its pitch differs from the reliable opposite
+   side by roughly 0.15 gauge.
 
 After the ladder, `recovery_targets()` decides what still needs rebuilding: any side without
 five arcs, plus the weaker member of any opposite pair whose lines differ by more than 1.5°.
@@ -311,57 +329,28 @@ the two (see below).
 
 ## Fallback characteristics
 
-Measured over a corpus of 8 scans / 92 stamps / 368 sides. Bias is the within-stamp paired
-difference against that stamp's `brightness` sides, so it is a *relative* figure, not an
-accuracy claim — there is no ground truth.
-
-| method | share of published sides | median gauge offset vs brightness |
-| --- | --- | --- |
-| `brightness` | 80% | baseline |
-| `adaptive_lab_a` / `_b` | 8% | −0.22 … −0.26 |
-| `parallel_edge_arc_recovery` | 5% | **+0.41** |
-| `sinusoidal_attenuation_recovery` | 4% | **−0.36** |
-| `parallel_normal_scan_recovery` | 3% | +0.21 |
-
-Two cautions follow from this, and both are open problems rather than settled behaviour:
-
-* The two largest offsets **exceed the 0.25 agreement tolerance** used to decide whether
-  opposite sides agree, and they have **opposite signs**. When one of each lands on opposite
-  sides of the same axis the errors compound: median opposite-side disagreement for that
-  combination was 0.44 gauge, against 0.045 for two brightness sides.
-* The published quality figures do **not** discriminate these cases. All fallbacks report
-  `geometry_source = circle_arcs` with five or more arcs, and their coverage and spacing RMS
-  are indistinguishable from the brightness path. `reliable_side()` is a gate on *evidence
-  type*, not on evidence *independence*: in the seeded recoveries the arcs are searched for
-  at positions predicted by the pitch hypothesis, so self-consistency is partly built in.
-
-Treat any side whose `method` is not `brightness` or `adaptive_lab_*` as provisional.
+The earlier fallback-share and offset figures belonged to the removed brightness-first
+pipeline and are no longer production statistics. They must be re-measured after the
+cross-support migration. Until then, phase 3–4 results remain provisional because their
+arc searches are seeded by a pitch hypothesis rather than discovered independently from
+the image.
 
 ---
 
 ## Performance
 
-The primary path is cheap; the fallback ladder dominates. Profiled on one 7358×1978 scan
-with 6 stamps, single worker:
-
-| | share of runtime |
-| --- | --- |
-| detection + orientation + I/O | <1% |
-| brightness profile and periodic hypothesis | <1% |
-| arc refinement (`refine_valleys`, `fit_arc`) | 75% cumulative |
-| `parallel_normal_scan_recovery` | 42% (≈223 s per invocation) |
-| `parallel_edge_arc_recovery` | 27% (≈90 s per invocation) |
-| `sinusoidal_attenuation_recovery` | 14% (≈48 s per invocation) |
-
-Because the cascade runs in **both** orientation passes, roughly half of the recovery work
-is spent on a measurement that is then discarded. Expect a few minutes per stamp with
-`--workers 1`; the 6-stamp scan above took 177 s with `--workers 6`.
+Phase 1 computes fourteen inexpensive profiles but performs only one greyscale arc pass
+per side. The previous timing table described the removed brightness-first pipeline and
+is intentionally not reused. The fallback ladder can still dominate stamps whose primary
+pass fails, and orientation refinement can cause the complete measurement to run twice.
 
 ## Known limitations
 
-* **No ground truth.** Accuracy has never been quantified against known catalogue values.
-  All quantitative tests use synthetic images drawn with perfect circles — the same model the
-  arc fitter assumes.
+* **No reliable ground truth.** The corpus has ruler-derived 11/16-interval measurements,
+  but they are too uncertain to validate or tune the detector. The only external hypothesis
+  currently under test is that the horizontal/vertical gauge pair is either 14.50×15.00 or
+  14.25×14.75; the class of each stamp is not independently known. Synthetic tests use
+  perfect circles — the same model the arc fitter assumes.
 * **Straight edges are reported as failures.** A genuine booklet or coil straight edge yields
   `unavailable` and suppresses that dimension. There is no status value meaning
   "imperforate / straight edge", so it is indistinguishable from a detection failure.
@@ -380,16 +369,16 @@ is spent on a measurement that is then discarded. Expect a few minutes per stamp
 python -m unittest discover -s tests -t .
 ```
 
-35 tests, about 45 s. One test needs a real scan (`1K.png`) that is not in the repository
-and skips without it.
+44 tests, about one minute. The real hinge regression uses a cropped fixture stored in
+`tests/fixtures/`, so the suite has no external scan dependency and does not skip in CI.
 
 ---
 
 ## Method experiments — `kmeans_brightness/`
 
-A standalone study of two candidate replacements for the phase 1 `brightness` path, kept
-so its numbers can be reproduced rather than re-derived. Nothing in it is imported by the
-tool; it imports `perforation.py` and `segment_stamps.py`, never the other way round.
+A reproducible study of replacements for the former phase 1 `brightness` path. Production
+and the experiments now share the `stack`/`close` implementations in `edge_profiles.py`;
+the experiment scripts contain the stored comparisons and reporting code.
 
 What is compared:
 
@@ -400,10 +389,48 @@ What is compared:
   **`kmeans34` is the chosen direction**, because a global threshold cannot separate a
   stamp hinge from the paper at all, while a centroid split can, recovering holes that are
   otherwise unmeasurable.
-* **Ridge extraction** — seven ways to turn an edge band into a boundary depth profile,
+* **Ridge extraction** — eight ways to turn an edge band into a boundary depth profile,
   from the shipped `raw` first-sustained-run rule to an area-and-pinhole gate, an
   interior-connectivity gate, a paper-count depth, an asymmetric closing of the depth
-  signal, and combinations (`ridges.py`).
+  signal, the straight-line light-majority experiment, and combinations (`ridges.py`).
+
+### Production primary — one-pass cross-support
+
+Production now uses the strict one-pass selector. The former standalone brightness
+method is gone: its binary mask survives only as one peer among the seven maps and never
+receives its own arc pass or priority.
+
+1. build the brightness peer plus all six k=3/4 centroid assignments;
+2. extract `stack` and `close` profiles from every map;
+3. score all fourteen profiles before fitting any arcs;
+4. apply a symmetric 1.1× bonus when a brightness and k-means profile agree in period and
+   edge position;
+5. select the maximum adjusted score and run exactly one greyscale arc pass, with a 5%
+   profile-pitch constraint on the final lattice.
+
+The sequential k-means-only arc search remains an experiment, not the production method.
+It publishes two more sides on `worst.jpg`, but needs multiple arc passes. Pixel voting,
+median-depth fusion, general pitch/line consensus, same-map `stack`/`close` agreement and
+the line-majority ridge all performed worse than cross-support.
+
+A less circular check first clusters the 65 complete stamps into two groups without
+supplying either theoretical pair. For the strict one-pass results, the fitted
+horizontal/vertical centres are `(14.266, 14.747)` and `(14.535, 14.968)`, with cluster
+sizes 34 and 31, separation 0.348 and within-cluster RMS 0.095. The sequential results
+produce virtually the same centres. Only after fitting are they compared with the
+theoretical `(14.25, 14.75)` and `(14.50, 15.00)` pairs. This is evidence compatible
+with the two-class hypothesis, but not proof: a shared detector bias can move both
+methods together and there is still no independent class label per stamp.
+
+The one-pass selector publishes 302/320 collection sides. Of the 65 complete
+four-side stamps, 61 assign both axes to the same nearest theoretical pair; opposite-side
+p90 is 0.153 and no published side is more than 0.5 from both axis-appropriate theoretical
+values. It agrees very closely with the sequential selector where both publish: median
+gauge difference 0.001, p90 0.027, maximum 0.099 over 302 collection sides. On
+`worst.jpg` it publishes 94/108 sides, versus 96/108 for the sequential multi-pass
+selector. Across 18 nearby bonus/tolerance settings, coverage stays at 301–302/320 on the
+collection and 94/108 on `worst.jpg`, with no side more than 0.5 from both axis-appropriate
+theoretical values.
 
 ### Input
 
@@ -429,6 +456,21 @@ python kmeans_brightness/ridge_experiment.py    # -> ridge_results.json  ~12 min
 python kmeans_brightness/report.py       > kmeans_brightness/report.txt
 python kmeans_brightness/ridge_report.py > kmeans_brightness/ridge_report.txt
 python kmeans_brightness/degradations.py        # -> degradation_sheets/  ~6 min
+python kmeans_brightness/arc_strategy_experiment.py
+python kmeans_brightness/arc_strategy_report.py
+python kmeans_brightness/collection_experiment.py
+python kmeans_brightness/collection_report.py
+python kmeans_brightness/selection_policy_report.py
+python kmeans_brightness/candidate_search_experiment.py
+python kmeans_brightness/candidate_search_report.py
+python kmeans_brightness/candidate_search_collection.py
+python kmeans_brightness/candidate_search_collection_report.py
+python kmeans_brightness/one_pass_experiment.py
+python kmeans_brightness/one_pass_collection.py
+python kmeans_brightness/one_pass_report.py
+python kmeans_brightness/one_pass_tuning.py
+python kmeans_brightness/one_pass_source_report.py
+python kmeans_brightness/theoretical_validation_report.py
 ```
 
 `degradations.py` renders a `--stamp`-style sheet for every side where a k-means method
@@ -447,7 +489,7 @@ Supporting scripts, none of which are needed to reproduce the reports:
 | `gate_cost.py` | per-side cost of each ridge extractor against one arc fit | ~1 min |
 
 `common.py` (shared loading and the definition of a degradation) and `ridges.py` (the
-seven extractors) are modules, not entry points.
+eight extractors) are modules, not entry points.
 
 ### Stored results
 
@@ -455,6 +497,10 @@ seven extractors) are modules, not entry points.
 `ridge_report.txt` are the rendered analyses, regenerated from the JSON by the two report
 scripts. All four are committed, so the conclusions can be checked without the scan.
 
-Both studies measure the primary path only, with the phase 2–4 fallback ladder disabled,
-and both judge accuracy by within-stamp opposite-side agreement, since there is still no
-ground truth.
+The `worst.jpg` studies measure the primary path only, with the phase 2–4 fallback ladder
+disabled. `theoretical_validation_report.py` intentionally does not read the manual CSV.
+It reports coverage, within-stamp opposite-side agreement, consistency of the horizontal
+and vertical assignments with the same nearest theoretical pair, and agreement between
+the one-pass and sequential selectors. Legacy report scripts can still print the rough
+`Prf.U` and `Prf.L` ruler measurements for diagnosis, but those numbers are not ground
+truth and must not be used to validate or tune a selector.

@@ -15,7 +15,10 @@ import numpy as np
 
 import cv2
 
-VARIANTS = ('raw', 'area', 'conn', 'count', 'close', 'gate', 'stack')
+from edge_profiles import profile_depth
+
+VARIANTS = ('raw', 'area', 'conn', 'count', 'close', 'majority', 'gate',
+            'stack')
 
 # A perforation feature cannot be smaller than about a quarter of a millimetre
 # across, which at 1200 dpi is a disk of roughly this area. Anything smaller
@@ -130,8 +133,94 @@ def closed_depth(depth, window=CLOSE_WINDOW):
                         window, np.nanmin)
 
 
+def _robust_line(x, y, tolerance=3.0):
+    """Small local copy of the production robust fit for standalone use."""
+    keep = np.ones(len(x), dtype=bool)
+    for _ in range(6):
+        if keep.sum() < 3:
+            return None
+        slope, intercept = np.polyfit(x[keep], y[keep], 1)
+        residual = y - (slope * x + intercept)
+        center = np.median(residual[keep])
+        mad = np.median(np.abs(residual[keep] - center))
+        updated = np.abs(residual - center) <= max(
+            tolerance, 3 * 1.4826 * mad,
+        )
+        if np.array_equal(updated, keep):
+            break
+        keep = updated
+    if keep.sum() < 3:
+        return None
+    slope, intercept = np.polyfit(x[keep], y[keep], 1)
+    return float(slope), float(intercept)
+
+
+def line_majority_depth(band, n0, depth=None, return_metadata=False):
+    """Move only premature outer boundaries towards the fitted edge line.
+
+    For a raw boundary above the robust straight edge, select the outermost
+    light pixel whose interval to that line contains strictly more light than
+    dark.  Boundaries on the inward side are the perforation valleys and are
+    deliberately preserved.  If no majority candidate exists, use the first
+    light pixel below the raw boundary.
+    """
+    raw = (_first_run(band, n0) if depth is None
+           else np.asarray(depth, dtype=float))
+    corrected = raw.copy()
+    x = np.arange(len(raw), dtype=float)
+    valid = np.isfinite(raw)
+    fitted = _robust_line(x[valid], raw[valid]) if valid.sum() >= 3 else None
+    shifts = []
+    if fitted is not None:
+        slope, intercept = fitted
+        height = band.shape[0]
+        for column in np.flatnonzero(valid):
+            curve_y = float(raw[column])
+            line_y = float(slope * column + intercept)
+            if curve_y >= line_y:
+                continue
+            curve_row = int(np.clip(round(curve_y) - n0, 0, height - 1))
+            line_row = int(np.clip(np.floor(line_y) - n0, 0, height - 1))
+            if line_row < curve_row:
+                continue
+
+            light = dark = 0
+            candidate = None
+            for row in range(line_row, curve_row - 1, -1):
+                if band[row, column]:
+                    light += 1
+                    if light > dark:
+                        candidate = row
+                else:
+                    dark += 1
+            if candidate is None:
+                below = np.flatnonzero(band[curve_row + 1:, column])
+                if below.size:
+                    candidate = curve_row + 1 + int(below[0])
+            if candidate is None:
+                continue
+            new_y = float(n0 + candidate)
+            if new_y > curve_y:
+                corrected[column] = new_y
+                shifts.append(new_y - curve_y)
+
+    if not return_metadata:
+        return corrected
+    metadata = {
+        'corrected_columns': len(shifts),
+        'mean_shift_px': float(np.mean(shifts)) if shifts else 0.,
+        'max_shift_px': float(np.max(shifts)) if shifts else 0.,
+        'baseline': (None if fitted is None else {
+            'slope': fitted[0], 'intercept': fitted[1],
+        }),
+    }
+    return corrected, metadata
+
+
 def depth_of(band, n0, variant):
     """One band, one variant, one depth profile."""
+    if variant in ('close', 'stack'):
+        return profile_depth(band, n0, variant)
     if variant == 'raw':
         return _first_run(band, n0)
     if variant == 'area':
@@ -140,15 +229,12 @@ def depth_of(band, n0, variant):
         return _first_run(interior_connected(band), n0)
     if variant == 'count':
         return count_depth(filled(band), n0)
-    if variant == 'close':
-        return closed_depth(_first_run(band, n0))
+    if variant == 'majority':
+        return line_majority_depth(band, n0)
     if variant == 'gate':
         # The two filters that never remove real paper: one works in the
         # image on noise too small to be perforation, the other works on the
         # profile on dips too narrow to be a tooth. They fail on different
         # sides, so together they cover more than either alone.
         return closed_depth(_first_run(area_filtered(band), n0))
-    if variant == 'stack':
-        cleaned = filled(interior_connected(area_filtered(band)))
-        return closed_depth(count_depth(cleaned, n0))
     raise ValueError(f'unknown ridge variant: {variant}')
