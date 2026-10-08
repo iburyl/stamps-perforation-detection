@@ -382,3 +382,79 @@ python -m unittest discover -s tests -t .
 
 35 tests, about 45 s. One test needs a real scan (`1K.png`) that is not in the repository
 and skips without it.
+
+---
+
+## Method experiments — `kmeans_brightness/`
+
+A standalone study of two candidate replacements for the phase 1 `brightness` path, kept
+so its numbers can be reproduced rather than re-derived. Nothing in it is imported by the
+tool; it imports `perforation.py` and `segment_stamps.py`, never the other way round.
+
+What is compared:
+
+* **Binarization** — `brightness` (one global threshold, as shipped) against a k-means
+  clustering of the edge band in Lab, where the darkest centroid is fixed to background,
+  the brightest to paper, and every assignment of the remaining centroids is tried: two
+  splits for k=3, four for k=4, six for both together (`kmeans3`, `kmeans4`, `kmeans34`).
+  **`kmeans34` is the chosen direction**, because a global threshold cannot separate a
+  stamp hinge from the paper at all, while a centroid split can, recovering holes that are
+  otherwise unmeasurable.
+* **Ridge extraction** — seven ways to turn an edge band into a boundary depth profile,
+  from the shipped `raw` first-sustained-run rule to an area-and-pinhole gate, an
+  interior-connectivity gate, a paper-count depth, an asymmetric closing of the depth
+  signal, and combinations (`ridges.py`).
+
+### Input
+
+The test scan is `worst.jpg`: 27 worst-case stamps cropped from eight real scans and
+composited onto backing paper, at 1200 dpi. It is 47 MB and is **not** in the repository.
+Point the experiments at your copy:
+
+```
+set STAMPS_WORST_SCAN=C:\path\to\worst.jpg
+```
+
+Without it, the default path in `experiment.py` is used.
+
+### Rerunning
+
+Run from the repository root, in this order. The two experiments use 10 worker processes
+and write the JSON the reports read, so a report can be regenerated in seconds without
+repeating a sweep.
+
+```
+python kmeans_brightness/experiment.py          # -> results.json        ~3.5 min
+python kmeans_brightness/ridge_experiment.py    # -> ridge_results.json  ~12 min
+python kmeans_brightness/report.py       > kmeans_brightness/report.txt
+python kmeans_brightness/ridge_report.py > kmeans_brightness/ridge_report.txt
+python kmeans_brightness/degradations.py        # -> degradation_sheets/  ~6 min
+```
+
+`degradations.py` renders a `--stamp`-style sheet for every side where a k-means method
+does worse than `brightness`, showing the intermediate ridge, the intermediate spots and
+the final arc spots for all six splits, plus a second sheet crossing the chosen splits
+with every ridge extractor. It writes about 316 MB, so the output is left out of the
+repository and regenerated on demand.
+
+Supporting scripts, none of which are needed to reproduce the reports:
+
+| script | purpose | runtime |
+| --- | --- | --- |
+| `check_ridges.py` | asserts the `raw` extractor reproduces `boundary_profile` exactly | ~40 s |
+| `smoke.py [stamp]` | one stamp through all four methods and all six splits | ~1 min |
+| `cost.py` | per-stamp cost of the four methods as they would run in production | ~4 min |
+| `gate_cost.py` | per-side cost of each ridge extractor against one arc fit | ~1 min |
+
+`common.py` (shared loading and the definition of a degradation) and `ridges.py` (the
+seven extractors) are modules, not entry points.
+
+### Stored results
+
+`results.json` and `ridge_results.json` are the raw measurements; `report.txt` and
+`ridge_report.txt` are the rendered analyses, regenerated from the JSON by the two report
+scripts. All four are committed, so the conclusions can be checked without the scan.
+
+Both studies measure the primary path only, with the phase 2–4 fallback ladder disabled,
+and both judge accuracy by within-stamp opposite-side agreement, since there is still no
+ground truth.
