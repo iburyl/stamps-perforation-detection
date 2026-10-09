@@ -339,10 +339,68 @@ the image.
 
 ## Performance
 
-Phase 1 computes fourteen inexpensive profiles but performs only one greyscale arc pass
-per side. The previous timing table described the removed brightness-first pipeline and
-is intentionally not reused. The fallback ladder can still dominate stamps whose primary
-pass fails, and orientation refinement can cause the complete measurement to run twice.
+The previous timing table described the removed brightness-first pipeline and is
+intentionally not reused. What follows is a static cost accounting derived from the code,
+not a measurement; the figures are hypothesis counts, which are stable, rather than
+wall-clock, which is not.
+
+The unit of cost is one `refine_valleys()` arc-lattice fit. `kmeans_brightness/gate_cost.py`
+measured a full-side pass at about 1037 ms; the calls inside the recovery grids carry fewer
+seeds and are cheaper, so treat 1 s as an upper anchor. Everything else in the pipeline —
+binarisation, boundary profiles, periodicity scoring, threshold sweeps — is negligible
+beside it.
+
+| Stage | Method | Arc fits per invocation |
+| --- | --- | --- |
+| 1 | `cross_support_edge()` | 1, after 14 cheap profile probes |
+| 2 | `adaptive_color_edge()` | 1, after 84 cheap threshold probes |
+| 3 | `recover_missing_side()` | anchor pairs × pitch candidates × 5 phases × 25 normal offsets ≈ 125–500 |
+| 3 | `recover_side_by_parallel_scan()` | ≤2 slopes × ~19 offsets × 4 phases ≈ 150 |
+| 4 | `recover_side_by_sequential_kmeans_lab()` | ≤12 profiles × 3 Lab channels ≤ 36 |
+
+So the primary path is close to free and the ladder is two to three orders of magnitude
+more expensive. Both phase-3 methods evaluate their *entire* grid with the full fitter and
+keep the best hypothesis; neither screens candidates first nor stops early on a good one.
+
+Three structural multipliers apply on top:
+
+* The recovery loop in `measure_stamp()` runs up to two passes, and a **third** geometry
+  pass follows the phase-4 challenge, so a side can enter `recover_missing_side()` and
+  `recover_side_by_parallel_scan()` three times with unchanged inputs.
+* A side that failed `recover_side_by_parallel_scan()` cheaply in pass 1 (its
+  `reliable_side(opposite)` guard short-circuits in microseconds) pays the full grid in a
+  later pass once the opposite side has been recovered.
+* Orientation refinement re-measures the stamp from scratch, so all of the above happens
+  twice and the first round's recovery work is discarded.
+
+The worst case observed is roughly 1000 arc fits per `measure_stamp()` call, about 70% of
+them spent on a single side that cannot succeed at any price — see the case study below.
+
+`--stamp` debug runs are slower than production **by design**: the `collect_trials` block
+runs all three recovery methods on all four sides regardless of whether the side already
+succeeded, so that `algorithm_trials.json` records what each method would have produced.
+Debug timings are not representative of a batch run.
+
+### Identified but unimplemented speedups
+
+Recorded here so the analysis is not repeated. None of these are in the code.
+
+* **Skip recovery in the orientation pass.** The consensus only votes on arc-supported
+  phase-1 sides, so the first `measure_stamp()` call does not need the ladder at all.
+  Halves the cost of every hard stamp at no accuracy risk — the largest single saving.
+* **Pre-screen grid hypotheses.** Score each candidate line with a cheap proxy (mean
+  gradient magnitude at the predicted seeds, say) and arc-fit only the best handful. The
+  strict circle gate still decides, so currently-succeeding cases are unaffected. Highest
+  payoff, and the one needing most care: the proxy must not discard the true offset.
+* **Reject bands that cannot hold an edge.** If a side's binary band is effectively
+  single-class there is no paper/background transition in it, and every in-band method
+  (phases 1, 2, the normal scan, and phase 4) is guaranteed to fail. The test is one
+  `mean()`. Only `recover_missing_side()` should survive the guard, since it extrapolates
+  from neighbours and may legitimately reach outside the box.
+* **Memoise failed geometric recoveries** on (side, reliable neighbours, their lines and
+  pitches), which is what they are deterministic in, to suppress the repeat passes above.
+* **Cap arc fits per side**, so a pathological stamp has a predictable ceiling instead of
+  an unbounded one.
 
 ## Known limitations
 
@@ -362,6 +420,55 @@ pass fails, and orientation refinement can cause the complete measurement to run
   interpolation, Sobel and k-means behaviour.
 * The per-hole diagnostics in `segment_stamps.py` **re-implement** the fitting loop from
   `refine_perforation.py` rather than calling it, so the two can drift apart.
+* **A mis-placed detection box fails silently and expensively.** Nothing downstream checks
+  that the stamp is actually inside its own box, so a lateral offset is reported as a
+  per-side measurement failure rather than as a detection fault. See the case study below.
+
+## Case study — laterally offset detection box
+
+Worked out from the `--stamp` debug artefacts of id 6 in the 14K scan, without rerunning
+detection. It is recorded because the symptoms are misleading: the visible complaints were
+"left border is way off" and "everything takes a very long time", and neither is a
+perforation-measurement problem.
+
+**The orientation is correct.** Coarse estimation returned 0.000° — it only ever saw the
+axis-aligned bounding box — and the refinement corrected it to −4.231°, voted for by top
+(−4.297°) and bottom (−4.165°). The rectified stamp is square, so the refinement did its
+job. Residual tilt in the refined frame is 0.127° top, 0.009° bottom, 0.174° right, and
+2.363° left; the left outlier is a consequence of the real fault, not the cause.
+
+**The box is laterally offset.** The stamp body occupies patch x 260..1056, while the box
+claims x 105..977: shifted 117 px left and 76 px too narrow. The search bands inherit the
+error, and three of the four then straddle the wrong material:
+
+| side | search band | true edge | consequence |
+| --- | --- | --- | --- |
+| bottom | 1128..1346 | 1262 | correct — the only side measured at phase 1 (11 arcs, gauge 14.598, `ok`) |
+| left | 57..218 | 260 | 42 px **outside** the stamp; the band is pure backing paper |
+| right | 864..1025 | 1056 | 31 px **outside**; the band lands in the printed design |
+| top | 40..258 | ~165 | inside, but the outer half is the scan's bright border strip |
+
+Everything else follows. Left produced one arc against the 5-arc bar and published nothing;
+its raw phase-1 reading (pitch 58.5 px, gauge 16.144, coverage 0.51, autocorrelation 0.29,
+from the `k31`/`close` profile) is noise fitted to backing paper, and the line it drew sits
+about 110 px too far left at the top and 60 px at the bottom. Every left fallback returned
+`unavailable`, which is the correct answer — no method can find an edge in a band that
+contains no edge. Top and right were rescued geometrically from their neighbours at phase 3
+(14.506 and 14.942), with `seed_source == 'hypothesis'`; right's recovery line lies at scan
+x 6216..6298, i.e. **outside** the box's own right edge at 6184. Only bottom carries
+`seed_source == 'image'`, so this stamp rests on a single trustworthy side.
+
+Note the asymmetry worth knowing about: `recover_missing_side()` reached outside the box to
+save right, but there is no equivalent reach on left, whose rescue depends on an opposite
+side that never became reliable in time.
+
+**Probable cause of the bad box**, stated as a hypothesis because confirming it needs a
+detection rerun: the stamp abuts the scan's bright top border. The patch's top-right corner
+sits at scan y=98, inside the known ~143 px border strip, and the box top is at scan y=129.
+
+The runtime is the same fault seen from the other end — three of four sides fail phase 1 and
+climb the whole ladder, twice over because of the orientation re-measure. See *Performance*
+for the accounting and for the early-exit guards that would make this case fail fast.
 
 ## Tests
 
