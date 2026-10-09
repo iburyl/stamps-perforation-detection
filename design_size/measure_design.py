@@ -685,6 +685,123 @@ def draw_design(image, results, skipped, unit):
     return image
 
 
+def photometric_match(predicted, actual, valid, weight):
+    """Carry the golden onto one stamp's own ink with a gain and an offset.
+
+    The per-stamp normalisation in ``stamp_patch`` equalises mean and spread
+    but not ink density, so the design does not cancel without this. The fit
+    uses inliers only, which is what keeps the cancellation out of it: a heavy
+    postmark would otherwise drag the gain and leave the design behind.
+    """
+    use = valid & (weight > 0.5)
+    if use.sum() < 100:
+        use = valid
+    gain, offset = np.polyfit(predicted[use].astype(np.float64),
+                              actual[use].astype(np.float64), 1)
+    return (gain * predicted + offset).astype(np.float32)
+
+
+def deghost(residual, design, valid, window):
+    """Remove the part of a residual that a local misregistration explains.
+
+    A shift of d turns the design into design + d.grad(design), so the design's
+    own edges dominate the residual wherever registration is imperfect by a
+    fraction of a pixel. Fitting that two-parameter model over a sliding window
+    and subtracting it leaves only what no shift could account for. A postmark
+    is not a shifted copy of the design, so it survives.
+    """
+    keep = valid.astype(np.float32)
+    gx = cv2.Sobel(design, cv2.CV_32F, 1, 0, ksize=3) * keep
+    gy = cv2.Sobel(design, cv2.CV_32F, 0, 1, ksize=3) * keep
+    masked = residual * keep
+
+    def box(array):
+        return cv2.boxFilter(array, cv2.CV_32F, (window, window))
+
+    xx, yy, xy = box(gx * gx), box(gy * gy), box(gx * gy)
+    xr, yr = box(gx * masked), box(gy * masked)
+    determinant = xx * yy - xy * xy
+    safe = np.abs(determinant) > 1e-8
+    divisor = np.where(safe, determinant, 1.0)
+    along_x = np.where(safe, (yy * xr - xy * yr) / divisor, 0.0)
+    along_y = np.where(safe, (xx * yr - xy * xr) / divisor, 0.0)
+    return residual - (along_x * gx + along_y * gy)
+
+
+def reveal_stamp(patch, predicted, mask, weight, fade, window):
+    """Darkness on one stamp that the shared design does not account for.
+
+    Returned in the patch's own photometric units, alongside how much design
+    ink stands over each pixel: where that approaches one the postmark would be
+    ink on ink, and absence of residual there is not evidence of absence.
+    """
+    valid = mask > 0
+    design = photometric_match(predicted, patch, valid, weight)
+    paper = np.percentile(patch[valid], 90.0)
+    design_paper = np.percentile(design[valid], 90.0)
+    revealed = (paper - patch) - fade * (design_paper - design)
+    revealed = deghost(revealed, design, valid, window)
+    revealed[~valid] = 0.0
+
+    floor = np.percentile(design[valid], 2.0)
+    ink = np.clip((design_paper - design) / max(design_paper - floor, 1e-6),
+                  0.0, 1.0)
+    ink[~valid] = 0.0
+    return revealed, ink
+
+
+BLIND_TINT = (150, 205, 240)
+
+
+def draw_reveal(image, patches, masks, placements, warps, weights, golden,
+                canvas, fade, window):
+    """The scan with the shared design removed from every stamp.
+
+    The geometry is the original scan's, so this can be laid beside
+    ``_detected.jpg``. Outside the measured stamps the scan is left as a pale
+    ghost, which keeps the layout and the perforation visible without
+    competing with what has been revealed.
+    """
+    height, width = image.shape[:2]
+    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    canvas_shape = (canvas[1], canvas[0])
+    flags = cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP
+
+    revealed = np.zeros((height, width), np.float32)
+    blindness = np.zeros((height, width), np.float32)
+    painted = np.zeros((height, width), np.float32)
+    for patch, mask, placement, warp, weight in zip(
+            patches, masks, placements, warps, weights):
+        predicted = cv2.warpAffine(golden, warp, canvas_shape,
+                                   flags=cv2.INTER_LINEAR)
+        extra, ink = reveal_stamp(patch, predicted, mask, weight, fade, window)
+        for source, target in ((extra, revealed), (ink, blindness),
+                               (np.minimum(mask, 1).astype(np.float32),
+                                painted)):
+            target += cv2.warpAffine(source, placement, (width, height),
+                                     flags=flags,
+                                     borderMode=cv2.BORDER_CONSTANT,
+                                     borderValue=0)
+
+    inside = painted > 0.5
+    if inside.any():
+        # One scale for the whole scan, so that stamps stay comparable.
+        span = np.percentile(revealed[inside], 99.5)
+        strength = np.clip(revealed / max(span, 1e-6), 0.0, 1.0)
+    else:
+        strength = np.zeros_like(revealed)
+
+    paper = np.clip(1.0 - 0.18 * (1.0 - grey), 0.0, 1.0)
+    out = np.dstack([paper, paper, paper])
+    tint = np.array(BLIND_TINT, np.float32) / 255.0
+    blind = np.clip((blindness - 0.45) / 0.55, 0.0, 1.0) ** 2
+    base = np.where(inside[..., None],
+                    1.0 - blind[..., None] * (1.0 - tint), out)
+    revealed_rgb = base * (1.0 - strength[..., None])
+    out = np.where(inside[..., None], revealed_rgb, out)
+    return np.clip(out * 255.0, 0, 255).astype(np.uint8)
+
+
 def measure_scan(image, document, schedule, iterations, eps, cutoff,
                  erode_px, pad, search_span, min_significance,
                  width_tolerance, span, rule_index, min_coverage, verbose):
@@ -759,8 +876,11 @@ def measure_scan(image, document, schedule, iterations, eps, cutoff,
             'design_corners_image': rectangle_on_scan(
                 rectangle, warps[index], placements[index]).tolist(),
         })
+    registration = {'patches': patches, 'masks': masks,
+                    'placements': placements, 'warps': warps,
+                    'weights': weights}
     return golden, coverage, rules, rule_index, results, canvas, min_stamps, \
-        skipped, candidates
+        skipped, candidates, registration
 
 
 def main():
@@ -810,6 +930,15 @@ def main():
         '--profile-span', type=float, default=0.5,
         help='Central fraction of the opposite axis used per profile (default: 0.5)')
     parser.add_argument(
+        '--reveal-fade', type=float, default=1.0,
+        help=('How much of the design to remove, from 0 for none to 1 for all '
+              '(default: 1.0)'))
+    parser.add_argument(
+        '--reveal-window', type=int, default=129,
+        help=('Side of the window, in pixels, over which the local '
+              'misregistration that would otherwise leave the design edges '
+              'ghosting is fitted and removed (default: 129)'))
+    parser.add_argument(
         '--min-coverage', type=float, default=0.3,
         help=('Fraction of the stamps that must reach a pixel before the '
               'golden is read there, which keeps the thinly covered canvas '
@@ -829,6 +958,10 @@ def main():
         parser.error('--rule must be a positive rule number')
     if not 0.0 < args.min_coverage <= 1.0:
         parser.error('--min-coverage must be in (0, 1]')
+    if not 0.0 <= args.reveal_fade <= 1.0:
+        parser.error('--reveal-fade must be in [0, 1]')
+    if args.reveal_window < 3 or args.reveal_window % 2 == 0:
+        parser.error('--reveal-window must be an odd number of pixels, >= 3')
 
     input_path = Path(args.input)
     perf_path = Path(args.perf) if args.perf else \
@@ -844,7 +977,7 @@ def main():
         print(f'Image: {input_path}')
 
     golden, coverage, rules, rule_index, results, canvas, min_stamps, \
-        skipped, candidates = measure_scan(
+        skipped, candidates, registration = measure_scan(
             image, document, DEFAULT_SCHEDULE, args.iterations, args.eps,
             args.outlier_cutoff, args.erode, args.pad, args.rule_search_span,
             args.rule_significance, args.rule_width_tolerance,
@@ -867,6 +1000,14 @@ def main():
                        draw_design(image, results, skipped, unit)):
         raise RuntimeError(f'Cannot write image: {drawn_path}')
 
+    reveal_path = input_path.with_name(input_path.stem + '_cancel.jpg')
+    if not cv2.imwrite(str(reveal_path), draw_reveal(
+            image, registration['patches'], registration['masks'],
+            registration['placements'], registration['warps'],
+            registration['weights'], golden, canvas, args.reveal_fade,
+            args.reveal_window)):
+        raise RuntimeError(f'Cannot write image: {reveal_path}')
+
     payload = {
         'format': 'stamp-design-size',
         'version': 1,
@@ -887,6 +1028,7 @@ def main():
             'preview': golden_path.name,
         },
         'annotated_scan': drawn_path.name,
+        'cancellation_scan': reveal_path.name,
         'parameters': {
             'schedule': [list(level) for level in DEFAULT_SCHEDULE],
             'iterations': args.iterations,
@@ -900,6 +1042,8 @@ def main():
             'profile_span': args.profile_span,
             'min_coverage': args.min_coverage,
             'rule': args.rule,
+            'reveal_fade': args.reveal_fade,
+            'reveal_window': args.reveal_window,
         },
         'stamps': results,
     }
@@ -945,7 +1089,8 @@ def main():
         if skipped:
             print('\nNot measured, no four published perforation sides: '
                   + ', '.join(str(number) for number, _ in skipped))
-        print(f"\nWrote {out_path}\nWrote {golden_path}\nWrote {drawn_path}")
+        print(f"\nWrote {out_path}\nWrote {golden_path}\nWrote {drawn_path}\n"
+              f"Wrote {reveal_path}")
 
 
 if __name__ == '__main__':

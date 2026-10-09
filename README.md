@@ -532,6 +532,7 @@ python design_size/measure_design.py scan.jpg --dpi 1200
 | `scan_design_size.jpg` | the scan with each design rectangle, its corners and its size in mm |
 | `scan_design.json` | per-stamp design rectangle, fitted scales and quality figures |
 | `scan_golden.png` | the averaged design with every detected frame rule drawn |
+| `scan_cancel.jpg` | the scan with the shared design subtracted, leaving the cancellations |
 
 `scan_design_size.jpg` is the result meant to be read, and is the counterpart of
 `scan_detected.jpg`. Line weights, font scale and label position follow it, so the two can
@@ -698,6 +699,48 @@ To place it back on the scan, the golden rectangle's corners are carried through
 stamp's fitted transform into its canvas and then through the inverse of the rigid
 placement that put the canvas there, giving `design_corners_image` in original scan
 pixels. The perforation stage's own detection box is reused only to position the label.
+
+## Revealing the cancellations
+
+Congealing separates every stamp into what it shares with the others and what is only its
+own. The design size is measured from the first part; `scan_cancel.jpg` is the second,
+which is very largely the postmark. It is written on every run, not behind a flag, because
+it is a by-product of work already done rather than a separate job.
+
+Nothing extra is estimated. The golden warped into each stamp's own frame is already
+computed, today only to report `residual_rms`, and it is already the basis on which the
+outlier weighting recognises cancellation ink. Subtracting it costs one more pass.
+
+`scan_cancel.jpg` keeps the scan's geometry, so it can be laid beside `scan_detected.jpg`.
+Outside the measured stamps the scan is left as a pale ghost, which keeps the layout and
+the perforation readable without competing with what has been revealed.
+
+Two corrections do the real work:
+
+* **A gain and an offset per stamp**, fitted on inlier pixels only. The normalisation in
+  `stamp_patch` equalises each stamp's mean and spread but not its ink density, so without
+  this the dark parts of the design do not cancel. Fitting on inliers is what keeps a heavy
+  postmark from dragging the gain and leaving the design behind.
+* **Local-shift deghosting.** A misregistration of a fraction of a pixel turns the design
+  into design + d·∇design, which is why the oval and the lettering survive a plain
+  subtraction while the paper between them does not. That two-parameter model is fitted
+  over a sliding `--reveal-window` and subtracted, removing the part of the residual that
+  any local shift could explain. A postmark is not a shifted copy of the design, so it
+  stays; in the tests the model removes at least 60% of a 0.3 px misregistration while
+  leaving an added mark intact.
+
+`--reveal-fade` sets how much of the design to take out, from 0 to 1. Full removal reads
+the postmark most clearly; leaving a quarter behind shows where on the design it sits.
+
+**Where the design prints solid, there is no signal to recover** — the postmark there is
+ink on ink. Those pixels are tinted rather than left blank, because blank would read as
+"no cancellation here" when it means "nothing could have been seen here". The tint tracks
+the design's own ink, so on a stamp whose frame and oval are solid it covers exactly those.
+
+**Fine design detail comes back as texture.** Stipple and engraving at the resolution limit
+do not register identically across stamps, so the average blurs them and each stamp keeps
+its own version, which the subtraction cannot remove. It is visible as a fine mottle and is
+not part of the cancellation.
 
 ## What the numbers are worth
 

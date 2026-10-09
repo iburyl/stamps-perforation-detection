@@ -173,6 +173,55 @@ class SelectionTest(unittest.TestCase):
             measure_design.choose_consistent_rule(candidates, start, 1.5))
 
 
+class RevealTest(unittest.TestCase):
+    def design(self):
+        """Something with edges in both directions to misregister."""
+        field = np.zeros((200, 200), np.float32)
+        field[:, ::9] = 1.0
+        field[::11, :] = 1.0
+        cv2.circle(field, (100, 100), 55, 0.8, 7)
+        return cv2.GaussianBlur(field, (0, 0), 1.2)
+
+    def test_photometric_match_recovers_a_known_gain_and_offset(self):
+        predicted = self.design()
+        actual = 0.62 * predicted - 0.4
+        valid = np.ones(predicted.shape, bool)
+        matched = measure_design.photometric_match(
+            predicted, actual, valid, np.ones(predicted.shape, np.float32))
+        self.assertLess(np.abs(matched - actual).max(), 1e-4)
+
+    def test_photometric_match_is_not_dragged_by_the_cancellation(self):
+        """A heavy postmark is exactly what the gain must not be fitted to."""
+        predicted = self.design()
+        actual = 0.62 * predicted - 0.4
+        defaced = actual.copy()
+        weight = np.ones(predicted.shape, np.float32)
+        defaced[:90] -= 1.5
+        weight[:90] = 0.0
+        matched = measure_design.photometric_match(
+            predicted, defaced, valid=np.ones(predicted.shape, bool),
+            weight=weight)
+        self.assertLess(np.abs(matched - actual)[120:].max(), 1e-4)
+
+    def test_deghost_removes_a_subpixel_shift_and_keeps_a_postmark(self):
+        design = self.design()
+        shift = np.array([[1.0, 0.0, 0.3], [0.0, 1.0, -0.25]])
+        observed = cv2.warpAffine(design, shift, (200, 200),
+                                  flags=cv2.INTER_CUBIC)
+        postmark = np.zeros((200, 200), np.float32)
+        cv2.circle(postmark, (100, 100), 30, 0.6, -1)
+        valid = np.zeros((200, 200), bool)
+        valid[20:180, 20:180] = True
+
+        ghost = observed - design
+        cleaned = measure_design.deghost(ghost, design, valid, 49)
+        self.assertLess(np.abs(cleaned[valid]).mean(),
+                        0.4 * np.abs(ghost[valid]).mean())
+
+        kept = measure_design.deghost(ghost + postmark, design, valid, 49)
+        self.assertGreater((kept - cleaned)[postmark > 0].mean(), 0.5 * 0.6)
+
+
 class BandTest(unittest.TestCase):
     def test_thinly_covered_lines_cannot_look_like_a_rule(self):
         """The 70K margin artefact: a dark band carried by one or two stamps
