@@ -731,9 +731,9 @@ def deghost(residual, design, valid, window):
 def reveal_stamp(patch, predicted, mask, weight, fade, window):
     """Darkness on one stamp that the shared design does not account for.
 
-    Returned in the patch's own photometric units, alongside how much design
-    ink stands over each pixel: where that approaches one the postmark would be
-    ink on ink, and absence of residual there is not evidence of absence.
+    In the patch's own photometric units. Where the design prints solid the
+    postmark would be ink on ink, so there is nothing to recover and the result
+    is blank: absence of residual is not evidence of absence of a cancel.
     """
     valid = mask > 0
     design = photometric_match(predicted, patch, valid, weight)
@@ -742,15 +742,7 @@ def reveal_stamp(patch, predicted, mask, weight, fade, window):
     revealed = (paper - patch) - fade * (design_paper - design)
     revealed = deghost(revealed, design, valid, window)
     revealed[~valid] = 0.0
-
-    floor = np.percentile(design[valid], 2.0)
-    ink = np.clip((design_paper - design) / max(design_paper - floor, 1e-6),
-                  0.0, 1.0)
-    ink[~valid] = 0.0
-    return revealed, ink
-
-
-BLIND_TINT = (150, 205, 240)
+    return revealed
 
 
 def draw_reveal(image, patches, masks, placements, warps, weights, golden,
@@ -768,14 +760,13 @@ def draw_reveal(image, patches, masks, placements, warps, weights, golden,
     flags = cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP
 
     revealed = np.zeros((height, width), np.float32)
-    blindness = np.zeros((height, width), np.float32)
     painted = np.zeros((height, width), np.float32)
     for patch, mask, placement, warp, weight in zip(
             patches, masks, placements, warps, weights):
         predicted = cv2.warpAffine(golden, warp, canvas_shape,
                                    flags=cv2.INTER_LINEAR)
-        extra, ink = reveal_stamp(patch, predicted, mask, weight, fade, window)
-        for source, target in ((extra, revealed), (ink, blindness),
+        extra = reveal_stamp(patch, predicted, mask, weight, fade, window)
+        for source, target in ((extra, revealed),
                                (np.minimum(mask, 1).astype(np.float32),
                                 painted)):
             target += cv2.warpAffine(source, placement, (width, height),
@@ -792,14 +783,9 @@ def draw_reveal(image, patches, masks, placements, warps, weights, golden,
         strength = np.zeros_like(revealed)
 
     paper = np.clip(1.0 - 0.18 * (1.0 - grey), 0.0, 1.0)
-    out = np.dstack([paper, paper, paper])
-    tint = np.array(BLIND_TINT, np.float32) / 255.0
-    blind = np.clip((blindness - 0.45) / 0.55, 0.0, 1.0) ** 2
-    base = np.where(inside[..., None],
-                    1.0 - blind[..., None] * (1.0 - tint), out)
-    revealed_rgb = base * (1.0 - strength[..., None])
-    out = np.where(inside[..., None], revealed_rgb, out)
-    return np.clip(out * 255.0, 0, 255).astype(np.uint8)
+    out = np.where(inside, 1.0 - strength, paper)
+    return np.clip(cv2.cvtColor(out, cv2.COLOR_GRAY2BGR) * 255.0,
+                   0, 255).astype(np.uint8)
 
 
 def measure_scan(image, document, schedule, iterations, eps, cutoff,

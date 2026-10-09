@@ -732,15 +732,16 @@ Two corrections do the real work:
 `--reveal-fade` sets how much of the design to take out, from 0 to 1. Full removal reads
 the postmark most clearly; leaving a quarter behind shows where on the design it sits.
 
-**Where the design prints solid, there is no signal to recover** — the postmark there is
-ink on ink. Those pixels are tinted rather than left blank, because blank would read as
-"no cancellation here" when it means "nothing could have been seen here". The tint tracks
-the design's own ink, so on a stamp whose frame and oval are solid it covers exactly those.
+The output is plain greyscale and carries no annotation, so everything in it is the
+subtraction's own result and can be judged as such. Two things in it are not cancellation:
 
-**Fine design detail comes back as texture.** Stipple and engraving at the resolution limit
-do not register identically across stamps, so the average blurs them and each stamp keeps
-its own version, which the subtraction cannot remove. It is visible as a fine mottle and is
-not part of the cancellation.
+* **Where the design prints solid there is no signal to recover**, because the postmark
+  there is ink on ink. Those areas come out blank, and blank means "nothing could have
+  been seen here" rather than "no cancellation here".
+* **Fine design detail comes back as texture.** Stipple and engraving at the resolution
+  limit do not register identically across stamps, so the average blurs them and each
+  stamp keeps its own version, which no subtraction can remove. It shows as a faint ghost
+  of the design and a fine mottle.
 
 ## What the numbers are worth
 
