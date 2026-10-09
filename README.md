@@ -515,14 +515,200 @@ climb the whole ladder. This stamp does not have enough primary edges to establi
 orientation, so the safe orientation guard retains its full coarse-angle pass. It still
 needs the early-exit guards described in *Performance* to fail fast.
 
+---
+
+# Design size — `design_size/`
+
+A second, independent measurand: the size of the **printed design** on each stamp, as
+opposed to the perforation that surrounds it. It consumes a scan plus the `*_perf.json`
+written by the detector.
+
+```
+python design_size/measure_design.py scan.jpg --dpi 1200
+```
+
+| file | contents |
+| --- | --- |
+| `scan_design_size.jpg` | the scan with each design rectangle, its corners and its size in mm |
+| `scan_design.json` | per-stamp design rectangle, fitted scales and quality figures |
+| `scan_golden.png` | the averaged design with every detected frame rule drawn |
+
+`scan_design_size.jpg` is the result meant to be read, and is the counterpart of
+`scan_detected.jpg`. Line weights, font scale and label position follow it, so the two can
+be compared at the same zoom. The rectangle is red, its corners cyan, and the label carries
+the stamp number and the size to two decimals. A stamp the perforation stage could not
+close has no design rectangle and is outlined in grey as `not measured`, so the omission is
+visible rather than silent.
+
+Because neither the fitted transform nor the placement shears, the drawn quadrilateral's
+side lengths *are* the reported width and height — the annotation is the measurement, not
+an illustration of it.
+
+One scan is one population. Different scans carry different designs and are never matched
+to each other; nothing in the tool compares across scans.
+
+## The measurand
+
+The design is bounded by one or more printed **rules**. The reported rectangle is the
+separation of opposite rule **centrelines**, counted outwards-in, with `--rule 1` the
+outermost. A rule's width grows with inking pressure, roughly symmetrically, so its edges
+move with the printing and its middle does not. This is the same reasoning that puts the
+perforation datum at the valley bases rather than the tooth tips.
+
+All rules found on all four sides are recorded in `rules`, so the choice is auditable and a
+different one can be published without re-deriving anything. Their separation is also a
+free consistency check: two genuine rules keep a constant gap, and on the 5K scan they do,
+19.2 px horizontally against 18.5 px vertically. Not every design has a second rule — the
+high values with coloured centres have only a thin outer rule — so a `rules` entry beyond
+the first is not evidence that one exists.
+
+## Why an average, and why it is not optional
+
+The design is not centred inside its perforation. Measured across 28 stamps, the gap from
+the valley line to the design runs from 0 to 38 px horizontally and 0 to 60 px vertically,
+and the perforation frequently cuts the design away entirely at a corner.
+
+Two consequences follow, and they point in the same direction:
+
+* **A per-stamp rectangle fit is not reliable.** The feature being measured is partly
+  absent on many stamps.
+* **Averaging on the perforation frame alone does not work.** A de-centring of 38 px is
+  wider than the frame rule itself, so the rules of different stamps do not overlap and the
+  average has no rule to detect.
+
+So the average and the per-stamp fit are *the same operation*: the stamps are jointly
+registered against their own running average until it converges (congealing), and the
+average is simply the fixed point. Scale is then measured against the whole design — the
+oval, the lettering, the ornaments — rather than against an edge that may not be there.
+
+## Algorithmic flow
+
+### 1. Common frame
+
+Each stamp's valley-base quadrilateral is intersected from the four `line_image` entries in
+the perforation JSON. A stamp missing any side is skipped: three lines cannot bound a
+stamp, and reconstructing the fourth would import the perforation measurement's error into
+this one.
+
+Each stamp is then placed on a shared canvas by **rotation and translation only**. No
+scaling is applied at this stage, because scale is the measurand. The mask is the valley
+quadrilateral eroded by `--erode`, every pixel of which is paper by construction. Grey is
+taken from Lab L and normalised to zero mean and unit variance per stamp, since ink density
+and paper tone vary and only geometry is being compared.
+
+### 2. Congealing
+
+Four pyramid levels, 1/8 to 1/1, with two or three rounds each. Each round rebuilds the
+average, re-registers every stamp against it, re-fixes the gauge, and recomputes the
+outlier weights. The coarse levels exist to carry the de-centring, which is far larger than
+the frame rule is wide.
+
+Registration is `cv2.findTransformECC` with an affine model. Maximising the correlation
+coefficient is invariant to linear brightness and contrast change, which is needed because
+cancellation, fading and scan exposure differ between stamps, and it returns a continuous
+sub-pixel transform. A discrete size sweep would be both slower and less precise.
+
+### 3. Five degrees of freedom, not six
+
+`MOTION_AFFINE` has six. The sixth is shear, and nothing shears a printed design: shrinkage
+and plate differences scale it along its own axes, and the platen is rigid. Fitting shear
+anyway only lets registration noise leak into the two scales being measured, so each
+estimate is projected back onto scale, rotation and translation.
+
+The shear the unconstrained fit asked for is kept as `unconstrained_shear`, and the
+residual angle as `residual_rotation_deg`. Both should be near zero — the perforation
+geometry already removed the rotation — so both are independent evidence that a stamp
+registered, not parameters of the answer.
+
+### 4. Gauge fixing
+
+Congealing determines the stamps only up to one transform shared by all of them. Left
+alone, the whole set drifts. Each round pins the geometric mean scale to 1 and the mean
+rotation and translation to 0. That also makes the golden's own rectangle the collection
+mean, so it can be read directly, and keeps the per-stamp angle usable as the check above.
+
+### 5. Robust weighting
+
+Cancellation ink, hinge remnants and tears are uncorrelated between stamps, so they stand
+out as large local residuals against the average. Pixels beyond `--outlier-cutoff` robust
+sigma stop contributing, to both the average and the next registration. The surviving
+fraction is reported per stamp as `kept_fraction`; on the three scans tested it runs from
+0.93 to 1.00.
+
+### 6. Reading the golden
+
+Profiles are taken over the central `--profile-span` of each axis and reduced with a
+median, because ornaments and value text interrupt the frame on any single row.
+
+A pixel is only read if at least `--min-coverage` of the stamps reach it. This guard is
+load-bearing, not hygiene. Near the canvas margin only one or two stamps reach a pixel, so
+whatever they happen to carry there survives averaging intact and looks exactly like a
+rule. Without the quorum, the 70K scan measured its height as 22.98 mm against a true
+22.46 mm, because the outermost "rule" it found was a dark margin artefact contributed by
+two stamps. The quorum is what makes the average, rather than any individual stamp, the
+thing being measured. Pixels below it are dimmed in `scan_golden.png`.
+
+### 7. Output
+
+Each stamp's rectangle is the golden rectangle multiplied by that stamp's own fitted
+`scale_x` and `scale_y`.
+
+To place it back on the scan, the golden rectangle's corners are carried through the
+stamp's fitted transform into its canvas and then through the inverse of the rigid
+placement that put the canvas there, giving `design_corners_image` in original scan
+pixels. The perforation stage's own detection box is reused only to position the label.
+
+## What the numbers are worth
+
+**Relative sizes are precise; absolute sizes are not.** Every stamp's figure is the golden
+rectangle scaled, so the absolute value rests on one rule detection on one image, and a
+bias there moves every stamp in the scan equally. Relative differences within a scan are
+unaffected. For sorting a scan into groups this is the right trade; for quoting a
+traceable millimetre figure it is not.
+
+**The precision is real and was measured.** Re-running a scan with a different mask
+erosion, canvas padding and congealing schedule moves the fitted scales by a run-to-run sd
+of 319 ppm in x and 96 ppm in y, against a between-stamp sd of 3798 ppm and 2349 ppm. The
+method therefore resolves the observed spread about twelve times over. In millimetres, on
+the 5K scan, that is roughly 0.005 mm of method noise against a 0.063 mm spread.
+
+**The error budget is physical, not algorithmic.** At 1200 dpi one pixel is 21 µm, and
+sub-pixel registration over a frame perimeter of a few thousand pixels is far below that.
+What remains is paper shrinkage, ink spread and scanner geometry.
+
+## Known limitations
+
+* **Nothing checks the scanner.** A flatbed whose true x and y scale differ, or whose scale
+  varies along the platen, produces exactly the signature this tool is designed to find.
+  Measured size should be regressed against position along the scan before any difference
+  is believed. `--dpi` is taken on trust here as it is elsewhere.
+* **Shrinkage is not separated from plate differences.** Sheets were perforated after
+  printing, so drying shrinkage moves the design size and the perforation pitch together.
+  Correlating the two against `*_perf.json` would test this; it has not been done.
+* **A size difference is assumed to be the whole story.** Genuinely different dies would
+  also register as a scale change. The residual map between two groups distinguishes them —
+  pure scale gives residuals growing radially from the centre, different dies give local
+  ones — but the tool does not compute it.
+* **Three stamps minimum**, and few stamps make a weak average; the quorum is clamped to
+  two stamps so a small scan still measures something.
+* **The rule search is a thresholded run**, not a fitted model, so a design whose outer
+  rule is lighter than `--band-level` relative to its interior needs that flag moved.
+
 ## Tests
 
 ```
 python -m unittest discover -s tests -t .
 ```
 
-46 tests, about one minute. The real hinge regression uses a cropped fixture stored in
+About one minute. The real hinge regression uses a cropped fixture stored in
 `tests/fixtures/`, so the suite has no external scan dependency and does not skip in CI.
+
+`tests/test_design_size.py` closes the loop on the design measurement with a synthetic set
+that is de-centred by more than its frame rule is wide and defaced with cancellation bars:
+known independent x and y scales are recovered to 0.2%, and the rectangle to 1.5 px. Two
+of its cases are regressions for bugs found on real scans — a margin artefact read as a
+rule, and coverage accumulated in units of 255 rather than stamps, which silently disabled
+the quorum that prevents it.
 
 ---
 
