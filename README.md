@@ -558,7 +558,7 @@ perforation datum at the valley bases rather than the tooth tips.
 All rules found on all four sides are recorded in `rules`, so the choice is auditable and a
 different one can be published without re-deriving anything. Their separation is also a
 free consistency check: two genuine rules keep a constant gap, and on the 5K scan they do,
-19.2 px horizontally against 18.5 px vertically. Not every design has a second rule — the
+19.1 px horizontally against 18.6 px vertically. Not every design has a second rule — the
 high values with coloured centres have only a thin outer rule — so a `rules` entry beyond
 the first is not evidence that one exists.
 
@@ -640,15 +640,56 @@ fraction is reported per stamp as `kept_fraction`; on the three scans tested it 
 Profiles are taken over the central `--profile-span` of each axis and reduced with a
 median, because ornaments and value text interrupt the frame on any single row.
 
-A pixel is only read if at least `--min-coverage` of the stamps reach it. This guard is
-load-bearing, not hygiene. Near the canvas margin only one or two stamps reach a pixel, so
-whatever they happen to carry there survives averaging intact and looks exactly like a
-rule. Without the quorum, the 70K scan measured its height as 22.98 mm against a true
-22.46 mm, because the outermost "rule" it found was a dark margin artefact contributed by
-two stamps. The quorum is what makes the average, rather than any individual stamp, the
-thing being measured. Pixels below it are dimmed in `scan_golden.png`.
+A pixel is only read if at least `--min-coverage` of the stamps reach it, so that the
+average rather than any individual stamp is the thing being measured. Near the canvas
+margin only one or two stamps reach a pixel, and whatever they happen to carry there
+survives averaging intact. Pixels below the quorum are dimmed in `scan_golden.png`.
 
-### 7. Output
+The quorum is deliberately low. It was once 0.6 and was the only defence against margin
+artefacts, but a quorum tight enough to exclude them also clipped the canvas straight
+through the 70K scan's left-hand outer rule, which is how that scan came to report
+15.99 mm instead of 16.40. The four-side agreement below rejects such artefacts on the
+evidence instead, so the quorum's remaining job is only to mark where the profile is
+defined at all. Each side's search is then restricted to that defined span — a profile
+cannot be padded out to full length without the padding itself forming a step that reads
+as a feature.
+
+### 7. Finding the rules
+
+The four sides of a design are one printed rectangle observed four times. That is the only
+premise this stage needs, and it replaces every per-side threshold.
+
+Working inwards from each edge over `--rule-search-span`, each local maximum of the
+darkness profile is described by two numbers:
+
+* **Prominence** — how far one must descend from the peak before being able to climb
+  higher. It is invariant to any constant added to the profile, so it judges a peak against
+  its own neighbourhood rather than against a global level. Divided by the profile's own
+  noise (the robust scatter against a lightly smoothed copy) it becomes a dimensionless
+  significance, which is what `--rule-significance` bounds.
+* **Width at half prominence**, again measured from the peak's own saddles. Unlike a
+  threshold-crossing width this does not depend on how strongly the line happened to print,
+  which is precisely the property needed to compare one side against another.
+
+The centre is the darkness-weighted centroid of the peak over that half-prominence support,
+taken on the unsmoothed profile.
+
+Candidates are then matched across sides, outermost first, and a set of four is accepted
+only if its widest and narrowest member differ by no more than `--rule-width-tolerance`.
+This is the whole of the decision. A faint rule and a strong rule of the same line agree on
+half-prominence width even when their prominences differ by a factor of two, so a side that
+prints weakly is no longer at risk of being skipped; and a peak that only one side shows is
+rejected however strong it is, because the other three cannot corroborate it. If one side
+genuinely cannot see the outermost rule, no family containing it exists and all four step
+inwards together rather than reporting a mixture.
+
+The tolerance has an empirical gap to sit in. Across the eight scans the accepted families
+span width ratios of 1.02 to 1.24, while the 70K mixture that had to be refused was 1.75,
+so the default 1.5 is not a tuned value. `--rule-significance` is a permissive floor that
+only bounds the candidate list: real rules there run from 31 to 123 sigma and spurious peaks
+up to 34, so the two overlap and significance alone could not have made this decision.
+
+### 8. Output
 
 Each stamp's rectangle is the golden rectangle multiplied by that stamp's own fitted
 `scale_x` and `scale_y`.
@@ -691,8 +732,14 @@ What remains is paper shrinkage, ink spread and scanner geometry.
   ones — but the tool does not compute it.
 * **Three stamps minimum**, and few stamps make a weak average; the quorum is clamped to
   two stamps so a small scan still measures something.
-* **The rule search is a thresholded run**, not a fitted model, so a design whose outer
-  rule is lighter than `--band-level` relative to its interior needs that flag moved.
+* **The four-side agreement needs four sides.** A design whose frame is genuinely
+  interrupted on one side — cut by the sheet margin, or overprinted — leaves no family to
+  accept, and the scan reports nothing rather than guessing from three.
+* **`--rule 1` is not a physical identity across scans.** It is the outermost rule *that
+  this scan could see on all four sides*. If a scan loses its outer rule to the quorum or to
+  damage, its rule 1 is the next line in, and comparing it with another scan's rule 1
+  compares two different printed lines. The recorded half-prominence widths are what make
+  the two distinguishable.
 
 ## Tests
 
@@ -705,10 +752,15 @@ About one minute. The real hinge regression uses a cropped fixture stored in
 
 `tests/test_design_size.py` closes the loop on the design measurement with a synthetic set
 that is de-centred by more than its frame rule is wide and defaced with cancellation bars:
-known independent x and y scales are recovered to 0.2%, and the rectangle to 1.5 px. Two
-of its cases are regressions for bugs found on real scans — a margin artefact read as a
-rule, and coverage accumulated in units of 255 rather than stamps, which silently disabled
-the quorum that prevents it.
+known independent x and y scales are recovered to 0.2%, and the rectangle to 1.5 px.
+
+Four of its cases are regressions for failures seen on real scans: a margin artefact read
+as a rule; coverage accumulated in units of 255 rather than stamps, which silently disabled
+the quorum that prevents it; the 3K scan, where the rule printed faintly on two sides and a
+threshold-based detector dropped through to the band behind it; and the 70K scan, where one
+side could not see the outermost rule at all and the four sides had to step inwards
+together. The last two are reproduced from the real candidate lists, so they fail if the
+selection rule regresses to anything per-side.
 
 ---
 

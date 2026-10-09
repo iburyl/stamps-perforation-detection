@@ -54,45 +54,145 @@ class DecomposeTest(unittest.TestCase):
         self.assertAlmostEqual(parts['shift_x'], 5.0, places=6)
 
 
+def rule_profile(length, rules, noise=0.0, seed=0):
+    """A side profile: Gaussian-ish dark lines on textured paper."""
+    profile = np.zeros(length)
+    position = np.arange(length, dtype=float)
+    for centre, width, height in rules:
+        profile += height * np.exp(-0.5 * ((position - centre)
+                                           / (width / 2.355)) ** 2)
+    if noise:
+        profile += np.random.default_rng(seed).normal(0, noise, length)
+    return profile
+
+
+class PeakTest(unittest.TestCase):
+    def test_prominence_ignores_an_added_constant(self):
+        signal = np.array([0.0, 1.0, 0.3, 2.0, 0.1, 0.5])
+        a, _ = measure_design.peak_prominence(signal, 3)
+        b, _ = measure_design.peak_prominence(signal + 17.0, 3)
+        self.assertAlmostEqual(a, b, places=9)
+
+    def test_prominence_is_measured_to_the_key_saddle(self):
+        # Peak at index 1 is lower than the one at 3, so its prominence is
+        # measured down to the valley between them, not to zero.
+        signal = np.array([0.0, 1.0, 0.4, 2.0, 0.0])
+        prominence, saddle = measure_design.peak_prominence(signal, 1)
+        self.assertAlmostEqual(prominence, 0.6, places=9)
+        self.assertAlmostEqual(saddle, 0.4, places=9)
+
+    def test_a_faint_rule_is_described_like_a_strong_one(self):
+        """The 3K failure in miniature. Two rules of equal width, one printed
+        at a third the strength. At a fixed darkness level the faint one is
+        narrower and was rejected; at half prominence both measure the same."""
+        strong = rule_profile(400, [(80.0, 9.0, 1.0)], noise=0.01, seed=1)
+        faint = rule_profile(400, [(80.0, 9.0, 0.33)], noise=0.01, seed=1)
+        a = measure_design.peak_candidates(strong, 0.5, 6.0)[0]
+        b = measure_design.peak_candidates(faint, 0.5, 6.0)[0]
+        self.assertAlmostEqual(a['width_px'], b['width_px'], delta=0.6)
+        self.assertAlmostEqual(a['centre_px'], 80.0, delta=0.5)
+        self.assertAlmostEqual(b['centre_px'], 80.0, delta=0.5)
+        # Both are far above the noise, which is what licenses them.
+        self.assertGreater(b['significance'], 20)
+
+    def test_candidates_are_ordered_outermost_first(self):
+        profile = rule_profile(400, [(30.0, 6.0, 1.0), (70.0, 18.0, 1.4)],
+                               noise=0.01, seed=2)
+        found = measure_design.peak_candidates(profile, 0.5, 6.0)
+        self.assertGreaterEqual(len(found), 2)
+        self.assertAlmostEqual(found[0]['centre_px'], 30.0, delta=0.6)
+        self.assertAlmostEqual(found[1]['centre_px'], 70.0, delta=0.8)
+        self.assertLess(found[0]['width_px'], found[1]['width_px'])
+
+
+class SelectionTest(unittest.TestCase):
+    def side(self, entries):
+        return [{'centre_px': c, 'width_px': w, 'prominence': 1.0,
+                 'significance': s} for c, w, s in entries]
+
+    def test_rejects_a_family_that_mixes_two_different_features(self):
+        """3K and 70K exactly: the thin rule found on two sides and the thick
+        band on the other two. Outermost-first alone would take it; the
+        four-side width agreement is what refuses."""
+        thin, thick = (6.0, 30.0), (18.0, 25.0)
+        candidates = {
+            'left': self.side([(86.0, *thin), (105.0, *thick)]),
+            'top': self.side([(94.0, *thin), (114.0, *thick)]),
+            # On these two the thin rule is fainter, so it sits second in the
+            # candidate list, but it is still the outermost one.
+            'right': self.side([(88.0, 6.0, 12.0), (107.0, *thick)]),
+            'bottom': self.side([(93.0, 6.0, 14.0), (104.0, *thick)]),
+        }
+        start = {side: 0 for side in candidates}
+        choice = measure_design.choose_consistent_rule(candidates, start, 1.5)
+        for side in candidates:
+            self.assertAlmostEqual(choice[side][1]['width_px'], 6.0, places=6)
+
+        inward = {side: index + 1 for side, (index, _) in choice.items()}
+        second = measure_design.choose_consistent_rule(candidates, inward, 1.5)
+        for side in candidates:
+            self.assertAlmostEqual(second[side][1]['width_px'], 18.0, places=6)
+
+    def test_skips_a_spurious_peak_no_other_side_corroborates(self):
+        candidates = {
+            'left': self.side([(40.0, 17.0, 9.0), (86.0, 6.0, 30.0)]),
+            'right': self.side([(88.0, 6.0, 28.0)]),
+            'top': self.side([(94.0, 6.0, 31.0)]),
+            'bottom': self.side([(93.0, 6.0, 27.0)]),
+        }
+        start = {side: 0 for side in candidates}
+        choice = measure_design.choose_consistent_rule(candidates, start, 1.5)
+        self.assertAlmostEqual(choice['left'][1]['centre_px'], 86.0, places=6)
+        self.assertEqual(choice['left'][0], 1)
+
+    def test_steps_all_four_sides_in_when_one_side_cannot_see_the_outermost(
+            self):
+        """70K exactly: the quorum clips the canvas through the left outer
+        rule, so the left list begins at the thick band. No family containing
+        the outer rule is available, and the thick band is reported for all
+        four rather than a left/right mixture."""
+        candidates = {
+            'left': self.side([(90.7, 14.2, 81.0), (173.0, 19.2, 56.0)]),
+            'right': self.side([(81.0, 8.2, 66.0), (100.7, 15.3, 81.0)]),
+            'top': self.side([(85.6, 8.1, 65.0), (105.2, 14.3, 69.0)]),
+            'bottom': self.side([(84.2, 8.1, 60.0), (103.6, 14.2, 64.0)]),
+        }
+        start = {side: 0 for side in candidates}
+        choice = measure_design.choose_consistent_rule(candidates, start, 1.5)
+        centres = {side: entry['centre_px']
+                   for side, (_, entry) in choice.items()}
+        self.assertEqual(centres, {'left': 90.7, 'right': 100.7,
+                                   'top': 105.2, 'bottom': 103.6})
+
+    def test_reports_nothing_when_a_side_has_no_candidate(self):
+        candidates = {'left': self.side([(86.0, 6.0, 30.0)]), 'right': [],
+                      'top': self.side([(94.0, 6.0, 31.0)]),
+                      'bottom': self.side([(93.0, 6.0, 27.0)])}
+        start = {side: 0 for side in candidates}
+        self.assertIsNone(
+            measure_design.choose_consistent_rule(candidates, start, 1.5))
+
+
 class BandTest(unittest.TestCase):
-    def test_reports_rules_outermost_first(self):
-        profile = np.zeros(400)
-        profile[20:34] = 1.0      # thin outer rule, centre 26.5
-        profile[50:70] = 1.0      # thick main frame band, centre 59.5
-        profile[330:350] = 1.0
-        profile[366:380] = 1.0
-        low, high = measure_design.edge_bands(profile, min_run=5, level=0.5,
-                                           count=2)
-        self.assertAlmostEqual(low[0]['centre_px'], 26.5, places=3)
-        self.assertEqual(low[0]['width_px'], 14)
-        self.assertAlmostEqual(low[1]['centre_px'], 59.5, places=3)
-        self.assertAlmostEqual(high[0]['centre_px'], 372.5, places=3)
-        self.assertAlmostEqual(high[1]['centre_px'], 339.5, places=3)
-
-    def test_ignores_runs_shorter_than_min_run(self):
-        profile = np.zeros(200)
-        profile[10:12] = 1.0      # speck
-        profile[40:54] = 1.0
-        profile[150:164] = 1.0
-        low, _ = measure_design.edge_bands(profile, min_run=5, level=0.5, count=1)
-        self.assertAlmostEqual(low[0]['centre_px'], 46.5, places=3)
-
     def test_thinly_covered_lines_cannot_look_like_a_rule(self):
-        """The 70K failure: a dark margin artefact carried by one or two
-        stamps is indistinguishable from a rule until a quorum is required."""
+        """The 70K margin artefact: a dark band carried by one or two stamps
+        is indistinguishable from a rule until a quorum is required."""
         darkness = np.zeros((40, 40), np.float32)
         darkness[:, :6] = 9.0           # dark, but only two stamps reach it
         darkness[:, 10:16] = 1.0        # the real rule, reached by all ten
         coverage = np.full((40, 40), 10.0, np.float32)
         coverage[:, :6] = 2.0
-        loose = measure_design.masked_profile(darkness, coverage, 0, span=1.0,
-                                           min_stamps=1)
-        strict = measure_design.masked_profile(darkness, coverage, 0, span=1.0,
-                                            min_stamps=6)
-        low, _ = measure_design.edge_bands(loose, min_run=5, level=0.5, count=1)
-        self.assertAlmostEqual(low[0]['centre_px'], 2.5, places=3)
-        low, _ = measure_design.edge_bands(strict, min_run=5, level=0.5, count=1)
-        self.assertAlmostEqual(low[0]['centre_px'], 12.5, places=3)
+        loose, loose_valid = measure_design.masked_profile(
+            darkness, coverage, 0, span=1.0, min_stamps=1)
+        strict, strict_valid = measure_design.masked_profile(
+            darkness, coverage, 0, span=1.0, min_stamps=6)
+        self.assertAlmostEqual(float(loose[2]), 9.0, places=5)
+        self.assertTrue(bool(loose_valid[2]))
+        # Under the quorum the artefact is not merely darkened, it is marked
+        # invalid, so the rule search never reaches it.
+        self.assertFalse(bool(strict_valid[2]))
+        self.assertTrue(bool(strict_valid[12]))
+        self.assertAlmostEqual(float(strict[12]), 1.0, places=5)
 
 
 class BackProjectionTest(unittest.TestCase):
@@ -202,9 +302,9 @@ class CongealTest(unittest.TestCase):
         self.assertEqual(sum(failures), 0)
         self.assertLess(max(abs(value) for value in free_shear), 0.01)
 
-        rules = measure_design.frame_rectangle(
-            golden, coverage, min_run=5, level=0.5, span=0.5,
-            min_stamps=0.6 * len(truth))
+        rules, _ = measure_design.frame_rectangle(
+            golden, coverage, span=0.5, min_stamps=0.6 * len(truth),
+            search_span=0.35, min_significance=6.0, width_tolerance=1.8)
         self.assertGreaterEqual(len(rules), 1)
         rectangle = rules[0]
 

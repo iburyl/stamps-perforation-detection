@@ -359,49 +359,109 @@ def congeal(patches, masks, size, schedule, iterations, eps, cutoff, verbose):
     return golden, coverage, warps, weights, failures, free_shear
 
 
-def edge_bands(profile, min_run, level, count):
-    """The outermost ``count`` sustained dark runs at each end of a profile.
+def smooth_profile(profile, sigma):
+    radius = max(1, int(round(3 * sigma)))
+    offsets = np.arange(-radius, radius + 1)
+    kernel = np.exp(-0.5 * (offsets / sigma) ** 2)
+    kernel /= kernel.sum()
+    return np.convolve(np.pad(profile, radius, mode='edge'), kernel, 'valid')
 
-    The Arms design carries more than one rule per side — a thin outer rule and
-    a thick main frame band — and either is a defensible definition of "the
-    design rectangle". Both are returned so the choice is recorded rather than
-    made silently, and so the separation between them can be checked.
 
-    Each run is reported as its sub-pixel darkness centroid and its width. A
-    centroid is used rather than an edge because a rule's width grows with
-    inking pressure, roughly symmetrically, which moves its edges but not its
-    middle.
+def profile_noise(profile, sigma=1.5):
+    """Robust scatter of a profile against a lightly smoothed copy of itself.
+
+    This is the yardstick everything else is measured in. Expressing a rule's
+    strength as a multiple of the profile's own noise makes the number
+    dimensionless and independent of exposure, ink colour and how dark the
+    design interior happens to be.
     """
-    low, high = np.percentile(profile, 5), np.percentile(profile, 98)
-    if high - low < 1e-6:
-        return [], []
-    norm = (profile - low) / (high - low)
-    dark = norm > level
-    length = len(norm)
-    results = []
-    for flip in (False, True):
-        sequence = dark[::-1] if flip else dark
-        values = norm[::-1] if flip else norm
-        found = []
-        index = 0
-        while index < length and len(found) < count:
-            if not sequence[index]:
-                index += 1
-                continue
-            end = index
-            while end < length and sequence[end]:
-                end += 1
-            if end - index >= min_run:
-                weight = values[index:end] - level
-                offset = float(np.sum(weight * np.arange(index, end)) /
-                               max(np.sum(weight), 1e-6))
-                found.append({
-                    'centre_px': length - 1 - offset if flip else offset,
-                    'width_px': int(end - index),
-                })
-            index = end
-        results.append(found)
-    return results[0], results[1]
+    residual = profile - smooth_profile(profile, sigma)
+    return float(1.4826 * np.median(np.abs(residual - np.median(residual))))
+
+
+def peak_prominence(signal, index):
+    """Topographic prominence of a local maximum, and its key saddle.
+
+    From the summit, how far must one descend before being able to climb to
+    anything higher? Unlike height above a fixed level, this is unaffected by
+    adding a constant, and it judges the peak against its own neighbourhood
+    rather than against the full range of the profile.
+    """
+    peak = signal[index]
+    saddles = []
+    for step in (-1, 1):
+        position = index
+        lowest = peak
+        while 0 <= position + step < len(signal):
+            position += step
+            if signal[position] > peak:
+                break
+            lowest = min(lowest, signal[position])
+        saddles.append(lowest)
+    saddle = max(saddles)
+    return float(peak - saddle), float(saddle)
+
+
+def _crossing(signal, inside, outside, level):
+    """Sub-pixel index where ``signal`` crosses ``level`` between two samples."""
+    span = signal[inside] - signal[outside]
+    if abs(span) < 1e-12:
+        return float(inside)
+    return float(inside + (signal[inside] - level) / span * (outside - inside))
+
+
+def peak_candidates(profile, search_span, min_significance, max_candidates=12):
+    """Every plausible rule on one side, described but not yet judged.
+
+    The profile runs outside-in, so index 0 is the edge of the canvas. Each
+    candidate carries its sub-pixel centre, its width at half prominence, and
+    its prominence in units of the profile's noise. Nothing is accepted or
+    rejected here: which candidates are real is decided later, by whether the
+    four sides agree, not by any per-side threshold.
+
+    Width is taken at half prominence rather than at a fixed darkness, because
+    the width of a line at a fixed level depends on how strongly that line
+    printed. Half prominence is relative to the peak's own height, so the same
+    rule measures the same width whether it printed heavily or faintly.
+    """
+    noise = profile_noise(profile)
+    if noise < 1e-12:
+        return []
+    smooth = smooth_profile(profile, 1.0)
+    limit = max(3, min(len(smooth) - 1, int(search_span * len(smooth))))
+    found = []
+    for index in range(1, limit):
+        if smooth[index] <= smooth[index - 1] or smooth[index] < smooth[index + 1]:
+            continue
+        prominence, saddle = peak_prominence(smooth, index)
+        if prominence < min_significance * noise:
+            continue
+        level = saddle + prominence / 2.0
+        low = index
+        while low > 0 and smooth[low - 1] > level:
+            low -= 1
+        high = index
+        while high < len(smooth) - 1 and smooth[high + 1] > level:
+            high += 1
+        start = 0.0 if low == 0 else _crossing(smooth, low, low - 1, level)
+        end = (float(high) if high == len(smooth) - 1
+               else _crossing(smooth, high, high + 1, level))
+        # Centre from the unsmoothed profile, so smoothing sets the support
+        # but does not move the answer.
+        weight = np.clip(profile[low:high + 1] - level, 0.0, None)
+        if weight.sum() <= 0:
+            continue
+        found.append({
+            'centre_px': float(np.sum(weight * np.arange(low, high + 1))
+                               / weight.sum()),
+            'width_px': float(end - start),
+            'prominence': prominence,
+            'significance': prominence / noise,
+        })
+    found.sort(key=lambda item: -item['significance'])
+    found = found[:max_candidates]
+    found.sort(key=lambda item: item['centre_px'])
+    return found
 
 
 def masked_profile(darkness, coverage, axis, span, min_stamps,
@@ -416,6 +476,11 @@ def masked_profile(darkness, coverage, axis, span, min_stamps,
     backing paper, a torn edge — survives averaging intact and looks exactly
     like a rule. Requiring agreement from a quorum of stamps is what makes the
     average, rather than any individual stamp, the thing being measured.
+
+    The validity flags are returned alongside, because filling the rejected
+    lines with a constant puts a step into the profile that is an artefact of
+    this function rather than anything on the stamps. Callers that look for
+    peaks must search inside the valid span, not fill and then threshold.
     """
     size = darkness.shape[1 - axis]
     margin = int((1.0 - span) / 2.0 * size)
@@ -428,39 +493,111 @@ def masked_profile(darkness, coverage, axis, span, min_stamps,
     profile = np.ma.median(values, axis=axis)
     enough = values.count(axis=axis) >= min_line_fraction * values.shape[axis]
     filled = np.ma.filled(profile, np.nan)
-    usable = filled[enough & np.isfinite(filled)]
-    return np.where(enough & np.isfinite(filled), filled,
-                    usable.min() if usable.size else 0.0)
+    valid = enough & np.isfinite(filled)
+    usable = filled[valid]
+    return np.where(valid, filled, usable.min() if usable.size else 0.0), valid
 
 
-def frame_rectangle(golden, coverage, min_run, level, span, min_stamps,
-                    band_count=2):
+def _index_tuples(depth, count):
+    """All 4-tuples of candidate offsets summing to ``depth``."""
+    for a in range(min(depth, count - 1) + 1):
+        for b in range(min(depth - a, count - 1) + 1):
+            for c in range(min(depth - a - b, count - 1) + 1):
+                d = depth - a - b - c
+                if d < count:
+                    yield (a, b, c, d)
+
+
+def choose_consistent_rule(candidates, start, width_tolerance, max_depth=10):
+    """The outermost choice of one candidate per side on which all four agree.
+
+    This is where the decision is made, and it is deliberately not made per
+    side. The four sides are not four independent detections; they are one
+    printed rectangle observed four times. So rather than asking each side
+    whether its peak clears some bar, the sides are asked whether they agree
+    on the *shape* of the feature they found — its width at half prominence.
+
+    Picking the thin outer rule on two sides and the thick frame band on the
+    other two, which is exactly how 3K and 70K failed, is precisely what this
+    test rejects: those widths differ threefold. Searching outermost-first then
+    makes "the outer rule" mean what it says.
+    """
+    sides = ('left', 'right', 'top', 'bottom')
+    available = [candidates[side][start[side]:] for side in sides]
+    if any(not entries for entries in available):
+        return None
+    count = max(len(entries) for entries in available)
+    for depth in range(max_depth + 1):
+        for offsets in _index_tuples(depth, count):
+            if any(offset >= len(entries)
+                   for offset, entries in zip(offsets, available)):
+                continue
+            chosen = {side: entries[offset] for side, offset, entries
+                      in zip(sides, offsets, available)}
+            widths = [entry['width_px'] for entry in chosen.values()]
+            if min(widths) <= 0:
+                continue
+            if max(widths) / min(widths) > width_tolerance:
+                continue
+            return {side: (start[side] + offset, chosen[side])
+                    for side, offset in zip(sides, offsets)}
+    return None
+
+
+def frame_rectangle(golden, coverage, span, min_stamps, search_span,
+                    min_significance, width_tolerance, band_count=2,
+                    max_candidates=12):
     """Measure the design's frame rules on the golden image.
 
     The returned ``rules`` list runs from the outermost rule inwards; the first
     entry is used as the published rectangle.
     """
+    height, width = golden.shape
     darkness = -golden.astype(np.float32)
-    columns = masked_profile(darkness, coverage, 0, span, min_stamps)
-    rows = masked_profile(darkness, coverage, 1, span, min_stamps)
-    left, right = edge_bands(columns, min_run, level, band_count)
-    top, bottom = edge_bands(rows, min_run, level, band_count)
+    columns, column_valid = masked_profile(darkness, coverage, 0, span,
+                                           min_stamps)
+    rows, row_valid = masked_profile(darkness, coverage, 1, span, min_stamps)
+    # Each side reads outside-in, so a candidate's position means the same
+    # thing on all four and the agreement test compares like with like.
+    profiles = {'left': (columns, column_valid),
+                'right': (columns[::-1], column_valid[::-1]),
+                'top': (rows, row_valid),
+                'bottom': (rows[::-1], row_valid[::-1])}
+    origin = {'left': 0.0, 'right': width - 1.0,
+              'top': 0.0, 'bottom': height - 1.0}
+    direction = {'left': 1.0, 'right': -1.0, 'top': 1.0, 'bottom': -1.0}
+
+    candidates = {}
+    for side, (profile, valid) in profiles.items():
+        present = np.flatnonzero(valid)
+        if present.size < 8:
+            candidates[side] = []
+            continue
+        first, last = int(present[0]), int(present[-1])
+        found = peak_candidates(profile[first:last + 1], search_span,
+                                min_significance, max_candidates)
+        for entry in found:
+            entry['centre_px'] += first
+        candidates[side] = found
 
     rules = []
-    for index in range(min(len(left), len(right), len(top), len(bottom))):
-        found = {'left': left[index], 'right': right[index],
-                 'top': top[index], 'bottom': bottom[index]}
-        rule = {'rule': index + 1}
-        rule.update({f'{side}_px': entry['centre_px']
-                     for side, entry in found.items()})
-        rule['width_px'] = float(found['right']['centre_px'] -
-                                 found['left']['centre_px'])
-        rule['height_px'] = float(found['bottom']['centre_px'] -
-                                  found['top']['centre_px'])
+    start = {side: 0 for side in profiles}
+    for number in range(1, band_count + 1):
+        choice = choose_consistent_rule(candidates, start, width_tolerance)
+        if choice is None:
+            break
+        rule = {'rule': number}
+        for side, (index, entry) in choice.items():
+            rule[f'{side}_px'] = origin[side] + direction[side] * entry['centre_px']
+            start[side] = index + 1
+        rule['width_px'] = float(rule['right_px'] - rule['left_px'])
+        rule['height_px'] = float(rule['bottom_px'] - rule['top_px'])
         rule['band_px'] = {side: entry['width_px']
-                           for side, entry in found.items()}
+                           for side, (_, entry) in choice.items()}
+        rule['significance'] = {side: entry['significance']
+                                for side, (_, entry) in choice.items()}
         rules.append(rule)
-    return rules
+    return rules, candidates
 
 
 RULE_COLORS = ((0, 0, 255), (0, 200, 255), (0, 255, 0))
@@ -549,8 +686,8 @@ def draw_design(image, results, skipped, unit):
 
 
 def measure_scan(image, document, schedule, iterations, eps, cutoff,
-                 erode_px, pad, min_run, level, span, rule_index,
-                 min_coverage, verbose):
+                 erode_px, pad, search_span, min_significance,
+                 width_tolerance, span, rule_index, min_coverage, verbose):
     usable = []
     for stamp in document['stamps']:
         quad = valley_quad(stamp)
@@ -585,11 +722,13 @@ def measure_scan(image, document, schedule, iterations, eps, cutoff,
     golden, coverage, warps, weights, failures, free_shear = congeal(
         patches, masks, canvas, schedule, iterations, eps, cutoff, verbose)
     min_stamps = max(2.0, min_coverage * len(patches))
-    rules = frame_rectangle(golden, coverage, min_run, level, span, min_stamps)
+    rules, candidates = frame_rectangle(
+        golden, coverage, span, min_stamps, search_span, min_significance,
+        width_tolerance, band_count=max(2, rule_index + 1))
     if len(rules) <= rule_index:
         raise RuntimeError(
-            f'golden image has {len(rules)} frame rules on all four sides, '
-            f'so rule {rule_index + 1} cannot be measured')
+            f'golden image has {len(rules)} frame rules all four sides agree '
+            f'on, so rule {rule_index + 1} cannot be measured')
     rectangle = rules[rule_index]
 
     results = []
@@ -621,7 +760,7 @@ def measure_scan(image, document, schedule, iterations, eps, cutoff,
                 rectangle, warps[index], placements[index]).tolist(),
         })
     return golden, coverage, rules, rule_index, results, canvas, min_stamps, \
-        skipped
+        skipped, candidates
 
 
 def main():
@@ -653,19 +792,28 @@ def main():
         '--pad', type=int, default=64,
         help='Canvas margin around the largest valley rectangle (default: 64)')
     parser.add_argument(
-        '--band-min-run', type=int, default=5,
-        help='Shortest run of dark pixels accepted as the frame band (default: 5)')
+        '--rule-search-span', type=float, default=0.35,
+        help=('Fraction of each profile, measured inwards from the edge, that '
+              'is searched for frame rules (default: 0.35)'))
     parser.add_argument(
-        '--band-level', type=float, default=0.5,
-        help='Normalised darkness defining the frame band (default: 0.5)')
+        '--rule-significance', type=float, default=6.0,
+        help=('Smallest peak prominence, in multiples of the profile noise, '
+              'that is enumerated as a candidate rule. This limits the '
+              'candidate list; which candidate wins is decided by four-side '
+              'agreement (default: 6.0)'))
+    parser.add_argument(
+        '--rule-width-tolerance', type=float, default=1.5,
+        help=('Largest ratio between the widest and narrowest of the four '
+              'sides of one rule, at half prominence, for the four to count '
+              'as the same printed feature (default: 1.5)'))
     parser.add_argument(
         '--profile-span', type=float, default=0.5,
         help='Central fraction of the opposite axis used per profile (default: 0.5)')
     parser.add_argument(
-        '--min-coverage', type=float, default=0.6,
+        '--min-coverage', type=float, default=0.3,
         help=('Fraction of the stamps that must reach a pixel before the '
               'golden is read there, which keeps the thinly covered canvas '
-              'margin out of the rule search (default: 0.6)'))
+              'margin out of the rule search (default: 0.3)'))
     parser.add_argument(
         '--rule', type=int, default=1,
         help=('Which frame rule to publish, counted inwards from the outside. '
@@ -696,11 +844,11 @@ def main():
         print(f'Image: {input_path}')
 
     golden, coverage, rules, rule_index, results, canvas, min_stamps, \
-        skipped = measure_scan(
+        skipped, candidates = measure_scan(
             image, document, DEFAULT_SCHEDULE, args.iterations, args.eps,
-            args.outlier_cutoff, args.erode, args.pad, args.band_min_run,
-            args.band_level, args.profile_span, args.rule - 1,
-            args.min_coverage, verbose)
+            args.outlier_cutoff, args.erode, args.pad, args.rule_search_span,
+            args.rule_significance, args.rule_width_tolerance,
+            args.profile_span, args.rule - 1, args.min_coverage, verbose)
     rectangle = rules[rule_index]
 
     unit = 'mm' if dpi else 'px'
@@ -735,6 +883,7 @@ def main():
             'min_stamps_per_pixel': min_stamps,
             'rectangle': rectangle,
             'rules': rules,
+            'candidates': candidates,
             'preview': golden_path.name,
         },
         'annotated_scan': drawn_path.name,
@@ -745,8 +894,9 @@ def main():
             'outlier_cutoff': args.outlier_cutoff,
             'erode': args.erode,
             'pad': args.pad,
-            'band_min_run': args.band_min_run,
-            'band_level': args.band_level,
+            'rule_search_span': args.rule_search_span,
+            'rule_significance': args.rule_significance,
+            'rule_width_tolerance': args.rule_width_tolerance,
             'profile_span': args.profile_span,
             'min_coverage': args.min_coverage,
             'rule': args.rule,
@@ -759,12 +909,21 @@ def main():
         encoding='utf-8')
 
     if verbose:
+        print('\nCandidate rules per side, by prominence over profile noise:')
+        for side in ('left', 'right', 'top', 'bottom'):
+            summary = ', '.join(
+                f"{entry['centre_px']:.1f}px w{entry['width_px']:.1f} "
+                f"({entry['significance']:.0f}s)"
+                for entry in candidates[side][:4])
+            print(f'  {side:<6} {summary}')
         print('\nGolden frame rules, outermost first:')
         for rule in rules:
             mark = ' <- published' if rule['rule'] == args.rule else ''
+            widths = tuple(round(value, 1) for value in rule['band_px'].values())
             print(f"  rule {rule['rule']}: {rule['width_px']:8.2f} x "
-                  f"{rule['height_px']:8.2f} px, band widths "
-                  f"{tuple(rule['band_px'].values())} px{mark}")
+                  f"{rule['height_px']:8.2f} px, half-prominence widths "
+                  f"{widths} px, weakest "
+                  f"{min(rule['significance'].values()):.0f}s{mark}")
         print(f"{'stamp':>5} {'width':>9} {'height':>9} {'sx':>8} {'sy':>8} "
               f"{'rot':>7} {'shear':>8} {'kept':>6} {'rms':>6}   ({unit})")
         for row in results:
