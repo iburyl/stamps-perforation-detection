@@ -644,6 +644,7 @@ def draw_design(image, results, skipped, unit):
     Line and font sizes follow ``segment_stamps.py`` so that this image and
     ``*_detected.jpg`` can be read side by side at the same zoom.
     """
+    image = image.copy()
     height, width = image.shape[:2]
     thickness = max(2, round(max(height, width) / 2500))
     font_scale = max(0.7, max(height, width) / 5000)
@@ -788,6 +789,120 @@ def draw_reveal(image, patches, masks, placements, warps, weights, golden,
                    0, 255).astype(np.uint8)
 
 
+CANCEL_SEED, CANCEL_EDGE, CANCEL_SMOOTH = 4.0, 1.5, 3.0
+CANCEL_CORE_FRACTION = 5e-5
+
+
+def cancel_strength(revealed, valid):
+    """How much of each pixel the cancellation, rather than the stamp, owns.
+
+    The residual is never zero — fine design detail does not survive averaging
+    and comes back as texture — so the stamp's own residual noise is the scale.
+    A single threshold on it cannot work, because a stroke's soft edge is as
+    faint as the texture and only its shape tells them apart. Two things are
+    true of a postmark and of nothing else here: it is connected, and it is
+    large. So each mark is followed out from a core of four robust sigma down
+    to one and a half, and a mark is only believed if its core covers enough
+    of the stamp to have been meant. Speckle, however deep a single excursion
+    happens to be, is neither.
+    """
+    sample = revealed[valid]
+    noise = 1.4826 * np.median(np.abs(sample - np.median(sample)))
+    core = (revealed > CANCEL_SEED * noise) & valid
+    edge = (revealed > CANCEL_EDGE * noise) & valid
+    count, labels = cv2.connectedComponents(edge.astype(np.uint8),
+                                            connectivity=8)
+
+    enough = max(16, int(CANCEL_CORE_FRACTION * valid.sum()))
+    core_size = np.bincount(labels[core], minlength=count)
+    seeded = core_size >= enough
+    seeded[0] = False
+
+    span = max((CANCEL_SEED - CANCEL_EDGE) * noise, 1e-6)
+    alpha = np.clip((revealed - CANCEL_EDGE * noise) / span, 0.0, 1.0)
+    alpha = np.where(seeded[labels], alpha, 0.0).astype(np.float32)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), CANCEL_SMOOTH)
+    alpha[~valid] = 0.0
+    return alpha
+
+
+def restore_stamp(colour, design, mask, weight, alpha):
+    """One stamp with the cancellation replaced by the shared design.
+
+    Returned as the change to apply, not as a new patch, so that everything the
+    cancellation does not touch keeps the stamp's own pixels untouched rather
+    than being resampled.
+
+    Lightness comes from the golden, carried into this stamp's own exposure.
+    Colour cannot: under a black mark the stamp's own hue is destroyed too. It
+    is rebuilt from the restored lightness instead, on the relation between the
+    two that holds over the uncancelled part of this stamp — a one-colour print
+    on tinted paper has only the two hues, and lightness says which.
+    """
+    valid = mask > 0
+    lab = cv2.cvtColor(colour, cv2.COLOR_BGR2LAB).astype(np.float32)
+    clear = valid & (alpha < 0.1)
+    if clear.sum() < 100:
+        clear = valid
+
+    blended = lab.copy()
+    lightness = photometric_match(design, lab[:, :, 0], clear, weight)
+    blended[:, :, 0] = lightness
+    for channel in (1, 2):
+        blended[:, :, channel] = photometric_match(
+            lightness, lab[:, :, channel], clear, weight)
+    mix = (alpha * (mask > 0))[..., None]
+    merged = np.clip(lab * (1.0 - mix) + blended * mix, 0, 255)
+    restored = cv2.cvtColor(merged.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    return restored.astype(np.float32) - colour.astype(np.float32)
+
+
+def scan_window(mask, placement, shape):
+    """Where on the scan one canvas patch lands, and the affine that puts it
+    there, so that only that part of a large scan has to be touched."""
+    x, y, w, h = cv2.boundingRect(mask)
+    corners = np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], float)
+    on_scan = apply_affine(cv2.invertAffineTransform(placement), corners)
+    x0 = max(int(np.floor(on_scan[:, 0].min())) - 2, 0)
+    y0 = max(int(np.floor(on_scan[:, 1].min())) - 2, 0)
+    x1 = min(int(np.ceil(on_scan[:, 0].max())) + 2, shape[1])
+    y1 = min(int(np.ceil(on_scan[:, 1].max())) + 2, shape[0])
+    shifted = placement.copy()
+    shifted[:, 2] += shifted[:, :2] @ np.array([x0, y0], float)
+    return (slice(y0, y1), slice(x0, x1)), shifted, (x1 - x0, y1 - y0)
+
+
+def draw_uncancelled(image, patches, masks, placements, warps, weights,
+                     golden, canvas, fade, window):
+    """The scan with the cancellations taken off and the design put back.
+
+    The complement of ``draw_reveal`` from the same decomposition: that one
+    keeps what the stamps do not share, this one restores it to what they do.
+    Only the marked pixels change, so away from a postmark the scan is the
+    original, down to the bit.
+    """
+    out = image.copy()
+    canvas_shape = (canvas[1], canvas[0])
+    for patch, mask, placement, warp, weight in zip(
+            patches, masks, placements, warps, weights):
+        design = cv2.warpAffine(golden, warp, canvas_shape,
+                                flags=cv2.INTER_LINEAR)
+        revealed = reveal_stamp(patch, design, mask, weight, 1.0, window)
+        alpha = cancel_strength(revealed, mask > 0) * fade
+        colour = cv2.warpAffine(image, placement, canvas_shape,
+                                flags=cv2.INTER_CUBIC,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        change = restore_stamp(colour, design, mask, weight, alpha)
+
+        where, shifted, size = scan_window(mask, placement, image.shape[:2])
+        back = cv2.warpAffine(change, shifted, size,
+                              flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        out[where] = np.clip(out[where].astype(np.float32) + back,
+                             0, 255).astype(np.uint8)
+    return out
+
+
 def measure_scan(image, document, schedule, iterations, eps, cutoff,
                  erode_px, pad, search_span, min_significance,
                  width_tolerance, span, rule_index, min_coverage, verbose):
@@ -920,6 +1035,10 @@ def main():
         help=('How much of the design to remove, from 0 for none to 1 for all '
               '(default: 1.0)'))
     parser.add_argument(
+        '--uncancel-fade', type=float, default=1.0,
+        help=('How much of the cancellation to take back off the stamps, from '
+              '0 for none to 1 for all (default: 1.0)'))
+    parser.add_argument(
         '--reveal-window', type=int, default=129,
         help=('Side of the window, in pixels, over which the local '
               'misregistration that would otherwise leave the design edges '
@@ -946,6 +1065,8 @@ def main():
         parser.error('--min-coverage must be in (0, 1]')
     if not 0.0 <= args.reveal_fade <= 1.0:
         parser.error('--reveal-fade must be in [0, 1]')
+    if not 0.0 <= args.uncancel_fade <= 1.0:
+        parser.error('--uncancel-fade must be in [0, 1]')
     if args.reveal_window < 3 or args.reveal_window % 2 == 0:
         parser.error('--reveal-window must be an odd number of pixels, >= 3')
 
@@ -986,13 +1107,18 @@ def main():
                        draw_design(image, results, skipped, unit)):
         raise RuntimeError(f'Cannot write image: {drawn_path}')
 
+    parts = (registration['patches'], registration['masks'],
+             registration['placements'], registration['warps'],
+             registration['weights'], golden, canvas)
     reveal_path = input_path.with_name(input_path.stem + '_cancel.jpg')
     if not cv2.imwrite(str(reveal_path), draw_reveal(
-            image, registration['patches'], registration['masks'],
-            registration['placements'], registration['warps'],
-            registration['weights'], golden, canvas, args.reveal_fade,
-            args.reveal_window)):
+            image, *parts, args.reveal_fade, args.reveal_window)):
         raise RuntimeError(f'Cannot write image: {reveal_path}')
+
+    clean_path = input_path.with_name(input_path.stem + '_uncancelled.jpg')
+    if not cv2.imwrite(str(clean_path), draw_uncancelled(
+            image, *parts, args.uncancel_fade, args.reveal_window)):
+        raise RuntimeError(f'Cannot write image: {clean_path}')
 
     payload = {
         'format': 'stamp-design-size',
@@ -1015,6 +1141,7 @@ def main():
         },
         'annotated_scan': drawn_path.name,
         'cancellation_scan': reveal_path.name,
+        'uncancelled_scan': clean_path.name,
         'parameters': {
             'schedule': [list(level) for level in DEFAULT_SCHEDULE],
             'iterations': args.iterations,
@@ -1029,6 +1156,7 @@ def main():
             'min_coverage': args.min_coverage,
             'rule': args.rule,
             'reveal_fade': args.reveal_fade,
+            'uncancel_fade': args.uncancel_fade,
             'reveal_window': args.reveal_window,
         },
         'stamps': results,
@@ -1076,7 +1204,7 @@ def main():
             print('\nNot measured, no four published perforation sides: '
                   + ', '.join(str(number) for number, _ in skipped))
         print(f"\nWrote {out_path}\nWrote {golden_path}\nWrote {drawn_path}\n"
-              f"Wrote {reveal_path}")
+              f"Wrote {reveal_path}\nWrote {clean_path}")
 
 
 if __name__ == '__main__':

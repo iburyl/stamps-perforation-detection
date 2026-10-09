@@ -222,6 +222,55 @@ class RevealTest(unittest.TestCase):
         self.assertGreater((kept - cleaned)[postmark > 0].mean(), 0.5 * 0.6)
 
 
+class UncancelTest(unittest.TestCase):
+    def test_strength_ignores_texture_and_claims_a_stroke(self):
+        """The residual is never zero, so the scale has to be its own noise,
+        and isolated excursions of it must not read as marks."""
+        rng = np.random.default_rng(7)
+        revealed = rng.normal(0.0, 0.05, (200, 200)).astype(np.float32)
+        cv2.line(revealed, (20, 40), (180, 160), 1.2, 21)
+        valid = np.ones((200, 200), bool)
+        alpha = measure_design.cancel_strength(revealed, valid)
+
+        stroke = np.zeros((200, 200), np.uint8)
+        cv2.line(stroke, (20, 40), (180, 160), 1, 7)
+        self.assertGreater(alpha[stroke > 0].min(), 0.9)
+        far = cv2.dilate(stroke, np.ones((41, 41), np.uint8)) == 0
+        self.assertLess(alpha[far].max(), 0.1)
+
+    def test_restoring_touches_only_the_marked_pixels(self):
+        design = np.zeros((120, 120), np.float32)
+        design[:, ::7] = 1.0
+        colour = np.full((120, 120, 3), 200, np.uint8)
+        colour[40:70, 40:70] = 20
+        mask = np.full((120, 120), 255, np.uint8)
+        weight = np.ones((120, 120), np.float32)
+        alpha = np.zeros((120, 120), np.float32)
+        alpha[40:70, 40:70] = 1.0
+
+        change = measure_design.restore_stamp(colour, design, mask, weight,
+                                              alpha)
+        untouched = np.ones((120, 120), bool)
+        untouched[40:70, 40:70] = False
+        self.assertEqual(np.abs(change[untouched]).max(), 0.0)
+        self.assertGreater(change[40:70, 40:70].mean(), 50.0)
+
+
+class AnnotationTest(unittest.TestCase):
+    def test_annotating_leaves_the_scan_untouched(self):
+        """Three outputs read the scan after this one draws on it."""
+        scan = np.full((400, 400, 3), 180, np.uint8)
+        before = scan.copy()
+        results = [{'stamp': 1, 'bbox': {'x0': 50, 'y0': 50,
+                                         'x1': 350, 'y1': 350},
+                    'design_width_mm': 16.0, 'design_height_mm': 22.0,
+                    'design_corners_image': [[60, 60], [340, 60],
+                                             [340, 340], [60, 340]]}]
+        drawn = measure_design.draw_design(scan, results, [], 'mm')
+        np.testing.assert_array_equal(scan, before)
+        self.assertTrue((drawn != before).any())
+
+
 class BandTest(unittest.TestCase):
     def test_thinly_covered_lines_cannot_look_like_a_rule(self):
         """The 70K margin artefact: a dark band carried by one or two stamps

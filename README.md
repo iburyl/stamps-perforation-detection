@@ -533,6 +533,7 @@ python design_size/measure_design.py scan.jpg --dpi 1200
 | `scan_design.json` | per-stamp design rectangle, fitted scales and quality figures |
 | `scan_golden.png` | the averaged design with every detected frame rule drawn |
 | `scan_cancel.jpg` | the scan with the shared design subtracted, leaving the cancellations |
+| `scan_uncancelled.jpg` | the scan with the cancellations taken off and the design restored |
 
 `scan_design_size.jpg` is the result meant to be read, and is the counterpart of
 `scan_detected.jpg`. Line weights, font scale and label position follow it, so the two can
@@ -742,6 +743,45 @@ subtraction's own result and can be judged as such. Two things in it are not can
   limit do not register identically across stamps, so the average blurs them and each
   stamp keeps its own version, which no subtraction can remove. It shows as a faint ghost
   of the design and a fine mottle.
+
+## Taking the cancellations off
+
+`scan_uncancelled.jpg` is the same decomposition read the other way: where the residual
+says a pixel is not part of the design, the design is put back. Only marked pixels change,
+so away from a postmark the output is the original scan down to the bit — the change is
+computed and added, rather than the stamp being resampled and pasted.
+
+Deciding which pixels are marked is the whole difficulty, and a threshold on the residual
+cannot do it. The texture above is not small, and a stroke's soft edge is as faint as it
+is. Two things are true of a postmark and of nothing else on the stamp: **it is connected,
+and it is large.** So each mark is followed outwards from a core of four robust sigma down
+to one and a half, and is believed only if its core covers enough of the stamp to have
+been meant. A deep isolated excursion of the texture is neither connected to a core nor
+large, and is left alone.
+
+That selectivity is the point, and it is measurable. On the 3K scan the heavily cancelled
+stamps have 3 to 8% of their area replaced, while the one that carries almost no postmark
+has 0.0% — it comes through untouched. A plain 2 sigma threshold cleaned the heavy stamps
+slightly better but replaced 8% of the clean one, which is not removing a cancellation but
+substituting the average for the stamp.
+
+Lightness under a mark comes from the golden, carried into the stamp's own exposure by the
+same gain and offset. Colour cannot be taken from anywhere, since black ink destroys the
+stamp's own hue as well, so it is rebuilt from the restored lightness using the relation
+between the two over the uncancelled part of that stamp. It holds as long as lightness
+predicts hue, which on these stamps it does: it carries a one-colour print on tinted paper
+exactly, and the two-colour 70K well enough that the brown frame and the orange centre
+both come back correctly. Two inks of similar lightness and different hue would not be
+told apart, and would be reconstructed as whatever the regression averages them to.
+
+`--uncancel-fade` sets how much of the mark to take off, from 0 to 1.
+
+**It cannot tell a postmark from any other individual blemish.** A tear, a thin spot, a
+pen stroke or a plate flaw peculiar to one stamp all satisfy the same description, and all
+will be restored away. The operation is "make this stamp agree with the others", and
+reading it as "remove the cancellation" is an interpretation of the result, not a property
+of the method. **Nothing restored is evidence about the stamp** — the detail under a mark
+is the average of the others, invented for this stamp.
 
 ## What the numbers are worth
 
