@@ -85,6 +85,14 @@ class PerforationTests(unittest.TestCase):
             self.assertNotIn('brightness', result['algorithm_trials'][side])
             primary = result['algorithm_trials'][side]['cross_support']
             self.assertEqual(len(primary['profile_candidates']), 14)
+            debug = result['debug_cross_support'][side]
+            self.assertEqual(len(debug['profile_candidates']), 14)
+            self.assertEqual(set(debug['clusterings']), {3, 4})
+            for clusters in (3, 4):
+                self.assertEqual(
+                    debug['clusterings'][clusters]['centers_lab'].shape,
+                    (clusters, 3),
+                )
             self.assertIn(primary['profile_map'], {
                 'brightness', 'k30', 'k31',
                 'k400', 'k401', 'k410', 'k411',

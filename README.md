@@ -3,7 +3,7 @@
 A research tool that measures postage stamp **perforation gauge** (holes per 20 mm) and
 **valley-to-valley dimensions** from a flatbed scan of several stamps on dark backing paper.
 
-Only NumPy and OpenCV are required.
+NumPy, OpenCV and Pillow are required.
 
 ```
 pip install -r requirements.txt
@@ -35,6 +35,45 @@ at a glance.
 `scan_perf.json` is written for the next processing stage and for agent-driven debugging.
 It is deliberately exhaustive and is not intended to be read by hand.
 
+### Collection analysis
+
+`analysis/analyze_perforation.py` reads any collection of `*_perf.json` files produced by
+the detector. It is not tied to a named study, catalogue issue, file naming scheme, or a
+fixed number of clusters.
+
+```bash
+python analysis/analyze_perforation.py /path/to/results
+```
+
+Directories are searched recursively. For one directory input, the default output is its
+`perforation-analysis` subdirectory; for one file, it is beside that file. The analysis
+selects the cluster count with the Gap statistic 1-SE rule and separately tests whether
+fitted corner-hole phases support frame perforation or are compatible with independent
+line-perforator passes.
+
+In the cluster chart, every source JSON has a distinct color and every selected cluster
+has a distinct marker shape. The marker outline identifies the worst edge-detection
+algorithm, using the same colors as the annotated detector image. The six observations
+farthest from their assigned centroid are labelled as `source:stamp_id`. Axis grid lines
+are drawn at every visible 0.25-gauge boundary.
+
+The report directory contains:
+
+| file | contents |
+| --- | --- |
+| `report.md` | readable conclusions, methods, limitations and embedded charts |
+| `analysis.json` | machine-readable cluster and frame-versus-line results |
+| `summary.csv` | all complete horizontal/vertical gauge pairs |
+| `cluster_assignments.csv` | one selected cluster per complete stamp measurement |
+| `perforation_clusters.png` | selected clustering and centroids |
+| `cluster_count_diagnostics.png` | Gap statistic and silhouette by candidate `k` |
+| `corner_alignment.png` | fitted corner-hole phase evidence |
+
+The frame/line result is deliberately conservative. At least 12 usable corners from four
+stamps are required; otherwise it reports `insufficient-data`. A `linear-compatible`
+result means that the test found no collection-wide phase locking. It is not proof of a
+particular perforating machine.
+
 Diagnostics for one stamp/side/hole are written to `scan_details/` when `--stamp`,
 `--side` and `--spot` are given. Every file name starts with the phase that produced it
 (`0` for stamp localization and rectification, then `1`–`4` as above), so sorting the
@@ -43,6 +82,9 @@ Each panel carries a banner naming its phase, its method, its status, and whethe
 the one selected. A diagnostic run selected with `--stamp` (optionally narrowed in the
 report with `--side`) executes and records a shadow run of every current fallback
 (`algorithm_trials.json`), so the alternatives can be compared on one baseline.
+With `--stamp` and `--side`, `1_all_profiles_and_guesses.png` also shows the exact k=3
+and k=4 centroid-colour images, all fourteen binary boundary profiles, every pre-arc
+valley guess, their scores, cross-support bonus, and a red border around the winner.
 
 ---
 
@@ -541,6 +583,73 @@ gauge difference 0.001, p90 0.027, maximum 0.099 over 302 collection sides. On
 selector. Across 18 nearby bonus/tolerance settings, coverage stays at 301–302/320 on the
 collection and 94/108 on `worst.jpg`, with no side more than 0.5 from both axis-appropriate
 theoretical values.
+
+### Profile roughness follow-up — recorded, not yet production
+
+An October 2026 follow-up investigated a false primary edge on `3K`, stamp 8, left side,
+and checked candidate-selection changes on the eight available nominal scans (`1K`, `2K`,
+`3K`, `5K`, `7K`, `14K`, `35K`, and `70K`). The sweep contained 98 stamps, 390 sides with
+at least one usable cheap-profile candidate, 194 complete opposite-side pairs, and 387
+sides with an independent reference made from at least five accepted circular arcs. The
+source scans and scratch evaluator outputs are external to this repository, so the figures
+below are an experiment record rather than a committed reproducible benchmark.
+
+The failure was unusually clear. The current score selected `k410/close`, pitch 25.851 px,
+14 guesses, on the problem side. Its boundary followed image texture rather than the stamp
+edge. A correct profile family was near 63–64 px: the opposite side measured 63.750 px and
+the corresponding side in the older scan measured about 64.08 px.
+
+Three selector changes were compared:
+
+* **Count cap.** Capping the count contribution at six selected `brightness/close`, pitch
+  63.070 px, on the problem side. A global cap is not safe, however: on `7K`, stamp 11,
+  right side, it replaced the correct `k401/close` result at 64.55 px (64.49 px arc
+  reference) with a doubled-period `k411/stack` result at 123.54 px. `cap6` must therefore
+  not be introduced globally.
+* **Continuous smoothness penalty.** Multiplying the current score by
+  `exp(-weight * roughness)` removed the gross half-period alias at weight 1.0, but changed
+  15 selections and still chose `k30/close`, pitch 55.503 px, for the problem side. This is
+  14.82% away from its opposite side and does not solve the edge-selection error.
+* **Hard roughness gate.** For a profile depth sequence `d`, the tested dimensionless
+  measure was
+
+  ```text
+  roughness = P90(abs(d - GaussianBlur(d, sigma=1.6))) / pitch
+  ```
+
+  The current winners had median roughness 0.02, 95th percentile 0.03, and 99th percentile
+  0.06. The false `3K` winner was 0.639; the next-highest winner was 0.18. Thresholds 0.20
+  and 0.30 therefore flagged only the known bad side in this dataset.
+
+The meaning of the hard gate is important. Removing the rough candidate and selecting the
+next candidate by the unchanged score chooses the incorrect 55.503 px profile. At threshold
+0.20 this changes one of 390 sides and removes the only opposite-side alias above 1.5×, but
+the number of pairs within 10% remains 193/194:
+
+| selector | changed sides | pairs within 5% | pairs within 10% | aliases >= 1.5x |
+| --- | ---: | ---: | ---: | ---: |
+| current | 0 | 191/194 | 193/194 | 1 |
+| reject rough candidates, then reuse current score (`roughness <= 0.20`) | 1 | 191/194 | 193/194 | 0 |
+
+The promising interpretation is instead to reject the **whole primary result** when its
+winner exceeds 0.20 and hand the side to the existing fallback ladder. One targeted full
+pipeline run did this without `cap6` and without an opposite-side score weight. The existing
+`parallel_edge_arc_recovery` recovered the left side at 63.882 px from 13 points, only 0.21%
+from the right side's 63.750 px. No other primary winner crossed the 0.20 threshold in the
+eight-scan selector sweep, including the correct `7K` side.
+
+This gate is not implemented yet. If continued, the conservative next experiment is:
+
+1. compute roughness only for the already selected winner, keeping the normal primary path
+   linear in profile length and requiring no extra arc pass;
+2. when roughness exceeds 0.20, publish no primary edge but preserve all profile candidates
+   for the existing recovery methods;
+3. run the complete end-to-end dataset before changing production selection.
+
+Opposite-side pitch agreement may remain weak supporting evidence, but it must not dominate
+selection: opposing perforation is often similar, not guaranteed identical. The same applies
+to agreement between different scans of the same stamp design. Neither was added as a score
+term in this follow-up.
 
 ### Input
 

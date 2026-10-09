@@ -112,8 +112,13 @@ def boundary_profile(binary, n0, n1, start, end):
     return depth
 
 
-def _cross_support_maps(brightness_band, lab_band):
-    """Return the brightness peer and all six k=3/4 binary partitions."""
+def _cross_support_maps(brightness_band, lab_band, debug=None):
+    """Return the brightness peer and all six k=3/4 binary partitions.
+
+    A diagnostic run may pass a dictionary.  In that case the exact label and
+    centroid arrays behind the partitions are retained for the human-readable
+    ``--stamp --side`` comparison sheet.  Production runs do not keep them.
+    """
     maps = [{
         'name': 'brightness', 'mask': brightness_band.astype(np.uint8),
         'k': None, 'assignment': None, 'centers_L': None,
@@ -128,6 +133,11 @@ def _cross_support_maps(brightness_band, lab_band):
             cv2.KMEANS_PP_CENTERS,
         )
         labels = labels.reshape(data.shape[:2])
+        if debug is not None:
+            debug.setdefault('clusterings', {})[k] = {
+                'labels': labels,
+                'centers_lab': centers,
+            }
         order = np.argsort(centers[:, 0])
         brightest = int(order[-1])
         middles = [int(index) for index in order[1:-1]]
@@ -183,9 +193,9 @@ def select_cross_support_candidate(candidates,
 
 
 def cross_support_edge(brightness_band, lab_band, gray_signal, positions,
-                       n0, short_size, collect_debug=False):
+                       n0, short_size, collect_debug=False, debug=None):
     """Choose among fourteen cheap profiles, then run exactly one arc pass."""
-    maps = _cross_support_maps(brightness_band, lab_band)
+    maps = _cross_support_maps(brightness_band, lab_band, debug=debug)
     center = float(np.mean(positions))
     candidates = []
     for ridge in CROSS_SUPPORT_RIDGES:
@@ -210,6 +220,11 @@ def cross_support_edge(brightness_band, lab_band, gray_signal, positions,
             })
 
     selected = select_cross_support_candidate(candidates)
+    if debug is not None:
+        # ``profile`` is the untouched cheap-profile result.  The winner's
+        # ``edge`` is refined below, but the comparison sheet must show the
+        # guesses that actually participated in pre-arc selection.
+        debug['profile_candidates'] = candidates
     summaries = ([{
         'map': candidate['map'], 'ridge': candidate['ridge'],
         'status': candidate['edge'].get('status', 'unavailable'),
@@ -1571,6 +1586,8 @@ def measure_stamp(image, orientation, threshold, collect_trials=False,
     algorithm_trials = {side: {} for side in SIDES} if collect_trials else None
     debug_algorithm_edges = ({side: {} for side in SIDES}
                              if collect_trials else None)
+    debug_cross_support = ({side: {} for side in SIDES}
+                           if collect_trials else None)
     for side in SIDES:
         primary_started = time.perf_counter()
         vertical = side in ('left', 'right')
@@ -1596,6 +1613,7 @@ def measure_stamp(image, orientation, threshold, collect_trials=False,
         edge, selected_profile, profile_candidates = cross_support_edge(
             brightness_band, lab_band, gray_work, positions, n0,
             min(width, height), collect_debug=collect_trials,
+            debug=(debug_cross_support[side] if collect_trials else None),
         )
         depth = (selected_profile['depth'] if selected_profile is not None
                  else np.full(len(positions), np.nan))
@@ -1850,6 +1868,7 @@ def measure_stamp(image, orientation, threshold, collect_trials=False,
             )
         result['algorithm_trials'] = algorithm_trials
         result['debug_algorithm_edges'] = debug_algorithm_edges
+        result['debug_cross_support'] = debug_cross_support
     return result
 
 

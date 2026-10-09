@@ -920,6 +920,176 @@ def _profile_image(context):
     return canvas
 
 
+def _labelled_edge_strip(image, title, width=600, height=210):
+    """Put a compact title above one side-oriented diagnostic strip."""
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    canvas = np.full((height, width, 3), 245, np.uint8)
+    resized = cv2.resize(
+        image, (width, height - 46),
+        interpolation=(cv2.INTER_NEAREST if image.dtype == np.uint8
+                       and len(np.unique(image.reshape(-1, image.shape[-1]),
+                                         axis=0)) <= 8
+                       else cv2.INTER_AREA),
+    )
+    canvas[46:] = resized
+    cv2.putText(canvas, title, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                0.58, (25, 25, 25), 1, cv2.LINE_AA)
+    return canvas
+
+
+def _candidate_profile_panel(candidate, context, winner=False):
+    """Draw one pre-arc binary profile and every valley guess it produced."""
+    width, height = 900, 290
+    title_height, strip_height = 62, 132
+    chart_top, chart_bottom = 207, height - 14
+    canvas = np.full((height, width, 3), 245, np.uint8)
+    mask = cv2.resize(candidate['mask'] * 255, (width, strip_height),
+                      interpolation=cv2.INTER_NEAREST)
+    canvas[title_height:title_height + strip_height] = cv2.cvtColor(
+        mask, cv2.COLOR_GRAY2BGR,
+    )
+    cv2.rectangle(canvas, (0, chart_top), (width - 1, chart_bottom),
+                  (30, 30, 30), -1)
+
+    start, end, n0, n1 = (context[key]
+                           for key in ('start', 'end', 'n0', 'n1'))
+    depth = candidate['depth']
+    profile = candidate.get('profile', candidate.get('edge', {}))
+
+    def x_coordinate(position):
+        return int(round((position - start) * (width - 1)
+                         / max(1, end - start - 1)))
+
+    def strip_point(position, value):
+        return (
+            x_coordinate(position),
+            title_height + int(round(
+                (value - n0) * (strip_height - 1) / max(1, n1 + 2 - n0)
+            )),
+        )
+
+    def chart_point(position, value):
+        return (
+            x_coordinate(position),
+            chart_top + int(round(
+                (value - n0) * (chart_bottom - chart_top)
+                / max(1, n1 + 2 - n0)
+            )),
+        )
+
+    valid = np.isfinite(depth)
+    for projector in (strip_point, chart_point):
+        previous = None
+        for position, value, is_valid in zip(context['positions'], depth, valid):
+            if not is_valid:
+                previous = None
+                continue
+            point = projector(position, value)
+            if previous is not None:
+                cv2.line(canvas, previous, point, (0, 215, 255), 1,
+                         cv2.LINE_AA)
+            previous = point
+
+    accepted = profile.get('accepted', [])
+    guesses = profile.get('valleys', np.empty((0, 2)))
+    for index, point in enumerate(guesses):
+        color = ((255, 255, 0)
+                 if index < len(accepted) and accepted[index]
+                 else (255, 0, 255))
+        for projector in (strip_point, chart_point):
+            cv2.drawMarker(canvas, projector(point[0], point[1]), color,
+                           cv2.MARKER_CROSS, 9, 2, cv2.LINE_AA)
+
+    pitch = profile.get('pitch_px')
+    pitch_text = '--' if pitch is None else f'{pitch:.2f}'
+    bonus = 'yes' if candidate.get('cross_supported') else 'no'
+    winner_text = 'WINNER | ' if winner else ''
+    title = (
+        f'{winner_text}{candidate["map"]}/{candidate["ridge"]}  '
+        f'status={profile.get("status", "unavailable")}  '
+        f'guess={len(guesses)}  pitch={pitch_text}  '
+        f'score={candidate.get("score", -1):.3f}  '
+        f'adj={candidate.get("adjusted_score", -1):.3f}  cross={bonus}'
+    )
+    cv2.putText(canvas, title, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                0.47, (20, 20, 20), 1, cv2.LINE_AA)
+    centers = candidate.get('centers_L')
+    subtitle = (
+        'yellow=profile; cyan=accepted guess; magenta=rejected guess'
+        + (f'; sorted centroid L={centers}' if centers is not None else '')
+    )
+    cv2.putText(canvas, subtitle, (10, 49), cv2.FONT_HERSHEY_SIMPLEX,
+                0.39, (75, 75, 75), 1, cv2.LINE_AA)
+    if winner:
+        cv2.rectangle(canvas, (2, 2), (width - 3, height - 3),
+                      (0, 0, 255), 4)
+    return canvas
+
+
+def _cross_support_profiles_image(context, debug, selected_edge):
+    """Render exact k-means colours and all fourteen pre-arc candidates."""
+    start, end, n0, n1 = (context[key]
+                           for key in ('start', 'end', 'n0', 'n1'))
+    side = debug.get('side')
+    patch = context['patch']
+    work_color = patch.transpose(1, 0, 2) if side in ('left', 'right') else patch
+    if side in ('bottom', 'right'):
+        work_color = work_color[::-1]
+    original = work_color[n0:n1 + 3, start:end]
+
+    overview = [_labelled_edge_strip(original, 'Original colour edge strip')]
+    for k in (3, 4):
+        clustering = debug.get('clusterings', {}).get(k)
+        if clustering is None:
+            continue
+        centers = np.clip(np.rint(clustering['centers_lab']), 0, 255).astype(
+            np.uint8,
+        )
+        center_bgr = cv2.cvtColor(centers[None], cv2.COLOR_LAB2BGR)[0]
+        quantized = center_bgr[clustering['labels']]
+        sorted_l = sorted(round(float(value), 1)
+                          for value in clustering['centers_lab'][:, 0])
+        overview.append(_labelled_edge_strip(
+            quantized, f'k={k} exact centroid colours; sorted L={sorted_l}',
+        ))
+    while len(overview) < 3:
+        overview.append(np.full_like(overview[0], 245))
+    overview_image = np.hstack(overview[:3])
+
+    candidates = debug.get('profile_candidates', [])
+    by_key = {
+        (candidate['map'], candidate['ridge']): candidate
+        for candidate in candidates
+    }
+    map_order = ('brightness', 'k30', 'k31',
+                 'k400', 'k401', 'k410', 'k411')
+    winner_key = (selected_edge.get('profile_map'),
+                  selected_edge.get('profile_ridge'))
+    rows = []
+    for name in map_order:
+        panels = []
+        for ridge in ('stack', 'close'):
+            candidate = by_key.get((name, ridge))
+            if candidate is None:
+                panels.append(_message_image(
+                    [f'{name}/{ridge}', 'candidate not available'],
+                    width=900, height=290,
+                ))
+            else:
+                panels.append(_candidate_profile_panel(
+                    candidate, context, winner=(name, ridge) == winner_key,
+                ))
+        rows.append(np.hstack(panels))
+    profiles = np.vstack(rows)
+    heading = _message_image([
+        'PHASE 1 - exact k-means colours, all 14 pre-arc profiles and guess points',
+        (f'Selected: {winner_key[0]}/{winner_key[1]}; '
+         'red border=winner; candidates are shown before circle fitting'),
+    ], width=profiles.shape[1], height=125)
+    return np.vstack([heading, overview_image, profiles])
+
+
 def _message_image(lines, width=1200, height=360):
     image = np.full((height, width, 3), 245, np.uint8)
     for index, line in enumerate(lines):
@@ -1199,6 +1369,13 @@ def save_details(directory, image, box, stamp_number, coarse_orientation,
     signal, mask = _side_input_panels(primary)
     write(1, 'input_gray', signal)
     write(1, 'selected_binary_map', mask)
+    cross_debug = measurement.get('debug_cross_support', {}).get(side)
+    if cross_debug and cross_debug.get('profile_candidates'):
+        cross_debug = dict(cross_debug, side=side)
+        write(1, 'all_profiles_and_guesses',
+              _cross_support_profiles_image(
+                  primary, cross_debug, primary_edge,
+              ), primary_edge)
     write(1, 'cross_support_profile', _profile_image(primary), primary_edge)
     write(1, 'holes_numbered', _numbered_side_image(primary), primary_edge)
 
