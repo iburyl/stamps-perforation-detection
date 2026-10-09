@@ -1299,18 +1299,37 @@ def _init_measurement_worker(memory_name, shape, dtype_name):
 
 def _analyze_stamp_measurement(image, index, coarse_orientation, threshold,
                                collect_trials):
-    first_measurement = measure_stamp(image, coarse_orientation, threshold)
-    refined_orientation = refine_orientation_from_measurement(
-        coarse_orientation, first_measurement,
+    # Try to establish the orientation from primary edges before paying for
+    # the recovery ladder. If they do not form a consensus, retain the legacy
+    # full coarse-angle pass: recovered edges can be essential orientation
+    # evidence on difficult stamps (14K #6 is one such case).
+    primary_measurement = measure_stamp(
+        image, coarse_orientation, threshold, primary_only=True,
     )
+    refined_orientation = refine_orientation_from_measurement(
+        coarse_orientation, primary_measurement,
+    )
+    if (refined_orientation is not None
+            and refined_orientation.get('orientation_source')
+            == 'perforation_line_consensus'
+            and refined_orientation.get('status') == 'ok'):
+        first_measurement = primary_measurement
+    else:
+        first_measurement = measure_stamp(
+            image, coarse_orientation, threshold,
+        )
+        refined_orientation = refine_orientation_from_measurement(
+            coarse_orientation, first_measurement,
+        )
     if collect_trials:
         measurement = measure_stamp(
             image, refined_orientation, threshold, collect_trials=True,
         )
     elif (refined_orientation is not None
-          and abs(refined_orientation.get(
+          and (abs(refined_orientation.get(
               'orientation_correction_deg', 0,
-          )) > 0.05):
+          )) > 0.05
+               or first_measurement.get('status') != 'ok')):
         measurement = measure_stamp(image, refined_orientation, threshold)
     else:
         measurement = first_measurement

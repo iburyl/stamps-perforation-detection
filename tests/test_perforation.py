@@ -18,12 +18,14 @@ from perforation import (circular_arc_count, draw_measurement, fit_arc_lattice,
                          select_cross_support_candidate)
 from segment_stamps import (average_perforation, summary_row, write_perf_json,
                             perforation_label, reconcile_perforation,
-                            refine_orientation_from_measurement)
+                            refine_orientation_from_measurement,
+                            _analyze_stamp_measurement)
 
 
 class PerforationTests(unittest.TestCase):
     def sample(self, angle=0, damaged=False, perforated=True, hinge=False,
-               paper_color=(125, 180, 200), collect_trials=False):
+               paper_color=(125, 180, 200), collect_trials=False,
+               primary_only=False):
         mask = np.zeros((900, 900), np.uint8)
         cv2.rectangle(mask, (250, 170), (650, 730), 255, -1)
         if perforated:
@@ -54,6 +56,7 @@ class PerforationTests(unittest.TestCase):
                            center_x=450., center_y=450.)
         return measure_stamp(
             image, orientation, 100, collect_trials=collect_trials,
+            primary_only=primary_only,
         )
 
     def test_diagnostic_run_forces_last_fallback_and_records_it(self):
@@ -118,6 +121,18 @@ class PerforationTests(unittest.TestCase):
             {edge['method'] for edge in result['sides'].values()},
             {'cross_support'},
         )
+
+    def test_primary_only_measurement_does_not_run_fallbacks(self):
+        with (patch('perforation.adaptive_color_edge') as adaptive,
+              patch('perforation.recover_missing_side') as edge_recovery,
+              patch('perforation.recover_side_by_parallel_scan') as scan_recovery,
+              patch('perforation.recover_side_by_sequential_kmeans_lab') as sequential):
+            self.sample(perforated=False, primary_only=True)
+
+        adaptive.assert_not_called()
+        edge_recovery.assert_not_called()
+        scan_recovery.assert_not_called()
+        sequential.assert_not_called()
 
     def test_cross_support_bonus_is_symmetric_and_pre_arc(self):
         brightness = {
@@ -219,6 +234,59 @@ class PerforationTests(unittest.TestCase):
         self.assertEqual(set(refined['orientation_inlier_sides']),
                          {'top', 'bottom', 'left'})
         self.assertNotIn('right', refined['orientation_inlier_sides'])
+
+    def test_orientation_probe_runs_full_pass_when_primary_is_incomplete(self):
+        orientation = {
+            'angle_deg': 0., 'width_px': 400., 'height_px': 560.,
+            'center_x': 300., 'center_y': 350.,
+        }
+        primary = {'status': 'review', 'sides': {}}
+        final = {'status': 'ok', 'sides': {}}
+        consensus = dict(
+            orientation,
+            orientation_source='perforation_line_consensus',
+            orientation_correction_deg=1.,
+            status='ok',
+        )
+        with (patch('segment_stamps.measure_stamp',
+                    side_effect=(primary, final)) as measured,
+              patch('segment_stamps.refine_orientation_from_measurement',
+                    return_value=consensus)):
+            _, _, result = _analyze_stamp_measurement(
+                np.zeros((10, 10, 3), np.uint8), 0, orientation, 100., False,
+            )
+
+        self.assertIs(result, final)
+        self.assertTrue(measured.call_args_list[0].kwargs['primary_only'])
+        self.assertNotIn('primary_only', measured.call_args_list[1].kwargs)
+
+    def test_orientation_probe_falls_back_to_legacy_coarse_pass_without_consensus(self):
+        orientation = {
+            'angle_deg': 0., 'width_px': 400., 'height_px': 560.,
+            'center_x': 300., 'center_y': 350.,
+        }
+        primary = {'status': 'review', 'sides': {}}
+        recovered = {'status': 'review', 'sides': {}}
+        refined = dict(
+            orientation,
+            orientation_source='perforation_line_consensus',
+            orientation_correction_deg=2.,
+        )
+        final = {'status': 'ok', 'sides': {}}
+        with (patch('segment_stamps.measure_stamp',
+                    side_effect=(primary, recovered, final)) as measured,
+              patch('segment_stamps.refine_orientation_from_measurement',
+                    side_effect=(orientation, refined))):
+            _, actual_orientation, result = _analyze_stamp_measurement(
+                np.zeros((10, 10, 3), np.uint8), 0, orientation, 100., False,
+            )
+
+        self.assertIs(actual_orientation, refined)
+        self.assertIs(result, final)
+        self.assertEqual(measured.call_count, 3)
+        self.assertTrue(measured.call_args_list[0].kwargs['primary_only'])
+        self.assertNotIn('primary_only', measured.call_args_list[1].kwargs)
+        self.assertNotIn('primary_only', measured.call_args_list[2].kwargs)
 
     def test_per_image_json_contains_summary_and_detailed_hole_ids(self):
         result = self.sample()

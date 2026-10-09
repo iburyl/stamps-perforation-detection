@@ -370,8 +370,13 @@ Three structural multipliers apply on top:
 * A side that failed `recover_side_by_parallel_scan()` cheaply in pass 1 (its
   `reliable_side(opposite)` guard short-circuits in microseconds) pays the full grid in a
   later pass once the opposite side has been recovered.
-* Orientation refinement re-measures the stamp from scratch, so all of the above happens
-  twice and the first round's recovery work is discarded.
+
+Orientation refinement now starts with a primary-only `cross_support` probe. When at least
+three of those edges form a tight orientation consensus, the fallback ladder is deferred
+until after the refined angle is known. If primary edges cannot establish the angle, the
+former full coarse-angle pass is retained because recovered sides may be essential orientation
+evidence. This conditional guard avoids discarded fallback work without changing the hard
+cases that depend on it.
 
 The worst case observed is roughly 1000 arc fits per `measure_stamp()` call, about 70% of
 them spent on a single side that cannot succeed at any price — see the case study below.
@@ -385,9 +390,6 @@ Debug timings are not representative of a batch run.
 
 Recorded here so the analysis is not repeated. None of these are in the code.
 
-* **Skip recovery in the orientation pass.** The consensus only votes on arc-supported
-  phase-1 sides, so the first `measure_stamp()` call does not need the ladder at all.
-  Halves the cost of every hard stamp at no accuracy risk — the largest single saving.
 * **Pre-screen grid hypotheses.** Score each candidate line with a cheap proxy (mean
   gradient magnitude at the predicted seeds, say) and arc-fit only the best handful. The
   strict circle gate still decides, so currently-succeeding cases are unaffected. Highest
@@ -467,8 +469,9 @@ detection rerun: the stamp abuts the scan's bright top border. The patch's top-r
 sits at scan y=98, inside the known ~143 px border strip, and the box top is at scan y=129.
 
 The runtime is the same fault seen from the other end — three of four sides fail phase 1 and
-climb the whole ladder, twice over because of the orientation re-measure. See *Performance*
-for the accounting and for the early-exit guards that would make this case fail fast.
+climb the whole ladder. This stamp does not have enough primary edges to establish its
+orientation, so the safe orientation guard retains its full coarse-angle pass. It still
+needs the early-exit guards described in *Performance* to fail fast.
 
 ## Tests
 
@@ -476,7 +479,7 @@ for the accounting and for the early-exit guards that would make this case fail 
 python -m unittest discover -s tests -t .
 ```
 
-44 tests, about one minute. The real hinge regression uses a cropped fixture stored in
+46 tests, about one minute. The real hinge regression uses a cropped fixture stored in
 `tests/fixtures/`, so the suite has no external scan dependency and does not skip in CI.
 
 ---

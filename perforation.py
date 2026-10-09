@@ -1545,7 +1545,8 @@ def recover_side_by_parallel_scan(side, sides, contexts):
     return edge
 
 
-def measure_stamp(image, orientation, threshold, collect_trials=False):
+def measure_stamp(image, orientation, threshold, collect_trials=False,
+                  primary_only=False):
     if orientation is None:
         return {'status': 'unavailable', 'sides': {}}
     angle = np.deg2rad(orientation['angle_deg'])
@@ -1619,7 +1620,7 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
         # Cross-support is the only primary arc pass. If it cannot establish
         # five arcs, the existing colour/geometric recovery ladder remains
         # available; no standalone brightness pass is attempted.
-        if collect_trials or circular_arc_count(edge) < 5:
+        if not primary_only and (collect_trials or circular_arc_count(edge) < 5):
             color_started = time.perf_counter()
             color_work = lab_work
             # Stay outside the printed frame: only the outer 7% is eligible.
@@ -1719,7 +1720,7 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
     # First use the cheaper geometry-driven recovery. It can establish sides
     # that no image-boundary profile sees, and each recovered side may support
     # another one in the following pass.
-    pending = recovery_targets(sides)
+    pending = set() if primary_only else recovery_targets(sides)
     for _ in range(2):
         progress = False
         for side in SIDES:
@@ -1743,7 +1744,7 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
     # for geometric results whose opposite pitch disagrees by about 0.15 gauge
     # at gauge 15 (~1%). A successful image-profile result outranks a geometric
     # hypothesis; a failed challenge leaves that hypothesis untouched.
-    sequential_targets = recovery_targets(sides)
+    sequential_targets = set() if primary_only else recovery_targets(sides)
     opposite_names = {
         'top': 'bottom', 'bottom': 'top',
         'left': 'right', 'right': 'left',
@@ -1770,7 +1771,7 @@ def measure_stamp(image, orientation, threshold, collect_trials=False):
 
     # One final geometry pass lets a newly measured k-means side support a
     # neighbour that was impossible during the first two passes.
-    pending = recovery_targets(sides)
+    pending = set() if primary_only else recovery_targets(sides)
     for side in SIDES:
         if side not in pending:
             continue
