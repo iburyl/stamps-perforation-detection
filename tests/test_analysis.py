@@ -72,7 +72,7 @@ class AnalysisTests(unittest.TestCase):
     def test_design_charts_are_pngs(self):
         rows = [
             {
-                "result_file": r"D:\results\1K_perf.json",
+                "result_file": r"D:\results\data_1K_perf.json",
                 "source": "1K.jpg", "stamp": str(index),
                 "design_width_mm": 16.2 + index*0.01,
                 "design_height_mm": 22.1 + index*0.02,
@@ -100,7 +100,7 @@ class AnalysisTests(unittest.TestCase):
     def test_non_modal_hole_counts_are_excluded_from_spacing(self):
         rows = [
             {
-                "result_file": r"D:\results\1K_perf.json",
+                "result_file": r"D:\results\data_1K_perf.json",
                 "stamp": str(index), "cluster": 0,
                 "frame_holes_across_width": width,
                 "frame_holes_across_height": 19,
@@ -175,10 +175,10 @@ class AnalysisTests(unittest.TestCase):
             }],
         }
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
-            path = Path(directory) / "nested" / "anything_perf.json"
+            path = Path(directory) / "nested" / "data_anything_perf.json"
             path.parent.mkdir()
             path.write_text(json.dumps(payload), encoding="utf-8")
-            design_path = path.with_name("anything_design.json")
+            design_path = path.with_name("data_anything_design.json")
             design_path.write_text(json.dumps({
                 "format": "stamp-design-size",
                 "source": "anything.png",
@@ -214,9 +214,9 @@ class AnalysisTests(unittest.TestCase):
 
     def test_source_labels_drop_suffix_and_sort_numbers_naturally(self):
         paths = [
-            r"D:\results\14K_perf.json",
-            r"D:\results\2K_perf.json",
-            r"D:\results\1K_perf.json",
+            r"D:\results\data_14K_perf.json",
+            r"D:\results\data_2K_perf.json",
+            r"D:\results\data_1K_perf.json",
         ]
         labels = source_labels(paths)
         ordered = sorted(paths, key=lambda path: natural_key(labels[path]))
@@ -224,9 +224,9 @@ class AnalysisTests(unittest.TestCase):
 
     def test_outliers_are_farthest_from_their_assigned_centroid(self):
         rows = [
-            {"point": (0.1, 0.0), "result_file": "1K_perf.json", "stamp": "1"},
-            {"point": (3.0, 0.0), "result_file": "1K_perf.json", "stamp": "2"},
-            {"point": (0.2, 0.0), "result_file": "1K_perf.json", "stamp": "3"},
+            {"point": (0.1, 0.0), "result_file": "data_1K_perf.json", "stamp": "1"},
+            {"point": (3.0, 0.0), "result_file": "data_1K_perf.json", "stamp": "2"},
+            {"point": (0.2, 0.0), "result_file": "data_1K_perf.json", "stamp": "3"},
         ]
         self.assertEqual(outlier_indices(rows, [(0.0, 0.0)], [0, 0, 0], count=2), [1, 2])
 

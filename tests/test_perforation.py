@@ -304,7 +304,7 @@ class PerforationTests(unittest.TestCase):
         # test hermetic by creating its disposable output beside the tests.
         with tempfile.TemporaryDirectory(
                 dir=Path(__file__).resolve().parent) as directory:
-            path = Path(directory) / 'scan_perf.json'
+            path = Path(directory) / 'data_scan_perf.json'
             orientation = dict(angle_deg=0., width_px=400., height_px=560.,
                                center_x=450., center_y=450., corners=np.zeros((4, 2)))
             write_perf_json(path, 'scan.png', [(250, 170, 650, 730)],

@@ -14,10 +14,10 @@ Outputs, written next to the input:
 
 | file | contents |
 | --- | --- |
-| `scan_detected.jpg` | the scan with fitted edge lines, hole markers and a per-stamp gauge label |
-| `scan_perf.json` | every numeric result: per stamp, per side, per hole |
+| `scan_perf.jpg` | the scan with fitted edge lines, hole markers and a per-stamp gauge label |
+| `data_scan_perf.json` | every numeric result: per stamp, per side, per hole |
 
-`scan_detected.jpg` is the result meant to be read. Each edge line is coloured by the
+`scan_perf.jpg` is the result meant to be read. Each edge line is coloured by the
 phase of the fallback ladder that produced it, so a side that needed a late fallback is
 visible without opening anything else:
 
@@ -32,14 +32,14 @@ visible without opening anything else:
 The per-stamp gauge label takes the worst phase on the stamp, so a sheet can be triaged
 at a glance.
 
-`scan_perf.json` is written for the next processing stage and for agent-driven debugging.
+`data_scan_perf.json` is written for the next processing stage and for agent-driven debugging.
 It is deliberately exhaustive and is not intended to be read by hand.
 
 ### Collection analysis
 
-`analysis/analyze_perforation.py` reads any collection of `*_perf.json` files produced by
+`analysis/analyze_perforation.py` reads any collection of `data_*_perf.json` files produced by
 the detector. It is not tied to a named study, catalogue issue, file naming scheme, or a
-fixed number of clusters. When matching `*_design.json` files are present beside the
+fixed number of clusters. When matching `data_*_design.json` files are present beside the
 perforation results, their printed-design dimensions are joined by source and stamp id.
 
 ```bash
@@ -374,7 +374,7 @@ Per-hole `category` in the JSON:
 
 Fitted edge lines are drawn in the phase colour of the method that produced them.
 
-Each side in `scan_perf.json` also carries `status`, `reason`, `phase`, `phase_name` and
+Each side in `data_scan_perf.json` also carries `status`, `reason`, `phase`, `phase_name` and
 `seed_source`. The last of these records whether the arcs behind that side were searched
 for against the image (`image`, phases 1–2) or at positions predicted by a pitch
 hypothesis (`hypothesis`, phases 3–4). A consumer that needs independent evidence should
@@ -534,7 +534,7 @@ needs the early-exit guards described in *Performance* to fail fast.
 # Design size — `design_size/`
 
 A second, independent measurand: the size of the **printed design** on each stamp, as
-opposed to the perforation that surrounds it. It consumes a scan plus the `*_perf.json`
+opposed to the perforation that surrounds it. It consumes a scan plus the `data_*_perf.json`
 written by the detector.
 
 ```
@@ -544,13 +544,13 @@ python design_size/measure_design.py scan.jpg --dpi 1200
 | file | contents |
 | --- | --- |
 | `scan_design_size.jpg` | the scan with each design rectangle, its corners and its size in mm |
-| `scan_design.json` | per-stamp design rectangle, fitted scales and quality figures |
+| `data_scan_design.json` | per-stamp design rectangle, fitted scales and quality figures |
 | `scan_golden.png` | the averaged design with every detected frame rule drawn |
-| `scan_cancel.jpg` | the scan with the shared design subtracted, leaving the cancellations |
-| `scan_uncancelled.jpg` | the scan with the cancellations taken off and the design restored |
+| `scan_design_cancel.jpg` | the scan with the shared design subtracted, leaving the cancellations |
+| `scan_design_clean.jpg` | the scan with the cancellations taken off and the design restored |
 
 `scan_design_size.jpg` is the result meant to be read, and is the counterpart of
-`scan_detected.jpg`. Line weights, font scale and label position follow it, so the two can
+`scan_perf.jpg`. Line weights, font scale and label position follow it, so the two can
 be compared at the same zoom. A normal rectangle is red, a recovered result needing review
 is orange, its corners are cyan, and the label carries the stamp number and the size to two
 decimals. A stamp the perforation stage could not close has no design rectangle and is
@@ -735,7 +735,7 @@ pixels. The perforation stage's own detection box is reused only to position the
 ## Revealing the cancellations
 
 Congealing separates every stamp into what it shares with the others and what is only its
-own. The design size is measured from the first part; `scan_cancel.jpg` is the second,
+own. The design size is measured from the first part; `scan_design_cancel.jpg` is the second,
 which is very largely the postmark. It is written on every run, not behind a flag, because
 it is a by-product of work already done rather than a separate job.
 
@@ -743,7 +743,7 @@ Nothing extra is estimated. The golden warped into each stamp's own frame is alr
 computed, today only to report `residual_rms`, and it is already the basis on which the
 outlier weighting recognises cancellation ink. Subtracting it costs one more pass.
 
-`scan_cancel.jpg` keeps the scan's geometry, so it can be laid beside `scan_detected.jpg`.
+`scan_design_cancel.jpg` keeps the scan's geometry, so it can be laid beside `scan_perf.jpg`.
 Outside the measured stamps the scan is left as a pale ghost, which keeps the layout and
 the perforation readable without competing with what has been revealed.
 
@@ -777,7 +777,7 @@ subtraction's own result and can be judged as such. Two things in it are not can
 
 ## Taking the cancellations off
 
-`scan_uncancelled.jpg` is the same decomposition read the other way: where the residual
+`scan_design_clean.jpg` is the same decomposition read the other way: where the residual
 says a pixel is not part of the design, the design is put back. Only marked pixels change,
 so away from a postmark the output is the original scan down to the bit — the change is
 computed and added, rather than the stamp being resampled and pasted.
@@ -840,7 +840,7 @@ What remains is paper shrinkage, ink spread and scanner geometry.
   is believed. `--dpi` is taken on trust here as it is elsewhere.
 * **Shrinkage is not separated from plate differences.** Sheets were perforated after
   printing, so drying shrinkage moves the design size and the perforation pitch together.
-  Correlating the two against `*_perf.json` would test this; it has not been done.
+  Correlating the two against `data_*_perf.json` would test this; it has not been done.
 * **A size difference is assumed to be the whole story.** Genuinely different dies would
   also register as a scale change. The residual map between two groups distinguishes them —
   pure scale gives residuals growing radially from the centre, different dies give local

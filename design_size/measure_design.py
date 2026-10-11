@@ -1,6 +1,6 @@
 """Measure the printed design rectangle of every stamp in one scan.
 
-The input is a scan plus the ``*_perf.json`` written by ``segment_stamps.py``.
+The input is a scan plus the ``data_*_perf.json`` written by ``segment_stamps.py``.
 Every stamp is placed in a common frame by rotation and translation only, so
 true scale is preserved, and the set is then jointly registered against its own
 running average (congealing). The converged average is the golden design; its
@@ -830,7 +830,7 @@ def draw_design(image, results, skipped, unit):
     """Annotate the scan with each stamp's design rectangle and size.
 
     Line and font sizes follow ``segment_stamps.py`` so that this image and
-    ``*_detected.jpg`` can be read side by side at the same zoom.
+    ``*_perf.jpg`` can be read side by side at the same zoom.
     """
     image = image.copy()
     height, width = image.shape[:2]
@@ -866,7 +866,7 @@ def draw_design(image, results, skipped, unit):
         for point in corners:
             cv2.circle(image, tuple(int(value) for value in point),
                        max(4, thickness * 3), CORNER_COLOR, -1, cv2.LINE_AA)
-        # Label above the detection box, where ``*_detected.jpg`` puts it, so
+        # Label above the detection box, where ``*_perf.jpg`` puts it, so
         # the two images can be compared without hunting for the caption.
         anchor = ((box['x0'], box['x1'], box['y0']) if box else
                   (corners[:, 0].min(), corners[:, 0].max(),
@@ -951,7 +951,7 @@ def draw_reveal(image, patches, masks, placements, warps, weights, golden,
     """The scan with the shared design removed from every stamp.
 
     The geometry is the original scan's, so this can be laid beside
-    ``_detected.jpg``. Outside the measured stamps the scan is left as a pale
+    ``_perf.jpg``. Outside the measured stamps the scan is left as a pale
     ghost, which keeps the layout and the perforation visible without
     competing with what has been revealed.
     """
@@ -1195,7 +1195,7 @@ def main():
                      'fitting each stamp back to it.'))
     parser.add_argument('input', help='Input scan, as given to segment_stamps.py')
     parser.add_argument(
-        '--perf', help='Perforation JSON (default: <input stem>_perf.json)')
+        '--perf', help='Perforation JSON (default: data_<input stem>_perf.json)')
     parser.add_argument(
         '--dpi', type=float,
         help='Scan DPI for mm output (default: the value in the perforation JSON)')
@@ -1276,7 +1276,7 @@ def main():
 
     input_path = Path(args.input)
     perf_path = Path(args.perf) if args.perf else \
-        input_path.with_name(input_path.stem + '_perf.json')
+        input_path.with_name('data_' + input_path.stem + '_perf.json')
     document = json.loads(perf_path.read_text(encoding='utf-8'))
     dpi = args.dpi if args.dpi is not None else document.get('dpi')
 
@@ -1320,12 +1320,12 @@ def main():
     parts = (registration['patches'], registration['masks'],
              registration['placements'], registration['warps'],
              registration['weights'], golden, canvas)
-    reveal_path = input_path.with_name(input_path.stem + '_cancel.jpg')
+    reveal_path = input_path.with_name(input_path.stem + '_design_cancel.jpg')
     if not cv2.imwrite(str(reveal_path), draw_reveal(
             image, *parts, args.reveal_fade, args.reveal_window)):
         raise RuntimeError(f'Cannot write image: {reveal_path}')
 
-    clean_path = input_path.with_name(input_path.stem + '_uncancelled.jpg')
+    clean_path = input_path.with_name(input_path.stem + '_design_clean.jpg')
     if not cv2.imwrite(str(clean_path), draw_uncancelled(
             image, *parts, args.uncancel_fade, args.reveal_window)):
         raise RuntimeError(f'Cannot write image: {clean_path}')
@@ -1371,7 +1371,7 @@ def main():
         },
         'stamps': results,
     }
-    out_path = input_path.with_name(input_path.stem + '_design.json')
+    out_path = input_path.with_name('data_' + input_path.stem + '_design.json')
     out_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False),
         encoding='utf-8')

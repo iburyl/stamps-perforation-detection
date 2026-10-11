@@ -81,7 +81,8 @@ def find_inputs(specifications, recursive=True):
     for specification in specifications:
         path = Path(specification).expanduser()
         if path.is_dir():
-            iterator = path.rglob("*_perf.json") if recursive else path.glob("*_perf.json")
+            iterator = (path.rglob("data_*_perf.json") if recursive
+                        else path.glob("data_*_perf.json"))
             paths.extend(iterator)
         elif path.is_file():
             paths.append(path)
@@ -203,7 +204,10 @@ def load_dataset(paths):
             errors.append(f"{path}: {error}")
             continue
         valid_paths.append(path)
-        source = str(payload.get("source") or path.name.removesuffix("_perf.json"))
+        source = str(
+            payload.get("source")
+            or path.name.removeprefix("data_").removesuffix("_perf.json")
+        )
         dpi = finite_positive(payload.get("dpi"))
         for stamp in stamps:
             total_stamps += 1
@@ -258,10 +262,14 @@ def load_dataset(paths):
 
     design_paths, design_rows = [], []
     for perf_path in valid_paths:
+        prefix = "data_"
         suffix = "_perf.json"
-        if not perf_path.name.casefold().endswith(suffix):
+        if (not perf_path.name.casefold().startswith(prefix)
+                or not perf_path.name.casefold().endswith(suffix)):
             continue
-        design_path = perf_path.with_name(perf_path.name[:-len(suffix)] + "_design.json")
+        design_path = perf_path.with_name(
+            perf_path.name[:-len(suffix)] + "_design.json"
+        )
         if not design_path.is_file():
             continue
         try:
@@ -275,7 +283,10 @@ def load_dataset(paths):
             errors.append(f"{design_path}: {error}")
             continue
         design_paths.append(design_path)
-        source = str(payload.get("source") or design_path.name[:-len("_design.json")])
+        source = str(
+            payload.get("source")
+            or design_path.name.removeprefix(prefix)[:-len("_design.json")]
+        )
         for stamp in stamps:
             width = finite_positive(stamp.get(DESIGN_WIDTH))
             height = finite_positive(stamp.get(DESIGN_HEIGHT))
@@ -564,8 +575,11 @@ def source_colors(keys):
 
 def source_name(key):
     name = Path(key).name
+    prefix = "data_"
     suffix = "_perf.json"
-    return name[:-len(suffix)] if name.casefold().endswith(suffix) else Path(name).stem
+    if name.casefold().startswith(prefix) and name.casefold().endswith(suffix):
+        return name[len(prefix):-len(suffix)]
+    return Path(name).stem
 
 
 def natural_key(value):
@@ -1673,7 +1687,7 @@ def parse_args(argv=None):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("inputs", nargs="+",
-                        help="*_perf.json file, directory, or wildcard pattern")
+                        help="data_*_perf.json file, directory, or wildcard pattern")
     parser.add_argument("-o", "--output-dir", type=Path,
                         help="report directory (default: beside a single input, otherwise current directory)")
     parser.add_argument("--no-recursive", action="store_true",
@@ -1697,7 +1711,7 @@ def main(argv=None):
         raise SystemExit("simulation and bootstrap counts must be positive")
     paths = find_inputs(args.inputs, recursive=not args.no_recursive)
     if not paths:
-        raise SystemExit("no input files matched; expected *_perf.json results")
+        raise SystemExit("no input files matched; expected data_*_perf.json results")
     dataset = load_dataset(paths)
     if len(dataset.rows) < 3:
         raise SystemExit("at least three complete horizontal/vertical gauge pairs are required")

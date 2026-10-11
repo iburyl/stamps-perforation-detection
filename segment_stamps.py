@@ -1587,8 +1587,8 @@ def main():
             args.stamp is None or args.side is None or args.spot < 1):
         parser.error('--spot requires --stamp and --side and must be positive')
     input_path = Path(args.input)
-    output_path = input_path.with_name(input_path.stem + '_detected.jpg')
-    perf_path = input_path.with_name(input_path.stem + '_perf.json')
+    output_path = input_path.with_name(input_path.stem + '_perf.jpg')
+    perf_path = input_path.with_name('data_' + input_path.stem + '_perf.json')
     print(f"Image: {input_path}")
 
     image = cv2.imread(

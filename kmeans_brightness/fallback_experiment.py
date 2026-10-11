@@ -281,7 +281,7 @@ def run_scan(report_path):
 
 
 def main():
-    paths = sorted(DATA.glob('*_perf.json'))
+    paths = sorted(DATA.glob('data_*_perf.json'))
     rows = []
     with ProcessPoolExecutor(max_workers=4) as pool:
         for path, result in zip(paths, pool.map(run_scan, paths)):
