@@ -37,6 +37,17 @@ SIDES = ('top', 'bottom', 'left', 'right')
 # 1200 dpi and larger than the frame line is wide.
 DEFAULT_SCHEDULE = ((8, 3), (4, 3), (2, 2), (1, 2))
 
+# The perforation rectangle has already removed the gross rotation and scale.
+# These limits therefore apply only to one ECC refinement in that rectified
+# coordinate system.  They are deliberately much wider than the observed
+# printing variation; their purpose is to stop a cancellation from becoming a
+# geometrically convincing local optimum.
+MAX_RESIDUAL_ROTATION_DEG = 3.0
+MAX_FREE_SHEAR = 0.05
+MIN_ABSOLUTE_SCALE = 0.80
+MAX_ABSOLUTE_SCALE = 1.25
+MIN_SCALE_COHORT_FRACTION = 0.04
+
 
 def valley_quad(stamp):
     """Corners of the perforation valley-base rectangle, in image pixels.
@@ -193,8 +204,8 @@ def build_golden(patches, masks, warps, weights, size):
     return golden.astype(np.float32), coverage
 
 
-def align_to_golden(golden, patch, mask, warp, iterations, eps):
-    """One ECC affine refinement of a stamp against the golden image.
+def align_to_golden(golden, patch, mask, warp, iterations, eps, motion):
+    """One ECC refinement of a stamp against the golden image.
 
     ``cv2.findTransformECC`` maximises the correlation coefficient, so it is
     invariant to the linear brightness and contrast differences between stamps,
@@ -205,12 +216,30 @@ def align_to_golden(golden, patch, mask, warp, iterations, eps):
     current = warp.astype(np.float32).copy()
     try:
         _, updated = cv2.findTransformECC(
-            golden, patch, current, cv2.MOTION_AFFINE, criteria, mask, 5)
+            golden, patch, current, motion, criteria, mask, 5)
     except cv2.error:
         return warp, False
     if not np.all(np.isfinite(updated)):
         return warp, False
     return updated, True
+
+
+def registration_patch(golden, patch, mask, warp, weight, threshold=0.5):
+    """Replace cancellation-like outliers before the next ECC refinement.
+
+    OpenCV's binary ECC mask becomes numerically fragile when it contains many
+    small residual holes.  Replacing those pixels with the current prediction
+    has the same zero-residual effect while preserving one stable, contiguous
+    valley mask for the optimiser.
+    """
+    height, width = patch.shape
+    rendered = cv2.warpAffine(golden, warp, (width, height),
+                              flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    replace = (mask > 0) & (weight < threshold)
+    cleaned = patch.copy()
+    cleaned[replace] = rendered[replace]
+    return cleaned
 
 
 def decompose(warp):
@@ -252,6 +281,59 @@ def project_no_shear(warp):
     out[:, :2] = (rotation @ np.diag([parts['scale_x'], parts['scale_y']])
                   ).astype(warp.dtype)
     return out
+
+
+def _robust_log_scale_limits(parts):
+    """Per-axis cohort limits for simultaneous affine ECC proposals."""
+    limits = []
+    for key in ('scale_x', 'scale_y'):
+        values = np.log([entry[key] for entry in parts])
+        centre = float(np.median(values))
+        mad_sigma = float(1.4826 * np.median(np.abs(values - centre)))
+        radius = max(np.log1p(MIN_SCALE_COHORT_FRACTION), 6.0 * mad_sigma)
+        limits.append((centre - radius, centre + radius))
+    return limits
+
+
+def plausible_affine_updates(updates, ok):
+    """Judge one simultaneous set of affine ECC proposals robustly.
+
+    A stamp is compared with the rest of the collection, not with a presumed
+    design size.  Real shared changes therefore remain measurable, while the
+    isolated 8--25 percent collapses caused by cancellations are rejected.
+    """
+    accepted = [False] * len(updates)
+    candidate_indices = []
+    candidate_parts = []
+    for index, (warp, converged) in enumerate(zip(updates, ok)):
+        if not converged:
+            continue
+        parts = decompose(warp)
+        if not all(np.isfinite(parts[key]) for key in
+                   ('scale_x', 'scale_y', 'rotation_deg', 'shear')):
+            continue
+        if not (MIN_ABSOLUTE_SCALE <= parts['scale_x'] <= MAX_ABSOLUTE_SCALE and
+                MIN_ABSOLUTE_SCALE <= parts['scale_y'] <= MAX_ABSOLUTE_SCALE):
+            continue
+        if abs(parts['rotation_deg']) > MAX_RESIDUAL_ROTATION_DEG:
+            continue
+        if abs(parts['shear']) > MAX_FREE_SHEAR:
+            continue
+        candidate_indices.append(index)
+        candidate_parts.append(parts)
+
+    if len(candidate_parts) < 3:
+        for index in candidate_indices:
+            accepted[index] = True
+        return accepted
+
+    x_limits, y_limits = _robust_log_scale_limits(candidate_parts)
+    for index, parts in zip(candidate_indices, candidate_parts):
+        log_x = np.log(parts['scale_x'])
+        log_y = np.log(parts['scale_y'])
+        accepted[index] = (x_limits[0] <= log_x <= x_limits[1] and
+                           y_limits[0] <= log_y <= y_limits[1])
+    return accepted
 
 
 def normalise_gauge(warps):
@@ -315,6 +397,8 @@ def congeal(patches, masks, size, schedule, iterations, eps, cutoff, verbose):
              for _ in range(count)]
     weights = [np.ones(size, np.float32) for _ in range(count)]
     failures = [0] * count
+    rejections = [0] * count
+    affine_accepts = [0] * count
     # The shear the unconstrained fit asked for before it was projected away.
     # It should be near zero; a large value means that stamp did not register.
     free_shear = [0.0] * count
@@ -333,14 +417,49 @@ def congeal(patches, masks, size, schedule, iterations, eps, cutoff, verbose):
             level_weights = [pyramid(w, factor, cv2.INTER_AREA) for w in weights]
             golden, coverage = build_golden(level_patches, level_masks, warps,
                                             level_weights, level_size)
+            motion = cv2.MOTION_AFFINE
+            updates = []
+            converged = []
             for index in range(count):
                 updated, ok = align_to_golden(
                     golden, level_patches[index], level_masks[index],
-                    warps[index], iterations, eps)
-                free_shear[index] = decompose(updated)['shear']
-                warps[index] = project_no_shear(updated)
-                if not ok:
+                    warps[index], iterations, eps, motion)
+                updates.append(updated)
+                converged.append(ok)
+
+            accepted = plausible_affine_updates(updates, converged)
+            # A rejected ordinary fit gets one robust retry.  Normal stamps
+            # retain the unmodified intensity field and therefore the original
+            # sub-pixel scale precision; only a suspect stamp has its previous
+            # residual outliers replaced by the current prediction.
+            if any(not value for value in accepted):
+                retried_updates = list(updates)
+                retried_converged = list(converged)
+                for index, accept in enumerate(accepted):
+                    if accept:
+                        continue
+                    cleaned = registration_patch(
+                        golden, level_patches[index], level_masks[index],
+                        warps[index], level_weights[index])
+                    retried_updates[index], retried_converged[index] = \
+                        align_to_golden(
+                            golden, cleaned, level_masks[index], warps[index],
+                            iterations, eps, motion)
+                updates = retried_updates
+                converged = retried_converged
+                accepted = plausible_affine_updates(updates, converged)
+
+            for index, (updated, ok, accept) in enumerate(
+                    zip(updates, converged, accepted)):
+                if ok:
+                    free_shear[index] = decompose(updated)['shear']
+                if accept:
+                    warps[index] = project_no_shear(updated)
+                    affine_accepts[index] += 1
+                elif not ok:
                     failures[index] += 1
+                else:
+                    rejections[index] += 1
             warps = normalise_gauge(warps)
             golden, coverage = build_golden(level_patches, level_masks, warps,
                                             level_weights, level_size)
@@ -356,7 +475,75 @@ def congeal(patches, masks, size, schedule, iterations, eps, cutoff, verbose):
 
     warps = [rescale_warp(w, previous, 1) for w in warps]
     golden, coverage = build_golden(patches, masks, warps, weights, size)
-    return golden, coverage, warps, weights, failures, free_shear
+    return (golden, coverage, warps, weights, failures, rejections,
+            affine_accepts, free_shear)
+
+
+def robust_outliers(values, minimum_radius, sigma_multiplier=6.0,
+                    logarithmic=False, upper_only=False):
+    """Boolean robust outlier mask with a practical minimum tolerance."""
+    values = np.asarray(values, float)
+    transformed = np.log(values) if logarithmic else values
+    centre = float(np.median(transformed))
+    mad_sigma = float(1.4826 * np.median(np.abs(transformed - centre)))
+    radius = max(minimum_radius, sigma_multiplier * mad_sigma)
+    difference = transformed - centre
+    return ((difference > radius) if upper_only
+            else (np.abs(difference) > radius))
+
+
+def assess_registrations(results):
+    """Attach conservative publication status to registration results.
+
+    Scale outliers and stamps for which no affine refinement was ever accepted
+    are unsafe measurements.  Rotation, shear, residual, or a recovered ECC
+    failure are review signals only: they may describe a real printing offset
+    and must not by themselves erase the measurement.
+    """
+    if not results:
+        return
+    scale_x_outlier = robust_outliers(
+        [row['scale_x'] for row in results],
+        np.log1p(MIN_SCALE_COHORT_FRACTION), logarithmic=True)
+    scale_y_outlier = robust_outliers(
+        [row['scale_y'] for row in results],
+        np.log1p(MIN_SCALE_COHORT_FRACTION), logarithmic=True)
+    rotation_outlier = robust_outliers(
+        [row['residual_rotation_deg'] for row in results], 2.0)
+    shear_outlier = robust_outliers(
+        [row['unconstrained_shear'] for row in results], 0.02)
+    residual_outlier = robust_outliers(
+        [row['residual_rms'] for row in results], 0.15, upper_only=True)
+
+    for index, row in enumerate(results):
+        rejected = []
+        review = []
+        if scale_x_outlier[index]:
+            rejected.append('scale_x cohort outlier')
+        if scale_y_outlier[index]:
+            rejected.append('scale_y cohort outlier')
+        if row['accepted_affine_updates'] == 0:
+            rejected.append('no accepted affine refinement')
+        if row['alignment_failures']:
+            review.append(f"{row['alignment_failures']} ECC failures")
+        if row['alignment_rejections']:
+            review.append(f"{row['alignment_rejections']} implausible ECC updates")
+        if rotation_outlier[index]:
+            review.append('residual rotation outlier')
+        if shear_outlier[index]:
+            review.append('free shear outlier')
+        if residual_outlier[index]:
+            review.append('residual RMS outlier')
+        reasons = rejected + review
+        row['registration_status'] = (
+            'rejected' if rejected else 'review' if review else 'ok')
+        row['registration_reasons'] = reasons
+
+        if rejected:
+            row['candidate_design_width_px'] = row.pop('design_width_px')
+            row['candidate_design_height_px'] = row.pop('design_height_px')
+            row['candidate_design_corners_image'] = row.pop(
+                'design_corners_image')
 
 
 def smooth_profile(profile, sigma):
@@ -635,6 +822,7 @@ def golden_preview(golden, coverage, rules, selected, min_stamps,
 
 DESIGN_COLOR = (0, 0, 255)
 CORNER_COLOR = (255, 255, 0)
+REVIEW_COLOR = (0, 165, 255)
 SKIPPED_COLOR = (180, 180, 180)
 
 
@@ -660,21 +848,33 @@ def draw_design(image, results, skipped, unit):
                     cv2.LINE_AA)
 
     for row in results:
+        box = row.get('bbox')
+        status = row.get('registration_status', 'ok')
+        if status == 'rejected':
+            if box:
+                cv2.rectangle(image, (box['x0'], box['y0']),
+                              (box['x1'], box['y1']), SKIPPED_COLOR,
+                              thickness, cv2.LINE_AA)
+                put_label(f"{row['stamp']}: registration rejected",
+                          box['x0'], box['x1'], box['y0'], SKIPPED_COLOR)
+            continue
+
         corners = np.rint(row['design_corners_image']).astype(np.int32)
-        cv2.polylines(image, [corners], True, DESIGN_COLOR, thickness,
+        color = REVIEW_COLOR if status == 'review' else DESIGN_COLOR
+        cv2.polylines(image, [corners], True, color, thickness,
                       cv2.LINE_AA)
         for point in corners:
             cv2.circle(image, tuple(int(value) for value in point),
                        max(4, thickness * 3), CORNER_COLOR, -1, cv2.LINE_AA)
         # Label above the detection box, where ``*_detected.jpg`` puts it, so
         # the two images can be compared without hunting for the caption.
-        box = row.get('bbox')
         anchor = ((box['x0'], box['x1'], box['y0']) if box else
                   (corners[:, 0].min(), corners[:, 0].max(),
-                   corners[:, 1].min()))
+                    corners[:, 1].min()))
+        suffix = ' [review]' if status == 'review' else ''
         put_label(f"{row['stamp']}: {row[f'design_width_{unit}']:.2f} x "
-                  f"{row[f'design_height_{unit}']:.2f} {unit}",
-                  *anchor, DESIGN_COLOR)
+                  f"{row[f'design_height_{unit}']:.2f} {unit}{suffix}",
+                  *anchor, color)
 
     # A stamp the perforation stage could not close has no design rectangle.
     # Labelling it keeps the omission visible instead of silent.
@@ -937,8 +1137,9 @@ def measure_scan(image, document, schedule, iterations, eps, cutoff,
         print(f"Congealing {len(patches)} stamps on a "
               f"{canvas[1]}x{canvas[0]} canvas")
 
-    golden, coverage, warps, weights, failures, free_shear = congeal(
-        patches, masks, canvas, schedule, iterations, eps, cutoff, verbose)
+    golden, coverage, warps, weights, failures, rejections, affine_accepts, \
+        free_shear = congeal(
+            patches, masks, canvas, schedule, iterations, eps, cutoff, verbose)
     min_stamps = max(2.0, min_coverage * len(patches))
     rules, candidates = frame_rectangle(
         golden, coverage, span, min_stamps, search_span, min_significance,
@@ -974,9 +1175,12 @@ def measure_scan(image, document, schedule, iterations, eps, cutoff,
             'residual_rms': residual,
             'kept_fraction': float(weights[index][valid].mean()),
             'alignment_failures': failures[index],
+            'alignment_rejections': rejections[index],
+            'accepted_affine_updates': affine_accepts[index],
             'design_corners_image': rectangle_on_scan(
                 rectangle, warps[index], placements[index]).tolist(),
         })
+    assess_registrations(results)
     registration = {'patches': patches, 'masks': masks,
                     'placements': placements, 'warps': warps,
                     'weights': weights}
@@ -1095,8 +1299,14 @@ def main():
     if dpi:
         factor = 25.4 / dpi
         for row in results:
-            row['design_width_mm'] = row['design_width_px'] * factor
-            row['design_height_mm'] = row['design_height_px'] * factor
+            if 'design_width_px' in row:
+                row['design_width_mm'] = row['design_width_px'] * factor
+                row['design_height_mm'] = row['design_height_px'] * factor
+            else:
+                row['candidate_design_width_mm'] = (
+                    row['candidate_design_width_px'] * factor)
+                row['candidate_design_height_mm'] = (
+                    row['candidate_design_height_px'] * factor)
 
     golden_path = input_path.with_name(input_path.stem + '_golden.png')
     cv2.imwrite(str(golden_path),
@@ -1183,23 +1393,41 @@ def main():
                   f"{widths} px, weakest "
                   f"{min(rule['significance'].values()):.0f}s{mark}")
         print(f"{'stamp':>5} {'width':>9} {'height':>9} {'sx':>8} {'sy':>8} "
-              f"{'rot':>7} {'shear':>8} {'kept':>6} {'rms':>6}   ({unit})")
+              f"{'rot':>7} {'shear':>8} {'kept':>6} {'rms':>6} "
+              f"{'status':>8}   ({unit})")
         for row in results:
-            width = row.get(f'design_width_{unit}', row['design_width_px'])
-            height = row.get(f'design_height_{unit}', row['design_height_px'])
-            print(f"{row['stamp']:5d} {width:9.4f} {height:9.4f} "
+            width = row.get(f'design_width_{unit}')
+            height = row.get(f'design_height_{unit}')
+            if width is None:
+                width_text = height_text = '       --'
+            else:
+                width_text = f'{width:9.4f}'
+                height_text = f'{height:9.4f}'
+            print(f"{row['stamp']:5d} {width_text} {height_text} "
                   f"{row['scale_x']:8.5f} {row['scale_y']:8.5f} "
                   f"{row['residual_rotation_deg']:7.3f} "
                   f"{row['unconstrained_shear']:8.5f} "
-                  f"{row['kept_fraction']:6.3f} {row['residual_rms']:6.3f}")
-        widths = np.array([row.get(f'design_width_{unit}', row['design_width_px'])
-                           for row in results])
-        heights = np.array([row.get(f'design_height_{unit}', row['design_height_px'])
-                            for row in results])
-        print(f"\nwidth  mean {widths.mean():.4f} sd {widths.std(ddof=1):.4f} "
-              f"range {widths.min():.4f}..{widths.max():.4f} {unit}")
-        print(f"height mean {heights.mean():.4f} sd {heights.std(ddof=1):.4f} "
-              f"range {heights.min():.4f}..{heights.max():.4f} {unit}")
+                  f"{row['kept_fraction']:6.3f} {row['residual_rms']:6.3f} "
+                  f"{row['registration_status']:>8}")
+        published = [row for row in results
+                     if f'design_width_{unit}' in row]
+        widths = np.array([row[f'design_width_{unit}'] for row in published])
+        heights = np.array([row[f'design_height_{unit}'] for row in published])
+        if len(published):
+            ddof = 1 if len(published) > 1 else 0
+            print(f"\nwidth  mean {widths.mean():.4f} sd "
+                  f"{widths.std(ddof=ddof):.4f} range "
+                  f"{widths.min():.4f}..{widths.max():.4f} {unit}")
+            print(f"height mean {heights.mean():.4f} sd "
+                  f"{heights.std(ddof=ddof):.4f} range "
+                  f"{heights.min():.4f}..{heights.max():.4f} {unit}")
+        rejected = [row for row in results
+                    if row['registration_status'] == 'rejected']
+        if rejected:
+            print('\nRejected registrations:')
+            for row in rejected:
+                print(f"  {row['stamp']}: "
+                      + '; '.join(row['registration_reasons']))
         if skipped:
             print('\nNot measured, no four published perforation sides: '
                   + ', '.join(str(number) for number, _ in skipped))

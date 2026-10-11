@@ -184,6 +184,8 @@ class AnalysisTests(unittest.TestCase):
                 "source": "anything.png",
                 "stamps": [{
                     "stamp": 7,
+                    "registration_status": "review",
+                    "registration_reasons": ["recovered ECC update"],
                     "design_width_mm": 16.25,
                     "design_height_mm": 22.5,
                 }],
@@ -197,6 +199,9 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(dataset.rows[0]["worst_edge_algorithm"], 3)
         self.assertEqual(len(dataset.design_rows), 1)
         self.assertEqual(dataset.design_rows[0]["point"], (16.25, 22.5))
+        self.assertEqual(dataset.design_rows[0]["registration_status"], "review")
+        self.assertEqual(dataset.design_rows[0]["registration_reasons"],
+                         "recovered ECC update")
         joined = attach_design_clusters(dataset.design_rows, dataset.rows, [1])
         self.assertEqual(joined[0]["cluster"], 1)
         self.assertEqual(joined[0]["frame_holes_across_width"], 17)

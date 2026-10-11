@@ -551,10 +551,11 @@ python design_size/measure_design.py scan.jpg --dpi 1200
 
 `scan_design_size.jpg` is the result meant to be read, and is the counterpart of
 `scan_detected.jpg`. Line weights, font scale and label position follow it, so the two can
-be compared at the same zoom. The rectangle is red, its corners cyan, and the label carries
-the stamp number and the size to two decimals. A stamp the perforation stage could not
-close has no design rectangle and is outlined in grey as `not measured`, so the omission is
-visible rather than silent.
+be compared at the same zoom. A normal rectangle is red, a recovered result needing review
+is orange, its corners are cyan, and the label carries the stamp number and the size to two
+decimals. A stamp the perforation stage could not close has no design rectangle and is
+outlined in grey as `not measured`. A rejected registration is likewise grey and has no
+published size, so neither kind of omission is silent.
 
 Because neither the fitted transform nor the placement shears, the drawn quadrilateral's
 side lengths *are* the reported width and height — the annotation is the measurement, not
@@ -624,6 +625,14 @@ coefficient is invariant to linear brightness and contrast change, which is need
 cancellation, fading and scan exposure differ between stamps, and it returns a continuous
 sub-pixel transform. A discrete size sweep would be both slower and less precise.
 
+All stamps propose their transform before any proposal is accepted. Scale is compared with
+the simultaneous cohort by median and MAD, with a minimum four-percent tolerance; residual
+rotation over 3 degrees, free shear over 0.05, and very broad absolute scale limits are also
+guards against a cancellation becoming a geometrically convincing local optimum. A rejected
+ordinary proposal is retried once with the previous round's residual outliers replaced by
+the current golden prediction. The coordinate offset is deliberately not bounded: a design
+can genuinely be printed off-centre relative to its perforation.
+
 ### 3. Five degrees of freedom, not six
 
 `MOTION_AFFINE` has six. The sixth is shear, and nothing shears a printed design: shrinkage
@@ -647,9 +656,17 @@ mean, so it can be read directly, and keeps the per-stamp angle usable as the ch
 
 Cancellation ink, hinge remnants and tears are uncorrelated between stamps, so they stand
 out as large local residuals against the average. Pixels beyond `--outlier-cutoff` robust
-sigma stop contributing, to both the average and the next registration. The surviving
-fraction is reported per stamp as `kept_fraction`; on the three scans tested it runs from
-0.93 to 1.00.
+sigma stop contributing to the average. They are also replaced by the golden for the robust
+retry of an implausible ECC proposal; normal proposals retain the original pixels because
+masking every residual edge measurably biases scale. The surviving fraction is reported per
+stamp as `kept_fraction`; on the three scans tested it runs from 0.93 to 1.00.
+
+Final scales are checked once more against the collection. An isolated scale outlier, or a
+stamp for which no affine refinement was ever accepted, gets
+`registration_status: rejected`; its diagnostic candidate is retained under
+`candidate_design_*`, but the publishable `design_width_*` and `design_height_*` fields are
+omitted. Recovered ECC failures/rejections and unusually large residual rotation, shear or
+RMS produce `registration_status: review` without suppressing the measurement.
 
 ### 6. Reading the golden
 

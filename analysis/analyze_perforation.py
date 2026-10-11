@@ -286,6 +286,11 @@ def load_dataset(paths):
                 "result_file": str(perf_path),
                 "source": source,
                 "stamp": str(stamp.get("stamp", "")),
+                "registration_status": str(
+                    stamp.get("registration_status") or "unknown"),
+                "registration_reasons": "; ".join(
+                    str(reason) for reason in
+                    (stamp.get("registration_reasons") or [])),
                 DESIGN_WIDTH: width,
                 DESIGN_HEIGHT: height,
                 "point": (width, height),
@@ -1309,6 +1314,7 @@ def write_design_summary(design_rows, perforation_rows, labels, output):
         for row in joined
     }
     fields = ("design_file", "result_file", "source", "stamp",
+              "registration_status", "registration_reasons",
               DESIGN_WIDTH, DESIGN_HEIGHT, "perforation_cluster",
               WIDTH_HOLE_COUNT, HEIGHT_HOLE_COUNT,
               HOLE_CENTER_WIDTH, HOLE_CENTER_HEIGHT,

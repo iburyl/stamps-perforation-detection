@@ -54,6 +54,82 @@ class DecomposeTest(unittest.TestCase):
         self.assertAlmostEqual(parts['shift_x'], 5.0, places=6)
 
 
+class RegistrationGuardTest(unittest.TestCase):
+    @staticmethod
+    def warp(scale_x=1.0, scale_y=1.0, rotation_deg=0.0):
+        angle = np.radians(rotation_deg)
+        rotation = np.array([[np.cos(angle), -np.sin(angle)],
+                             [np.sin(angle), np.cos(angle)]])
+        return np.hstack([
+            rotation @ np.diag([scale_x, scale_y]),
+            np.zeros((2, 1)),
+        ]).astype(np.float32)
+
+    def test_isolated_scale_collapse_is_rejected(self):
+        updates = [self.warp(1.0 + delta, 1.0 - delta)
+                   for delta in (-0.01, 0.0, 0.01, 0.005, -0.005)]
+        updates.append(self.warp(0.76, 1.0))
+        accepted = measure_design.plausible_affine_updates(
+            updates, [True] * len(updates))
+        self.assertEqual(accepted, [True, True, True, True, True, False])
+
+    def test_residual_outliers_are_replaced_only_for_retry(self):
+        shape = (20, 20)
+        golden = np.full(shape, 2.0, np.float32)
+        patch = np.full(shape, 3.0, np.float32)
+        patch[5, 7] = 20.0
+        mask = np.full(shape, 255, np.uint8)
+        weight = np.ones(shape, np.float32)
+        weight[5, 7] = 0.0
+        identity = self.warp()
+        cleaned = measure_design.registration_patch(
+            golden, patch, mask, identity, weight)
+        self.assertEqual(cleaned[5, 7], 2.0)
+        self.assertEqual(cleaned[5, 8], 3.0)
+
+    def test_quality_control_does_not_reject_a_large_frame_offset(self):
+        rows = []
+        for index in range(6):
+            rows.append({
+                'scale_x': 1.0,
+                'scale_y': 1.0,
+                'residual_rotation_deg': 0.0,
+                'unconstrained_shear': 0.0,
+                'residual_rms': 0.8,
+                'alignment_failures': 0,
+                'alignment_rejections': 0,
+                'accepted_affine_updates': 5,
+                'offset_x_px': 250.0 if index == 0 else 0.0,
+                'offset_y_px': -180.0 if index == 0 else 0.0,
+                'design_width_px': 770.0,
+                'design_height_px': 1050.0,
+                'design_corners_image': [[0.0, 0.0]] * 4,
+            })
+        measure_design.assess_registrations(rows)
+        self.assertEqual(rows[0]['registration_status'], 'ok')
+
+    def test_quality_control_withholds_an_isolated_scale_outlier(self):
+        rows = []
+        for scale_x in (0.99, 1.0, 1.0, 1.01, 1.0, 0.82):
+            rows.append({
+                'scale_x': scale_x,
+                'scale_y': 1.0,
+                'residual_rotation_deg': 0.0,
+                'unconstrained_shear': 0.0,
+                'residual_rms': 0.8,
+                'alignment_failures': 0,
+                'alignment_rejections': 0,
+                'accepted_affine_updates': 5,
+                'design_width_px': 770.0 * scale_x,
+                'design_height_px': 1050.0,
+                'design_corners_image': [[0.0, 0.0]] * 4,
+            })
+        measure_design.assess_registrations(rows)
+        self.assertEqual(rows[-1]['registration_status'], 'rejected')
+        self.assertNotIn('design_width_px', rows[-1])
+        self.assertIn('candidate_design_width_px', rows[-1])
+
+
 def rule_profile(length, rules, noise=0.0, seed=0):
     """A side profile: Gaussian-ish dark lines on textured paper."""
     profile = np.zeros(length)
@@ -394,10 +470,13 @@ class CongealTest(unittest.TestCase):
             patches.append(value)
             masks.append(mask)
 
-        golden, coverage, warps, _, failures, free_shear = measure_design.congeal(
-            patches, masks, canvas, ((4, 3), (2, 2), (1, 2)),
-            iterations=200, eps=1e-7, cutoff=3.0, verbose=False)
+        golden, coverage, warps, _, failures, rejections, affine_accepts, \
+            free_shear = measure_design.congeal(
+                patches, masks, canvas, ((4, 3), (2, 2), (1, 2)),
+                iterations=200, eps=1e-7, cutoff=3.0, verbose=False)
         self.assertEqual(sum(failures), 0)
+        self.assertEqual(sum(rejections), 0)
+        self.assertTrue(all(count > 0 for count in affine_accepts))
         self.assertLess(max(abs(value) for value in free_shear), 0.01)
 
         rules, _ = measure_design.frame_rectangle(
