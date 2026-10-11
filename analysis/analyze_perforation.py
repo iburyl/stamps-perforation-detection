@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze clusters and frame-versus-line evidence in perforation JSON results."""
+"""Analyze perforation clusters, frame-versus-line evidence and printed-design sizes."""
 
 from __future__ import annotations
 
@@ -22,6 +22,17 @@ from PIL import Image, ImageDraw, ImageFont
 
 HORIZONTAL = "horizontal_perforation_per_20mm"
 VERTICAL = "vertical_perforation_per_20mm"
+DESIGN_WIDTH = "design_width_mm"
+DESIGN_HEIGHT = "design_height_mm"
+HOLE_CENTER_WIDTH = "hole_center_width_mm"
+HOLE_CENTER_HEIGHT = "hole_center_height_mm"
+HORIZONTAL_DESIGN_GAP = "horizontal_design_gap_mm"
+VERTICAL_DESIGN_GAP = "vertical_design_gap_mm"
+WIDTH_HOLE_COUNT = "frame_holes_across_width"
+HEIGHT_HOLE_COUNT = "frame_holes_across_height"
+EXPECTED_WIDTH_HOLE_COUNT = "expected_frame_holes_across_width"
+EXPECTED_HEIGHT_HOLE_COUNT = "expected_frame_holes_across_height"
+SPACING_COUNT_OUTLIER = "spacing_count_outlier"
 SIDES_AT_CORNERS = (
     ("top", "left"),
     ("top", "right"),
@@ -47,6 +58,7 @@ ALGORITHM_LEGEND = (
 SUMMARY_FIELDS = (
     "result_file", "source", "stamp", "status", "worst_edge_algorithm",
     "width_px", "height_px", "width_mm", "height_mm",
+    WIDTH_HOLE_COUNT, HEIGHT_HOLE_COUNT, HOLE_CENTER_WIDTH, HOLE_CENTER_HEIGHT,
     HORIZONTAL, VERTICAL,
 )
 
@@ -57,6 +69,8 @@ class Dataset:
     rows: list[dict]
     incomplete: list[dict]
     corner_records: list[dict]
+    design_paths: list[Path]
+    design_rows: list[dict]
     errors: list[str]
     total_stamps: int
 
@@ -89,6 +103,11 @@ def finite_positive(value):
     return number if math.isfinite(number) and number > 0 else None
 
 
+def sample_sd(values):
+    values = list(values)
+    return statistics.stdev(values) if len(values) > 1 else 0.0
+
+
 def line_intersection(first, second):
     (x1, y1), (x2, y2) = first
     (x3, y3), (x4, y4) = second
@@ -113,6 +132,17 @@ def refined_hole_points(side):
                 and isinstance(point, (list, tuple)) and len(point) == 2):
             points.append((float(point[0]), float(point[1])))
     return points
+
+
+def frame_hole_geometry(valley_dimension_mm, gauge):
+    """Infer a frame's whole hole count and extreme-centre span from gauge."""
+    valley_dimension_mm = finite_positive(valley_dimension_mm)
+    gauge = finite_positive(gauge)
+    if valley_dimension_mm is None or gauge is None:
+        return None, None
+    pitch_mm = 20.0 / gauge
+    intervals = max(1, math.ceil(valley_dimension_mm / pitch_mm - 1e-9))
+    return intervals + 1, intervals * pitch_mm
 
 
 def corner_records_for_stamp(source, stamp_id, sides, max_distance=1.25):
@@ -174,6 +204,7 @@ def load_dataset(paths):
             continue
         valid_paths.append(path)
         source = str(payload.get("source") or path.name.removesuffix("_perf.json"))
+        dpi = finite_positive(payload.get("dpi"))
         for stamp in stamps:
             total_stamps += 1
             stamp_id = str(stamp.get("stamp", ""))
@@ -199,6 +230,21 @@ def load_dataset(paths):
                 "status": str(measurement.get("status") or "unknown"),
                 "worst_edge_algorithm": max(phases) if phases else None,
             })
+            width_mm = finite_positive(summary.get("width_mm"))
+            height_mm = finite_positive(summary.get("height_mm"))
+            if dpi is not None:
+                width_px = (finite_positive(summary.get("width_px"))
+                            or finite_positive(measurement.get("valley_width_px")))
+                height_px = (finite_positive(summary.get("height_px"))
+                             or finite_positive(measurement.get("valley_height_px")))
+                width_mm = width_mm or (width_px * 25.4 / dpi if width_px else None)
+                height_mm = height_mm or (height_px * 25.4 / dpi if height_px else None)
+            width_holes, center_width = frame_hole_geometry(width_mm, horizontal)
+            height_holes, center_height = frame_hole_geometry(height_mm, vertical)
+            row[WIDTH_HOLE_COUNT] = width_holes
+            row[HEIGHT_HOLE_COUNT] = height_holes
+            row[HOLE_CENTER_WIDTH] = center_width
+            row[HOLE_CENTER_HEIGHT] = center_height
             if horizontal is None or vertical is None:
                 incomplete.append({"source": source, "stamp": stamp_id,
                                    "reason": "incomplete gauge pair"})
@@ -209,7 +255,43 @@ def load_dataset(paths):
                 rows.append(row)
             if isinstance(sides, dict):
                 corners.extend(corner_records_for_stamp(source, stamp_id, sides))
-    return Dataset(valid_paths, rows, incomplete, corners, errors, total_stamps)
+
+    design_paths, design_rows = [], []
+    for perf_path in valid_paths:
+        suffix = "_perf.json"
+        if not perf_path.name.casefold().endswith(suffix):
+            continue
+        design_path = perf_path.with_name(perf_path.name[:-len(suffix)] + "_design.json")
+        if not design_path.is_file():
+            continue
+        try:
+            payload = json.loads(design_path.read_text(encoding="utf-8"))
+            if payload.get("format") != "stamp-design-size":
+                raise ValueError("unsupported design JSON format")
+            stamps = payload.get("stamps")
+            if not isinstance(stamps, list):
+                raise ValueError("'stamps' is not a list")
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as error:
+            errors.append(f"{design_path}: {error}")
+            continue
+        design_paths.append(design_path)
+        source = str(payload.get("source") or design_path.name[:-len("_design.json")])
+        for stamp in stamps:
+            width = finite_positive(stamp.get(DESIGN_WIDTH))
+            height = finite_positive(stamp.get(DESIGN_HEIGHT))
+            if width is None or height is None:
+                continue
+            design_rows.append({
+                "design_file": str(design_path),
+                "result_file": str(perf_path),
+                "source": source,
+                "stamp": str(stamp.get("stamp", "")),
+                DESIGN_WIDTH: width,
+                DESIGN_HEIGHT: height,
+                "point": (width, height),
+            })
+    return Dataset(valid_paths, rows, incomplete, corners,
+                   design_paths, design_rows, errors, total_stamps)
 
 
 def squared_distance(first, second):
@@ -591,7 +673,7 @@ def draw_outlier_labels(draw, rows, centers, labels, screen, font, plot_box, cou
         draw.text((label_left, label_top), text, font=font, fill="#202020")
 
 
-def draw_cluster_chart(rows, centers, labels, output):
+def draw_cluster_chart(rows, centers, labels, output, colors=None):
     width, height = 1500, 980
     left, top, right, bottom = 150, 115, 1085, 820
     image = Image.new("RGB", (width, height), "white")
@@ -653,7 +735,7 @@ def draw_cluster_chart(rows, centers, labels, output):
 
     sources = sorted({row["result_file"] for row in rows},
                      key=lambda key: natural_key(source_name(key)))
-    colors = source_colors(sources)
+    colors = colors or source_colors(sources)
     display_names = source_labels(sources)
     for row, label in zip(rows, labels):
         x, y = screen(row["point"])
@@ -702,6 +784,368 @@ def draw_cluster_chart(rows, centers, labels, output):
         draw.ellipse((legend_x, y-7, legend_x+14, y+7), fill="white",
                      outline=ALGORITHM_OUTLINE_COLORS[algorithm], width=3)
         draw.text((legend_x+25, y), name, anchor="lm", font=small_font, fill="#202020")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output, format="PNG")
+
+
+def attach_design_clusters(design_rows, perforation_rows, labels):
+    assignments = {
+        (row["result_file"].casefold(), str(row["stamp"])): (row, label)
+        for row, label in zip(perforation_rows, labels)
+    }
+    joined = []
+    for row in design_rows:
+        match = assignments.get((row["result_file"].casefold(), str(row["stamp"])))
+        if match is None:
+            continue
+        perforation, label = match
+        item = {**row, "cluster": label}
+        for field in (WIDTH_HOLE_COUNT, HEIGHT_HOLE_COUNT,
+                      HOLE_CENTER_WIDTH, HOLE_CENTER_HEIGHT):
+            item[field] = perforation.get(field)
+        if item.get(HOLE_CENTER_WIDTH) is not None:
+            item[HORIZONTAL_DESIGN_GAP] = (
+                item[HOLE_CENTER_WIDTH] - item[DESIGN_WIDTH]
+            )
+        if item.get(HOLE_CENTER_HEIGHT) is not None:
+            item[VERTICAL_DESIGN_GAP] = (
+                item[HOLE_CENTER_HEIGHT] - item[DESIGN_HEIGHT]
+            )
+        joined.append(item)
+    return joined
+
+
+def usable_design_spacing_rows(rows):
+    return [
+        row for row in rows
+        if row.get(HORIZONTAL_DESIGN_GAP) is not None
+        and row.get(VERTICAL_DESIGN_GAP) is not None
+        and math.isfinite(row[HORIZONTAL_DESIGN_GAP])
+        and math.isfinite(row[VERTICAL_DESIGN_GAP])
+    ]
+
+
+def split_spacing_count_outliers(rows):
+    """Keep the unique modal hole-count pair in each Source/cluster group."""
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[(row["result_file"], row["cluster"])].append(row)
+    inliers, outliers = [], []
+    for members in grouped.values():
+        frequencies = Counter(
+            (row[WIDTH_HOLE_COUNT], row[HEIGHT_HOLE_COUNT]) for row in members
+        )
+        highest = max(frequencies.values())
+        modes = sorted(pair for pair, count in frequencies.items() if count == highest)
+        expected = modes[0] if len(modes) == 1 else None
+        for row in members:
+            pair = (row[WIDTH_HOLE_COUNT], row[HEIGHT_HOLE_COUNT])
+            item = {
+                **row,
+                EXPECTED_WIDTH_HOLE_COUNT: expected[0] if expected else None,
+                EXPECTED_HEIGHT_HOLE_COUNT: expected[1] if expected else None,
+                SPACING_COUNT_OUTLIER: expected is None or pair != expected,
+            }
+            if item[SPACING_COUNT_OUTLIER]:
+                item["spacing_count_outlier_reason"] = (
+                    "no unique modal hole count" if expected is None
+                    else "non-modal hole count"
+                )
+                outliers.append(item)
+            else:
+                inliers.append(item)
+    sort_key = lambda row: (
+        natural_key(source_name(row["result_file"])), row["cluster"],
+        natural_key(str(row["stamp"])),
+    )
+    return sorted(inliers, key=sort_key), sorted(outliers, key=sort_key)
+
+
+def design_spacing_summaries(rows):
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[(row["result_file"], row["cluster"])].append(row)
+    return [
+        {
+            "result_file": source,
+            "source": source_name(source),
+            "cluster": cluster,
+            "count": len(members),
+            "mean_horizontal_gap_mm": statistics.mean(
+                row[HORIZONTAL_DESIGN_GAP] for row in members
+            ),
+            "mean_vertical_gap_mm": statistics.mean(
+                row[VERTICAL_DESIGN_GAP] for row in members
+            ),
+            "width_hole_count": members[0][WIDTH_HOLE_COUNT],
+            "height_hole_count": members[0][HEIGHT_HOLE_COUNT],
+        }
+        for (source, cluster), members in sorted(
+            grouped.items(),
+            key=lambda item: (natural_key(source_name(item[0][0])), item[0][1]),
+        )
+    ]
+
+
+def design_spacing_changes(summaries):
+    by_source = defaultdict(list)
+    for summary in summaries:
+        by_source[summary["result_file"]].append(summary)
+    changes = []
+    for source in sorted(by_source, key=lambda key: natural_key(source_name(key))):
+        ordered = sorted(by_source[source], key=lambda item: item["cluster"])
+        for first, second in zip(ordered, ordered[1:]):
+            changes.append({
+                "source": source_name(source),
+                "from_cluster": first["cluster"],
+                "to_cluster": second["cluster"],
+                "delta_horizontal_gap_mm": (
+                    second["mean_horizontal_gap_mm"] - first["mean_horizontal_gap_mm"]
+                ),
+                "delta_vertical_gap_mm": (
+                    second["mean_vertical_gap_mm"] - first["mean_vertical_gap_mm"]
+                ),
+            })
+    return changes
+
+
+def draw_design_source_chart(rows, output, colors):
+    width, height = 1400, 920
+    left, top, right, bottom = 150, 115, 1035, 785
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image, "RGBA")
+    title_font = load_font(30, True)
+    label_font = load_font(22)
+    tick_font = load_font(17)
+    small_font = load_font(16)
+    x_min, x_max = nice_bounds([row[DESIGN_WIDTH] for row in rows], 0.08)
+    y_min, y_max = nice_bounds([row[DESIGN_HEIGHT] for row in rows], 0.08)
+
+    def screen(point):
+        return (left + (point[0]-x_min)*(right-left)/(x_max-x_min),
+                bottom - (point[1]-y_min)*(bottom-top)/(y_max-y_min))
+
+    draw.text((width/2, 43), "Printed-design dimensions by source",
+              anchor="mm", font=title_font, fill="#202020")
+    draw.text((width/2, 82), f"n={len(rows)} measured designs; crosses = source means",
+              anchor="mm", font=small_font, fill="#555555")
+    draw.rectangle((left, top, right, bottom), outline="#303030", width=2)
+    for index in range(6):
+        x_value = x_min + (x_max-x_min)*index/5
+        y_value = y_min + (y_max-y_min)*index/5
+        x, _ = screen((x_value, y_min))
+        _, y = screen((x_min, y_value))
+        draw.line((x, top, x, bottom), fill="#dedede")
+        draw.line((left, y, right, y), fill="#dedede")
+        draw.text((x, bottom+12), f"{x_value:.2f}", anchor="mt",
+                  font=tick_font, fill="#303030")
+        draw.text((left-12, y), f"{y_value:.2f}", anchor="rm",
+                  font=tick_font, fill="#303030")
+
+    sources = sorted({row["result_file"] for row in rows},
+                     key=lambda key: natural_key(source_name(key)))
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[row["result_file"]].append(row)
+        x, y = screen(row["point"])
+        draw.ellipse((x-6, y-6, x+6, y+6), fill=colors[row["result_file"]],
+                     outline="#555555", width=1)
+    means = {}
+    for source in sources:
+        members = grouped[source]
+        mean = (statistics.mean(row[DESIGN_WIDTH] for row in members),
+                statistics.mean(row[DESIGN_HEIGHT] for row in members))
+        means[source] = mean
+        x, y = screen(mean)
+        draw.ellipse((x-12, y-12, x+12, y+12), fill="white",
+                     outline=colors[source], width=3)
+        draw.line((x-8, y-8, x+8, y+8), fill=colors[source], width=4)
+        draw.line((x-8, y+8, x+8, y-8), fill=colors[source], width=4)
+
+    draw.text(((left+right)/2, 875), "Design width (mm)", anchor="mm",
+              font=label_font, fill="#202020")
+    vertical = Image.new("RGBA", (330, 40), (255, 255, 255, 0))
+    ImageDraw.Draw(vertical).text((165, 20), "Design height (mm)", anchor="mm",
+                                  font=label_font, fill="#202020")
+    vertical = vertical.rotate(90, expand=True)
+    image.paste(vertical, (35, 285), vertical)
+    legend_x, legend_y = 1085, 125
+    draw.text((legend_x, legend_y-35), "Source", font=label_font, fill="#202020")
+    for index, source in enumerate(sources):
+        y = legend_y + index*48
+        draw.ellipse((legend_x, y-7, legend_x+14, y+7),
+                     fill=colors[source], outline="#777777")
+        draw.text((legend_x+25, y), source_name(source), anchor="lm",
+                  font=tick_font, fill="#202020")
+        mean = means[source]
+        draw.text((legend_x+25, y+19),
+                  f"mean {mean[0]:.3f} × {mean[1]:.3f} mm; n={len(grouped[source])}",
+                  anchor="lm", font=small_font, fill="#555555")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output, format="PNG")
+
+
+def draw_design_spacing_change(rows, cluster_count, output, colors):
+    """Plot estimated edge-to-edge design gaps by Source and perforation cluster."""
+    sources = sorted({row["result_file"] for row in rows},
+                     key=lambda key: natural_key(source_name(key)))
+    width = 1760
+    top, row_step = 175, 66
+    bottom = top + max(1, len(sources)-1)*row_step + 35
+    height = bottom + 145
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image, "RGBA")
+    title_font = load_font(30, True)
+    label_font = load_font(20)
+    tick_font = load_font(16)
+    small_font = load_font(15)
+    draw.text((width/2, 42), "Estimated spacing between neighboring designs",
+              anchor="mm", font=title_font, fill="#202020")
+    draw.text((width/2, 82),
+              "Hole-count-consistent means; lines show within-Source cluster change",
+              anchor="mm", font=small_font, fill="#555555")
+
+    panels = (
+        (HORIZONTAL_DESIGN_GAP, "Horizontal gap (mm)", 245, 915),
+        (VERTICAL_DESIGN_GAP, "Vertical gap (mm)", 1035, 1705),
+    )
+    grouped = defaultdict(lambda: defaultdict(list))
+    for row in rows:
+        grouped[row["result_file"]][row["cluster"]].append(row)
+
+    for source_index, source in enumerate(sources):
+        y = top + source_index*row_step
+        draw.text((225, y), source_name(source), anchor="rm",
+                  font=label_font, fill="#202020")
+
+    for field, panel_title, left, right in panels:
+        values = [
+            statistics.mean(row[field] for row in members if row.get(field) is not None)
+            for clusters in grouped.values()
+            for members in clusters.values()
+            if any(row.get(field) is not None for row in members)
+        ]
+        x_min, x_max = nice_bounds(values, 0.12)
+
+        def screen_x(value):
+            return left + (value-x_min)*(right-left)/(x_max-x_min)
+
+        draw.text(((left+right)/2, 128), panel_title, anchor="mm",
+                  font=label_font, fill="#202020")
+        draw.rectangle((left, top-30, right, bottom), outline="#505050", width=2)
+        for tick in range(6):
+            value = x_min + (x_max-x_min)*tick/5
+            x = screen_x(value)
+            draw.line((x, top-30, x, bottom), fill="#dedede")
+            draw.text((x, bottom+12), f"{value:.2f}", anchor="mt",
+                      font=tick_font, fill="#303030")
+        for source_index, source in enumerate(sources):
+            y = top + source_index*row_step
+            draw.line((left, y, right, y), fill="#ededed")
+            means = []
+            for cluster, members in sorted(grouped[source].items()):
+                usable = [row[field] for row in members if row.get(field) is not None]
+                if usable:
+                    means.append((cluster, statistics.mean(usable), len(usable)))
+            for (_, first, _), (_, second, _) in zip(means, means[1:]):
+                draw.line((screen_x(first), y, screen_x(second), y),
+                          fill=colors[source], width=4)
+            for cluster, mean, count in means:
+                x = screen_x(mean)
+                draw_marker(draw, x, y, colors[source], cluster,
+                            radius=10, outline="#333333")
+                label_y = y-15 if cluster % 2 == 0 else y+15
+                draw.text((x, label_y), f"{mean:.2f}", anchor="ms" if cluster % 2 == 0 else "ma",
+                          font=small_font, fill="#333333")
+
+    legend_y = height-42
+    legend_width = cluster_count*150
+    start_x = (width-legend_width)/2
+    for cluster in range(cluster_count):
+        x = start_x + cluster*150
+        draw_marker(draw, x, legend_y, "#b0b0b0", cluster,
+                    radius=7, outline="#555555")
+        draw.text((x+18, legend_y), f"Cluster C{cluster+1}", anchor="lm",
+                  font=small_font, fill="#202020")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output, format="PNG")
+
+
+def draw_design_spacing_points(rows, cluster_count, output, colors):
+    """Plot every count-consistent stamp as a jittered spacing observation."""
+    sources = sorted({row["result_file"] for row in rows},
+                     key=lambda key: natural_key(source_name(key)))
+    width = 1760
+    top, row_step = 175, 66
+    bottom = top + max(1, len(sources)-1)*row_step + 35
+    height = bottom + 145
+    image = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(image, "RGBA")
+    title_font = load_font(30, True)
+    label_font = load_font(20)
+    tick_font = load_font(16)
+    small_font = load_font(15)
+    draw.text((width/2, 42), "Per-stamp estimated spacing between neighboring designs",
+              anchor="mm", font=title_font, fill="#202020")
+    draw.text((width/2, 82),
+              f"n={len(rows)} count-consistent stamps; vertical jitter is visual only",
+              anchor="mm", font=small_font, fill="#555555")
+
+    panels = (
+        (HORIZONTAL_DESIGN_GAP, "Horizontal gap (mm)", 245, 915),
+        (VERTICAL_DESIGN_GAP, "Vertical gap (mm)", 1035, 1705),
+    )
+    grouped = defaultdict(list)
+    jitter = {}
+    for source in sources:
+        members = sorted(
+            (row for row in rows if row["result_file"] == source),
+            key=lambda row: natural_key(str(row["stamp"])),
+        )
+        grouped[source] = members
+        for index, row in enumerate(members):
+            jitter[(source, str(row["stamp"]), row["cluster"])] = (index*11 % 31) - 15
+
+    for source_index, source in enumerate(sources):
+        y = top + source_index*row_step
+        draw.text((225, y), source_name(source), anchor="rm",
+                  font=label_font, fill="#202020")
+
+    for field, panel_title, left, right in panels:
+        values = [row[field] for row in rows]
+        x_min, x_max = nice_bounds(values, 0.07)
+
+        def screen_x(value):
+            return left + (value-x_min)*(right-left)/(x_max-x_min)
+
+        draw.text(((left+right)/2, 128), panel_title, anchor="mm",
+                  font=label_font, fill="#202020")
+        draw.rectangle((left, top-30, right, bottom), outline="#505050", width=2)
+        for tick in range(6):
+            value = x_min + (x_max-x_min)*tick/5
+            x = screen_x(value)
+            draw.line((x, top-30, x, bottom), fill="#dedede")
+            draw.text((x, bottom+12), f"{value:.2f}", anchor="mt",
+                      font=tick_font, fill="#303030")
+        for source_index in range(len(sources)-1):
+            separator_y = top + (source_index+0.5)*row_step
+            draw.line((left, separator_y, right, separator_y), fill="#dddddd")
+        for source_index, source in enumerate(sources):
+            center_y = top + source_index*row_step
+            for row in grouped[source]:
+                y = center_y + jitter[(source, str(row["stamp"]), row["cluster"])]
+                draw_marker(draw, screen_x(row[field]), y, colors[source],
+                            row["cluster"], radius=6, outline="#333333")
+
+    legend_y = height-42
+    legend_width = cluster_count*150
+    start_x = (width-legend_width)/2
+    for cluster in range(cluster_count):
+        x = start_x + cluster*150
+        draw_marker(draw, x, legend_y, "#b0b0b0", cluster,
+                    radius=7, outline="#555555")
+        draw.text((x+18, legend_y), f"Cluster C{cluster+1}", anchor="lm",
+                  font=small_font, fill="#202020")
     output.parent.mkdir(parents=True, exist_ok=True)
     image.save(output, format="PNG")
 
@@ -852,6 +1296,37 @@ def write_summary(rows, output):
             writer.writerow({field: row.get(field) for field in SUMMARY_FIELDS})
 
 
+def write_design_summary(design_rows, perforation_rows, labels, output):
+    joined = attach_design_clusters(design_rows, perforation_rows, labels)
+    usable = usable_design_spacing_rows(joined)
+    spacing_inliers, spacing_outliers = split_spacing_count_outliers(usable)
+    classified = {
+        (row["result_file"].casefold(), str(row["stamp"])): row
+        for row in spacing_inliers + spacing_outliers
+    }
+    assignments = {
+        (row["result_file"].casefold(), str(row["stamp"])): row
+        for row in joined
+    }
+    fields = ("design_file", "result_file", "source", "stamp",
+              DESIGN_WIDTH, DESIGN_HEIGHT, "perforation_cluster",
+              WIDTH_HOLE_COUNT, HEIGHT_HOLE_COUNT,
+              HOLE_CENTER_WIDTH, HOLE_CENTER_HEIGHT,
+              HORIZONTAL_DESIGN_GAP, VERTICAL_DESIGN_GAP,
+              EXPECTED_WIDTH_HOLE_COUNT, EXPECTED_HEIGHT_HOLE_COUNT,
+              SPACING_COUNT_OUTLIER, "spacing_count_outlier_reason")
+    with output.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for row in design_rows:
+            match = assignments.get((row["result_file"].casefold(), str(row["stamp"])))
+            key = (row["result_file"].casefold(), str(row["stamp"]))
+            source = classified.get(key) or match or row
+            item = {field: source.get(field) for field in fields}
+            item["perforation_cluster"] = "" if match is None else f"C{match['cluster']+1}"
+            writer.writerow(item)
+
+
 def outlier_records(rows, centers, labels, count=6):
     records = []
     for index in outlier_indices(rows, centers, labels, count):
@@ -908,8 +1383,13 @@ def write_report(path, dataset, diagnostics, selected_k, centers, labels, corner
     counts = Counter(labels)
     statuses = Counter(row["status"] for row in dataset.rows)
     outliers = outlier_records(dataset.rows, centers, labels)
+    design_with_clusters = attach_design_clusters(dataset.design_rows, dataset.rows, labels)
+    spacing_candidates = usable_design_spacing_rows(design_with_clusters)
+    spacing_rows, spacing_count_outliers = split_spacing_count_outliers(spacing_candidates)
+    spacing_summaries = design_spacing_summaries(spacing_rows)
+    spacing_changes = design_spacing_changes(spacing_summaries)
     lines = [
-        "# Perforation analysis",
+        "# Perforation and printed-design analysis",
         "",
         "## Result",
         "",
@@ -921,6 +1401,11 @@ def write_report(path, dataset, diagnostics, selected_k, centers, labels, corner
         "",
         f"Result files read: **{len(dataset.json_paths)}**; stamps found: **{dataset.total_stamps}**; "
         f"complete gauge pairs: **{len(dataset.rows)}**; incomplete pairs: **{len(dataset.incomplete)}**.",
+        "",
+        f"Design-size files read: **{len(dataset.design_paths)}**; measured designs: "
+        f"**{len(dataset.design_rows)}**; matched to a perforation cluster: "
+        f"**{len(design_with_clusters)}**; hole-count outliers excluded from spacing: "
+        f"**{len(spacing_count_outliers)}**.",
         "",
         "Measurement status among complete pairs: "
         + ", ".join(f"`{name}` — {count}" for name, count in sorted(statuses.items())) + ".",
@@ -977,9 +1462,143 @@ def write_report(path, dataset, diagnostics, selected_k, centers, labels, corner
         "reference samples over the same two-dimensional range. The standard 1-SE rule chooses "
         "the smallest k for which `Gap(k) ≥ Gap(k+1) − SE(k+1)`.",
         "",
-        "## Frame or line perforation",
-        "",
     ]
+    if dataset.design_rows:
+        design_groups = defaultdict(list)
+        for row in dataset.design_rows:
+            design_groups[row["result_file"]].append(row)
+        lines += [
+            "## Printed-design dimensions by source",
+            "",
+            "![Printed-design dimensions by source](design_sizes_by_source.png)",
+            "",
+            "Each point is one measured printed design. Large crosses mark the mean for each "
+            "Source; both dimensions are in millimetres.",
+            "",
+            "The `±` interval is one sample standard deviation and describes the observed "
+            "within-Source spread; it is not a confidence interval.",
+            "",
+            "| Source | n | Width, mean ± SD | Height, mean ± SD |",
+            "|---|---:|---:|---:|",
+        ]
+        for source in sorted(design_groups, key=lambda key: natural_key(source_name(key))):
+            members = design_groups[source]
+            widths = [row[DESIGN_WIDTH] for row in members]
+            heights = [row[DESIGN_HEIGHT] for row in members]
+            lines.append(
+                f"| {source_name(source)} | {len(members)} | "
+                f"{statistics.mean(widths):.4f} ± {sample_sd(widths):.4f} mm | "
+                f"{statistics.mean(heights):.4f} ± {sample_sd(heights):.4f} mm |"
+            )
+        lines += ["", "Measurements and cluster joins: [design_summary.csv](design_summary.csv).", ""]
+        if spacing_rows or spacing_count_outliers:
+            lines += [
+                "## Estimated spacing between neighboring designs",
+                "",
+            ]
+            if spacing_rows:
+                lines += [
+                    "![Estimated spacing between neighboring designs]"
+                    "(design_spacing_by_perforation_cluster.png)",
+                    "",
+                ]
+            lines += [
+                "Under the frame-perforation hypothesis, each side contains a whole number of "
+                "equally spaced holes. The pitch is obtained from the measured gauge. The "
+                "smallest whole number of pitch intervals that spans the measured valley-line "
+                "dimension determines both the hole count and the distance between the centres "
+                "of the extreme holes:",
+                "",
+                "`pitch = 20 / gauge`",
+                "",
+                "`interval count = ceil(valley-line dimension / pitch)`",
+                "",
+                "`hole count = interval count + 1`",
+                "",
+                "`extreme-hole-centre dimension = interval count × pitch`",
+                "",
+                "`horizontal design gap = hole-centre width − design width`",
+                "",
+                "`vertical design gap = hole-centre height − design height`",
+                "",
+                "The chart shows cluster means for every Source. A connecting line makes the "
+                "change from one perforation cluster to the next explicit. Within each "
+                "Source/cluster group, the unique modal width/height hole-count pair is required. "
+                "Other estimates are listed below and excluded from the chart and all means.",
+                "",
+                "No fitted hole radius is used in this calculation.",
+                "",
+                "| Source | Cluster | n | Width holes | Height holes | Mean horizontal gap | Mean vertical gap |",
+                "|---|---:|---:|---:|---:|---:|---:|",
+            ]
+            for summary in spacing_summaries:
+                lines.append(
+                    f"| {summary['source']} | C{summary['cluster']+1} | "
+                    f"{summary['count']} | "
+                    f"{summary['width_hole_count']} | "
+                    f"{summary['height_hole_count']} | "
+                    f"{summary['mean_horizontal_gap_mm']:.4f} mm | "
+                    f"{summary['mean_vertical_gap_mm']:.4f} mm |"
+                )
+            if spacing_rows:
+                lines += [
+                    "",
+                    "### Per-stamp distributions",
+                    "",
+                    "![Per-stamp estimated spacing between neighboring designs]"
+                    "(design_spacing_points_by_perforation_cluster.png)",
+                    "",
+                    "Each marker is one stamp; color denotes Source and shape denotes the "
+                    "perforation cluster. Vertical jitter has no measurement meaning and only "
+                    "keeps coincident points visible.",
+                    "",
+                    "The cluster ranges overlap substantially in the per-stamp observations. "
+                    "Design spacing can therefore provide supporting context, but it must not "
+                    "be used as a determining factor on its own.",
+                ]
+            if spacing_count_outliers:
+                lines += [
+                    "",
+                    "### Excluded hole-count outliers",
+                    "",
+                    "| Observation | Cluster | Estimated holes (W × H) | Expected holes (W × H) | Reason |",
+                    "|---|---:|---:|---:|---|",
+                ]
+                for row in spacing_count_outliers:
+                    expected = (
+                        f"{row[EXPECTED_WIDTH_HOLE_COUNT]} × {row[EXPECTED_HEIGHT_HOLE_COUNT]}"
+                        if row[EXPECTED_WIDTH_HOLE_COUNT] is not None else "no unique mode"
+                    )
+                    lines.append(
+                        f"| {source_name(row['result_file'])}:{row['stamp']} | "
+                        f"C{row['cluster']+1} | {row[WIDTH_HOLE_COUNT]} × "
+                        f"{row[HEIGHT_HOLE_COUNT]} | {expected} | "
+                        f"{row['spacing_count_outlier_reason']} |"
+                    )
+            if spacing_changes:
+                lines += [
+                    "",
+                    "### Change between consecutive clusters",
+                    "",
+                    "| Source | Transition | Δ horizontal gap | Δ vertical gap |",
+                    "|---|---:|---:|---:|",
+                ]
+                for change in spacing_changes:
+                    lines.append(
+                        f"| {change['source']} | C{change['from_cluster']+1} → "
+                        f"C{change['to_cluster']+1} | "
+                        f"{change['delta_horizontal_gap_mm']:+.4f} mm | "
+                        f"{change['delta_vertical_gap_mm']:+.4f} mm |"
+                    )
+            lines += [
+                "",
+                "These are hypothesis-based repeat-spacing estimates, not direct measurements "
+                "of a physical pair of neighboring stamps. They assume a complete frame with "
+                "a whole number of pitch intervals and that the extreme hole centres define the "
+                "repeated stamp spacing.",
+                "",
+            ]
+    lines += ["## Frame or line perforation", ""]
     if corner_stats:
         lines += [
             "![Corner-hole phase consistency](corner_alignment.png)",
@@ -1084,6 +1703,16 @@ def main(argv=None):
     )
     selected_result = next(result for result in diagnostics if result["k"] == selected_k)
     centers, labels = order_clusters(selected_result["centers"], selected_result["labels"])
+    all_sources = sorted(
+        {row["result_file"] for row in dataset.rows + dataset.design_rows},
+        key=lambda key: natural_key(source_name(key)),
+    )
+    colors = source_colors(all_sources)
+    design_with_clusters = attach_design_clusters(dataset.design_rows, dataset.rows, labels)
+    spacing_candidates = usable_design_spacing_rows(design_with_clusters)
+    spacing_rows, spacing_count_outliers = split_spacing_count_outliers(spacing_candidates)
+    spacing_summaries = design_spacing_summaries(spacing_rows)
+    spacing_changes = design_spacing_changes(spacing_summaries)
     corner_stats = corner_statistics(
         dataset.corner_records,
         simulations=args.phase_simulations,
@@ -1091,8 +1720,32 @@ def main(argv=None):
     )
     write_summary(dataset.rows, output / "summary.csv")
     write_assignments(dataset.rows, centers, labels, output / "cluster_assignments.csv")
-    draw_cluster_chart(dataset.rows, centers, labels, output / "perforation_clusters.png")
+    draw_cluster_chart(dataset.rows, centers, labels,
+                       output / "perforation_clusters.png", colors)
     draw_diagnostics(diagnostics, selected_k, output / "cluster_count_diagnostics.png")
+    if dataset.design_rows:
+        write_design_summary(dataset.design_rows, dataset.rows, labels,
+                             output / "design_summary.csv")
+        draw_design_source_chart(dataset.design_rows,
+                                 output / "design_sizes_by_source.png", colors)
+    legacy_design_chart = output / "design_size_by_perforation_cluster.png"
+    if legacy_design_chart.exists():
+        legacy_design_chart.unlink()
+    spacing_chart = output / "design_spacing_by_perforation_cluster.png"
+    if spacing_chart.exists():
+        spacing_chart.unlink()
+    spacing_points_chart = output / "design_spacing_points_by_perforation_cluster.png"
+    if spacing_points_chart.exists():
+        spacing_points_chart.unlink()
+    if spacing_rows:
+        draw_design_spacing_change(
+            spacing_rows, selected_k,
+            spacing_chart, colors,
+        )
+        draw_design_spacing_points(
+            spacing_rows, selected_k,
+            spacing_points_chart, colors,
+        )
     if corner_stats:
         draw_corner_chart(dataset.corner_records, corner_stats, output / "corner_alignment.png")
     write_report(output / "report.md", dataset, diagnostics, selected_k, centers, labels,
@@ -1106,6 +1759,11 @@ def main(argv=None):
             "stamps": dataset.total_stamps,
             "complete_gauge_pairs": len(dataset.rows),
             "incomplete_gauge_pairs": len(dataset.incomplete),
+            "design_files": len(dataset.design_paths),
+            "measured_designs": len(dataset.design_rows),
+            "designs_with_perforation_cluster": len(design_with_clusters),
+            "designs_with_spacing_estimate": len(spacing_rows),
+            "design_spacing_count_outliers": len(spacing_count_outliers),
             "errors": dataset.errors,
         },
         "clustering": {
@@ -1115,6 +1773,59 @@ def main(argv=None):
             "outliers": outlier_records(dataset.rows, centers, labels),
             "diagnostics": json_ready(diagnostics),
         },
+        "design_size": {
+            "files": [str(path) for path in dataset.design_paths],
+            "measurements": len(dataset.design_rows),
+            "matched_to_perforation_cluster": len(design_with_clusters),
+            "by_source": [
+                {
+                    "source": source_name(source),
+                    "count": len(members),
+                    "mean_width_mm": statistics.mean(
+                        row[DESIGN_WIDTH] for row in members
+                    ),
+                    "mean_height_mm": statistics.mean(
+                        row[DESIGN_HEIGHT] for row in members
+                    ),
+                    "sd_width_mm": sample_sd(
+                        row[DESIGN_WIDTH] for row in members
+                    ),
+                    "sd_height_mm": sample_sd(
+                        row[DESIGN_HEIGHT] for row in members
+                    ),
+                }
+                for source, members in sorted(
+                    ((source, [row for row in dataset.design_rows
+                               if row["result_file"] == source])
+                     for source in {row["result_file"] for row in dataset.design_rows}),
+                    key=lambda item: natural_key(source_name(item[0])),
+                )
+            ],
+            "spacing_estimate": {
+                "assumption": (
+                    "a complete frame has a whole number of pitch intervals; "
+                    "the extreme hole centres define stamp repeat"
+                ),
+                "method": "ceil(valley-line dimension / (20 / gauge)) whole pitch intervals",
+                "measurements": len(spacing_rows),
+                "candidate_measurements": len(spacing_candidates),
+                "excluded_hole_count_outliers": [
+                    {
+                        "source": source_name(row["result_file"]),
+                        "stamp": row["stamp"],
+                        "cluster": row["cluster"],
+                        "width_hole_count": row[WIDTH_HOLE_COUNT],
+                        "height_hole_count": row[HEIGHT_HOLE_COUNT],
+                        "expected_width_hole_count": row[EXPECTED_WIDTH_HOLE_COUNT],
+                        "expected_height_hole_count": row[EXPECTED_HEIGHT_HOLE_COUNT],
+                        "reason": row["spacing_count_outlier_reason"],
+                    }
+                    for row in spacing_count_outliers
+                ],
+                "by_source_and_cluster": spacing_summaries,
+                "changes_between_consecutive_clusters": spacing_changes,
+            },
+        },
         "frame_vs_line": json_ready(corner_stats),
     }
     (output / "analysis.json").write_text(
@@ -1122,6 +1833,8 @@ def main(argv=None):
     )
     print(f"Report: {output / 'report.md'}")
     print(f"Measurements: {len(dataset.rows)} complete, {len(dataset.incomplete)} incomplete")
+    print(f"Design sizes: {len(dataset.design_rows)} measured, "
+          f"{len(design_with_clusters)} matched to a perforation cluster")
     print(f"Clusters: k={selected_k}; " + "; ".join(
         f"C{index+1}=({center[0]:.4f}, {center[1]:.4f}), n={labels.count(index)}"
         for index, center in enumerate(centers)

@@ -7,9 +7,13 @@ import unittest
 from PIL import Image
 
 from analysis.analyze_perforation import (
+    attach_design_clusters,
     circular_summary,
     cluster_diagnostics,
     corner_records_for_stamp,
+    draw_design_spacing_change,
+    draw_design_spacing_points,
+    draw_design_source_chart,
     draw_diagnostics,
     find_inputs,
     kmeans,
@@ -19,7 +23,9 @@ from analysis.analyze_perforation import (
     order_clusters,
     outlier_indices,
     ALGORITHM_OUTLINE_COLORS,
+    split_spacing_count_outliers,
     source_labels,
+    source_colors,
 )
 from perforation import PHASE_COLORS
 
@@ -63,6 +69,58 @@ class AnalysisTests(unittest.TestCase):
                 self.assertGreater(image.width, 100)
                 self.assertGreater(image.height, 100)
 
+    def test_design_charts_are_pngs(self):
+        rows = [
+            {
+                "result_file": r"D:\results\1K_perf.json",
+                "source": "1K.jpg", "stamp": str(index),
+                "design_width_mm": 16.2 + index*0.01,
+                "design_height_mm": 22.1 + index*0.02,
+                "point": (16.2 + index*0.01, 22.1 + index*0.02),
+                "cluster": index % 2,
+                "horizontal_design_gap_mm": 2.1 + index*0.03,
+                "vertical_design_gap_mm": 2.8 + index*0.02,
+            }
+            for index in range(1, 5)
+        ]
+        colors = source_colors([rows[0]["result_file"]])
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            source_output = Path(directory) / "sources.png"
+            cluster_output = Path(directory) / "clusters.png"
+            points_output = Path(directory) / "points.png"
+            draw_design_source_chart(rows, source_output, colors)
+            draw_design_spacing_change(rows, 2, cluster_output, colors)
+            draw_design_spacing_points(rows, 2, points_output, colors)
+            for output in (source_output, cluster_output, points_output):
+                with Image.open(output) as image:
+                    self.assertEqual(image.format, "PNG")
+                    self.assertGreater(image.width, 100)
+                    self.assertGreater(image.height, 100)
+
+    def test_non_modal_hole_counts_are_excluded_from_spacing(self):
+        rows = [
+            {
+                "result_file": r"D:\results\1K_perf.json",
+                "stamp": str(index), "cluster": 0,
+                "frame_holes_across_width": width,
+                "frame_holes_across_height": 19,
+                "horizontal_design_gap_mm": 1.5,
+                "vertical_design_gap_mm": 2.0,
+            }
+            for index, width in enumerate((14, 14, 15), start=1)
+        ]
+        inliers, outliers = split_spacing_count_outliers(rows)
+        self.assertEqual([row["stamp"] for row in inliers], ["1", "2"])
+        self.assertEqual([row["stamp"] for row in outliers], ["3"])
+        self.assertEqual(outliers[0]["expected_frame_holes_across_width"], 14)
+        self.assertTrue(outliers[0]["spacing_count_outlier"])
+        tied = [{**row, "cluster": 1} for row in rows[:1] + rows[2:]]
+        tied_inliers, tied_outliers = split_spacing_count_outliers(tied)
+        self.assertEqual(tied_inliers, [])
+        self.assertEqual(len(tied_outliers), 2)
+        self.assertTrue(all(row["expected_frame_holes_across_width"] is None
+                            for row in tied_outliers))
+
     def test_line_intersection(self):
         point = line_intersection(((0, 1), (2, 1)), ((1, 0), (1, 2)))
         self.assertEqual(point, (1.0, 1.0))
@@ -97,15 +155,22 @@ class AnalysisTests(unittest.TestCase):
         payload = {
             "format": "stamp-perforation-results",
             "source": "anything.png",
+            "dpi": 100,
             "stamps": [{
                 "stamp": 7,
                 "summary": {
+                    "width_px": 100,
+                    "height_px": 200,
                     "horizontal_perforation_per_20mm": 12.25,
                     "vertical_perforation_per_20mm": 12.5,
                 },
                 "measurement": {
                     "status": "ok",
-                    "sides": {"top": {"phase": 1}, "right": {"phase": 3}},
+                    "sides": {
+                        name: {"phase": phase}
+                        for name, phase in (("top", 1), ("right", 3),
+                                            ("bottom", 1), ("left", 2))
+                    },
                 },
             }],
         }
@@ -113,6 +178,16 @@ class AnalysisTests(unittest.TestCase):
             path = Path(directory) / "nested" / "anything_perf.json"
             path.parent.mkdir()
             path.write_text(json.dumps(payload), encoding="utf-8")
+            design_path = path.with_name("anything_design.json")
+            design_path.write_text(json.dumps({
+                "format": "stamp-design-size",
+                "source": "anything.png",
+                "stamps": [{
+                    "stamp": 7,
+                    "design_width_mm": 16.25,
+                    "design_height_mm": 22.5,
+                }],
+            }), encoding="utf-8")
             paths = find_inputs([directory])
             dataset = load_dataset(paths)
         self.assertEqual(len(paths), 1)
@@ -120,6 +195,17 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(dataset.rows[0]["source"], "anything.png")
         self.assertEqual(dataset.rows[0]["point"], (12.25, 12.5))
         self.assertEqual(dataset.rows[0]["worst_edge_algorithm"], 3)
+        self.assertEqual(len(dataset.design_rows), 1)
+        self.assertEqual(dataset.design_rows[0]["point"], (16.25, 22.5))
+        joined = attach_design_clusters(dataset.design_rows, dataset.rows, [1])
+        self.assertEqual(joined[0]["cluster"], 1)
+        self.assertEqual(joined[0]["frame_holes_across_width"], 17)
+        self.assertEqual(joined[0]["frame_holes_across_height"], 33)
+        self.assertAlmostEqual(joined[0]["hole_center_width_mm"], 16*20/12.25)
+        self.assertAlmostEqual(joined[0]["hole_center_height_mm"], 32*20/12.5)
+        self.assertAlmostEqual(joined[0]["horizontal_design_gap_mm"],
+                               16*20/12.25 - 16.25)
+        self.assertAlmostEqual(joined[0]["vertical_design_gap_mm"], 51.2 - 22.5)
 
     def test_source_labels_drop_suffix_and_sort_numbers_naturally(self):
         paths = [

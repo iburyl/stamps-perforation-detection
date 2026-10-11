@@ -39,7 +39,8 @@ It is deliberately exhaustive and is not intended to be read by hand.
 
 `analysis/analyze_perforation.py` reads any collection of `*_perf.json` files produced by
 the detector. It is not tied to a named study, catalogue issue, file naming scheme, or a
-fixed number of clusters.
+fixed number of clusters. When matching `*_design.json` files are present beside the
+perforation results, their printed-design dimensions are joined by source and stamp id.
 
 ```bash
 python analysis/analyze_perforation.py /path/to/results
@@ -65,9 +66,22 @@ The report directory contains:
 | `analysis.json` | machine-readable cluster and frame-versus-line results |
 | `summary.csv` | all complete horizontal/vertical gauge pairs |
 | `cluster_assignments.csv` | one selected cluster per complete stamp measurement |
+| `design_summary.csv` | printed-design dimensions, matched cluster and frame-based spacing estimates |
 | `perforation_clusters.png` | selected clustering and centroids |
 | `cluster_count_diagnostics.png` | Gap statistic and silhouette by candidate `k` |
+| `design_sizes_by_source.png` | printed-design width versus height across Sources |
+| `design_spacing_by_perforation_cluster.png` | estimated horizontal and vertical design gaps by Source and cluster |
+| `design_spacing_points_by_perforation_cluster.png` | the same design gaps with every retained stamp shown separately |
 | `corner_alignment.png` | fitted corner-hole phase evidence |
+
+Under the frame-perforation hypothesis, the analysis also estimates the stamp repeat from
+the centres of the extreme holes. It converts gauge to pitch (`20 / gauge`), selects the
+smallest whole number of pitch intervals that spans the measured valley-line dimension,
+and uses that integer span as the centre-to-centre repeat. Subtracting the printed-design
+dimension gives the estimated edge-to-edge spacing between neighboring designs. Hole radii
+are not used in this calculation. Within each Source/perforation-cluster group, only stamps
+with the unique modal width/height hole-count pair contribute to spacing means and the chart;
+non-modal estimates are reported separately as hole-count outliers.
 
 The frame/line result is deliberately conservative. At least 12 usable corners from four
 stamps are required; otherwise it reports `insufficient-data`. A `linear-compatible`
