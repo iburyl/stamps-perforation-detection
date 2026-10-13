@@ -9,6 +9,7 @@ from PIL import Image
 from analysis.analyze_perforation import (
     attach_design_clusters,
     circular_summary,
+    cluster_axis_ranges,
     cluster_diagnostics,
     corner_records_for_stamp,
     draw_design_spacing_change,
@@ -46,6 +47,16 @@ class AnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(centers[1][1], 5.0, delta=0.03)
         self.assertEqual(labels.count(0), 20)
         self.assertEqual(labels.count(1), 20)
+
+    def test_cluster_axis_ranges_return_minimum_and_maximum(self):
+        rows = [
+            {"point": (1.0, 10.0)},
+            {"point": (3.0, 14.0)},
+            {"point": (20.0, 30.0)},
+        ]
+        result = cluster_axis_ranges(rows, [0, 0, 1], 2)
+        self.assertEqual(result[0], ((1.0, 3.0), (10.0, 14.0)))
+        self.assertEqual(result[1], ((20.0, 20.0), (30.0, 30.0)))
 
     def test_gap_statistic_selects_two_clear_groups(self):
         rng = random.Random(19)

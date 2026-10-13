@@ -109,6 +109,20 @@ def sample_sd(values):
     return statistics.stdev(values) if len(values) > 1 else 0.0
 
 
+def cluster_axis_ranges(rows, labels, cluster_count):
+    """Return min/max ranges for the horizontal and vertical axes of each cluster."""
+    members = [[] for _ in range(cluster_count)]
+    for row, label in zip(rows, labels):
+        members[label].append(row["point"])
+    return [
+        (
+            (min(point[0] for point in points), max(point[0] for point in points)),
+            (min(point[1] for point in points), max(point[1] for point in points)),
+        )
+        for points in members
+    ]
+
+
 def line_intersection(first, second):
     (x1, y1), (x2, y2) = first
     (x3, y3), (x4, y4) = second
@@ -1401,6 +1415,7 @@ def frame_conclusion(stats):
 def write_report(path, dataset, diagnostics, selected_k, centers, labels, corner_stats,
                  references, simulations):
     counts = Counter(labels)
+    cluster_ranges = cluster_axis_ranges(dataset.rows, labels, len(centers))
     statuses = Counter(row["status"] for row in dataset.rows)
     outliers = outlier_records(dataset.rows, centers, labels)
     design_with_clusters = attach_design_clusters(dataset.design_rows, dataset.rows, labels)
@@ -1443,11 +1458,17 @@ def write_report(path, dataset, diagnostics, selected_k, centers, labels, corner
         "Clustering uses the horizontal and vertical gauges directly. Cluster names are ordered "
         "by increasing sum of their two centroid coordinates and have no predefined catalogue meaning.",
         "",
-        "| Cluster | n | Horizontal centroid | Vertical centroid |",
-        "|---:|---:|---:|---:|",
+        "Ranges show the minimum and maximum observed values within each cluster.",
+        "",
+        "| Cluster | n | Horizontal centroid | Horizontal range | Vertical centroid | Vertical range |",
+        "|---:|---:|---:|---:|---:|---:|",
     ]
-    for index, center in enumerate(centers):
-        lines.append(f"| C{index+1} | {counts[index]} | {center[0]:.4f} | {center[1]:.4f} |")
+    for index, (center, axis_ranges) in enumerate(zip(centers, cluster_ranges)):
+        lines.append(
+            f"| C{index+1} | {counts[index]} | {center[0]:.4f} | "
+            f"{axis_ranges[0][0]:.4f}–{axis_ranges[0][1]:.4f} | "
+            f"{center[1]:.4f} | {axis_ranges[1][0]:.4f}–{axis_ranges[1][1]:.4f} |"
+        )
     lines += [
         "",
         "The six observations farthest from their assigned centroid are labelled on the chart:",

@@ -105,8 +105,8 @@ def detect_stamps_2d(
     reference_components = component_sets[min(1, len(component_sets) - 1)][1]
     scale_candidates = [
         component for component in reference_components
-        if (0.055 * work_w <= component['width'] <= 0.14 * work_w
-            and 0.075 * work_w <= component['height'] <= 0.18 * work_w
+        if (0.055 * work_w <= component['width'] <= 0.18 * work_w
+            and 0.075 * work_w <= component['height'] <= 0.23 * work_w
             and 0.28 <= component['width'] / component['height'] <= 1.35
             and component['area'] >= 0.22 * component['width'] * component['height'])
     ]
