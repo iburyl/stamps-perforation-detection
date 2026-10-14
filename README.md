@@ -5,6 +5,11 @@ A research tool that measures postage stamp **perforation gauge** (holes per 20 
 
 NumPy, OpenCV and Pillow are required.
 
+Research prototypes for separating multi-colour printing passes by colour and
+residual micro-registration are documented in
+[`design_components/`](design_components/README.md). They are not part of the
+production pipeline.
+
 ```
 pip install -r requirements.txt
 python segment_stamps.py scan.png --dpi 1200

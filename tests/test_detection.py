@@ -22,10 +22,27 @@ class DetectionTests(unittest.TestCase):
         # A bright elongated object must not become a sequence of "stamps".
         cv2.rectangle(image, (120, 700), (1480, 765), (225, 225, 225), -1)
 
-        boxes, mask = detect_stamps_2d(image, max_processing_width=1600)
+        boxes, mask = detect_stamps_2d(
+            image, max_processing_width=1600, dpi=100,
+        )
 
         self.assertEqual(len(boxes), 5)
         self.assertTrue(all(estimate_orientation(mask, box) for box in boxes))
+
+    def test_physical_limit_replaces_relative_size_limits(self):
+        image = np.full((900, 1500, 3), 25, np.uint8)
+        # Both are below 7 cm at 100 dpi.  Their very different sizes must not
+        # cause the smaller stamp to be rejected by a relative lower bound.
+        cv2.rectangle(image, (80, 100), (119, 149), (210, 210, 210), -1)
+        cv2.rectangle(image, (300, 100), (499, 349), (210, 210, 210), -1)
+        # This square exceeds 7 cm on both sides and must not be a proposal.
+        cv2.rectangle(image, (700, 100), (1399, 799), (210, 210, 210), -1)
+
+        boxes, _ = detect_stamps_2d(
+            image, max_processing_width=1500, dpi=100,
+        )
+
+        self.assertEqual(boxes, [(80, 100, 119, 149), (300, 100, 499, 349)])
 
 
 if __name__ == '__main__':

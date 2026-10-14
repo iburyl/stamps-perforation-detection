@@ -18,6 +18,9 @@ from perforation import (PHASE_NAMES, PHASE_SEED_SOURCES, SIDES,
 from refine_perforation import fit_arc, fit_parabola
 
 
+MAX_STAMP_SIDE_CM = 7.0
+
+
 def _reading_order(boxes, typical_height):
     """Stable numbering only; rows are not used to decide what is a stamp."""
     remaining = list(boxes)
@@ -41,14 +44,17 @@ def detect_stamps_2d(
     image,
     max_processing_width=3000,
     background_delta=35,
+    dpi=None,
+    max_stamp_side_cm=MAX_STAMP_SIDE_CM,
 ):
     """Detect stamp-shaped 2-D components in the complete scan.
 
     Detection does not assume a single backing-paper rectangle and does not
     project the image into rows.  Several nearby thresholds make pale and dark
     stamps available as proposals; overlapping proposals are consolidated in
-    two dimensions.  A component about twice the normal stamp width/height is
-    split, which retains touching pairs.
+    two dimensions.  When DPI is known, the only size gate is physical: neither
+    side of one stamp may exceed ``max_stamp_side_cm``.  A component larger
+    than that may still be split when it is consistent with touching stamps.
     """
     image_h, image_w = image.shape[:2]
     scale = min(1.0, max_processing_width / image_w)
@@ -59,6 +65,10 @@ def detect_stamps_2d(
         work = image.copy()
     gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
     work_h, work_w = gray.shape
+    max_stamp_side = (
+        float(dpi) * float(max_stamp_side_cm) * scale / 2.54
+        if dpi is not None else None
+    )
 
     # The lower percentile samples the black mounting sheet even when a ruler
     # divides it into separate regions.  Avoid allowing a very bright exterior
@@ -99,63 +109,6 @@ def detect_stamps_2d(
             foreground[np.isin(labels, list(border_labels))] = 0
         component_sets.append((foreground, components))
 
-    # Estimate the scale from compact, stamp-sized components rather than from
-    # their position.  Broad limits are relative to processing width, so scans
-    # at other pixel dimensions remain supported.
-    reference_components = component_sets[min(1, len(component_sets) - 1)][1]
-    scale_candidates = [
-        component for component in reference_components
-        if (0.055 * work_w <= component['width'] <= 0.18 * work_w
-            and 0.075 * work_w <= component['height'] <= 0.23 * work_w
-            and 0.28 <= component['width'] / component['height'] <= 1.35
-            and component['area'] >= 0.22 * component['width'] * component['height'])
-    ]
-    if not scale_candidates:
-        return [], np.zeros((image_h, image_w), dtype=np.uint8)
-    typical_width = float(np.median([c['width'] for c in scale_candidates]))
-    typical_height = float(np.median([c['height'] for c in scale_candidates]))
-    typical_area = float(np.median([c['area'] for c in scale_candidates]))
-
-    proposals = []
-    for level, (_, components) in enumerate(component_sets):
-        for component in components:
-            width = component['width']
-            height = component['height']
-            area = component['area']
-            if area < 0.16 * typical_area:
-                continue
-            if not (0.28 * typical_width <= width <= 3.2 * typical_width
-                    and 0.28 * typical_height <= height <= 3.2 * typical_height):
-                continue
-            if area < 0.14 * width * height:
-                continue
-
-            nx = max(1, int(round(width / typical_width))) if width > 1.5 * typical_width else 1
-            ny = max(1, int(round(height / typical_height))) if height > 1.5 * typical_height else 1
-            if nx * ny > 4:
-                continue
-            x0, y0, x1, y1 = component['box']
-            x_edges = np.linspace(x0, x1 + 1, nx + 1)
-            y_edges = np.linspace(y0, y1 + 1, ny + 1)
-            for iy in range(ny):
-                for ix in range(nx):
-                    sx0, sx1 = x_edges[ix], x_edges[ix + 1] - 1
-                    sy0, sy1 = y_edges[iy], y_edges[iy + 1] - 1
-                    cx = (sx0 + sx1) / 2
-                    cy = (sy0 + sy1) / 2
-                    proposal_w = max(typical_width, sx1 - sx0 + 1)
-                    proposal_h = max(typical_height, sy1 - sy0 + 1)
-                    proposals.append({
-                        'box': (
-                            int(round(cx - proposal_w / 2)),
-                            int(round(cy - proposal_h / 2)),
-                            int(round(cx + proposal_w / 2)),
-                            int(round(cy + proposal_h / 2)),
-                        ),
-                        'score': area / max(1.0, nx * ny),
-                        'level': level,
-                    })
-
     def intersection_over_union(first, second):
         ax0, ay0, ax1, ay1 = first
         bx0, by0, bx1, by1 = second
@@ -166,26 +119,142 @@ def detect_stamps_2d(
                  + (bx1 - bx0 + 1) * (by1 - by0 + 1) - intersection)
         return intersection / union if union else 0.0
 
+    def covered_fraction(first, second):
+        """Intersection divided by the smaller box area."""
+        ax0, ay0, ax1, ay1 = first
+        bx0, by0, bx1, by1 = second
+        width = max(0, min(ax1, bx1) - max(ax0, bx0) + 1)
+        height = max(0, min(ay1, by1) - max(ay0, by0) + 1)
+        intersection = width * height
+        smaller = min(
+            (ax1 - ax0 + 1) * (ay1 - ay0 + 1),
+            (bx1 - bx0 + 1) * (by1 - by0 + 1),
+        )
+        return intersection / smaller if smaller else 0.0
+
+    def is_stamp_shape(component):
+        width = component['width']
+        height = component['height']
+        if not 0.28 <= width / height <= 1.35:
+            return False
+        if component['area'] < 0.14 * width * height:
+            return False
+        if (max_stamp_side is not None
+                and (width > max_stamp_side or height > max_stamp_side)):
+            return False
+        return True
+
+    def consolidate(proposals):
+        selected = []
+        for proposal in sorted(
+                proposals, key=lambda item: item['score'], reverse=True):
+            box = proposal['box']
+            supporting_levels = {
+                candidate['level'] for candidate in proposals
+                if intersection_over_union(box, candidate['box']) >= 0.25
+            }
+            if len(supporting_levels) < 2:
+                continue
+            if any(
+                    intersection_over_union(box, old) >= 0.25
+                    or covered_fraction(box, old) >= 0.80
+                    for old in selected):
+                continue
+            selected.append(box)
+        return selected
+
+    # Use the whole component as the primary proposal.  Larger boxes are
+    # considered first, so cancellation fragments contained inside a complete
+    # stamp cannot establish an artificially small reference size.
+    proposals = []
+    for level, (_, components) in enumerate(component_sets):
+        for component in components:
+            if not is_stamp_shape(component):
+                continue
+            x0, y0, x1, y1 = component['box']
+            proposals.append({
+                'box': component['box'],
+                'score': float((x1 - x0 + 1) * (y1 - y0 + 1)),
+                'level': level,
+            })
+
+    initial_selected = consolidate(proposals)
+    if not initial_selected:
+        return [], np.zeros((image_h, image_w), dtype=np.uint8)
+
+    typical_width = float(np.median([
+        x1 - x0 + 1 for x0, _, x1, _ in initial_selected
+    ]))
+    typical_height = float(np.median([
+        y1 - y0 + 1 for _, y0, _, y1 in initial_selected
+    ]))
+
+    # Preserve support for touching stamps.  With DPI, splitting is attempted
+    # only for a connected component that exceeds the 7 cm physical limit;
+    # a smaller component is a valid single-stamp size regardless of how it
+    # compares with the median on this particular scan.
+    split_proposals = []
+    for level, (_, components) in enumerate(component_sets):
+        for component in components:
+            width = component['width']
+            height = component['height']
+            oversized = (
+                max_stamp_side is not None
+                and (width > max_stamp_side or height > max_stamp_side)
+            )
+            legacy_multiple = (
+                max_stamp_side is None
+                and (width > 1.5 * typical_width
+                     or height > 1.5 * typical_height)
+            )
+            if not (oversized or legacy_multiple):
+                continue
+            if component['area'] < 0.14 * width * height:
+                continue
+            nx = max(1, int(round(width / typical_width)))
+            ny = max(1, int(round(height / typical_height)))
+            if nx * ny <= 1 or nx * ny > 4:
+                continue
+            cell_width = width / nx
+            cell_height = height / ny
+            if (max_stamp_side is not None
+                    and (cell_width > max_stamp_side
+                         or cell_height > max_stamp_side)):
+                continue
+            if not 0.28 <= cell_width / cell_height <= 1.35:
+                continue
+            x0, y0, x1, y1 = component['box']
+            x_edges = np.linspace(x0, x1 + 1, nx + 1)
+            y_edges = np.linspace(y0, y1 + 1, ny + 1)
+            for iy in range(ny):
+                for ix in range(nx):
+                    sx0, sx1 = x_edges[ix], x_edges[ix + 1] - 1
+                    sy0, sy1 = y_edges[iy], y_edges[iy + 1] - 1
+                    split_proposals.append({
+                        'box': (
+                            int(round(sx0)), int(round(sy0)),
+                            int(round(sx1)), int(round(sy1)),
+                        ),
+                        'score': float(cell_width * cell_height),
+                        'level': level,
+                    })
+
+    proposals.extend(split_proposals)
+
     # Non-maximum suppression merges threshold variants and fragments of one
     # heavily cancelled stamp, but does not merge neighbouring stamps.
-    selected = []
-    for proposal in sorted(proposals, key=lambda item: item['score'], reverse=True):
-        box = proposal['box']
-        supporting_levels = {
-            candidate['level'] for candidate in proposals
-            if intersection_over_union(box, candidate['box']) >= 0.25
-        }
-        if len(supporting_levels) < 2:
-            continue
-        if any(intersection_over_union(box, old) >= 0.25 for old in selected):
-            continue
-        x0, y0, x1, y1 = box
-        selected.append((
+    selected = [
+        (
             max(0, x0), max(0, y0),
             min(work_w - 1, x1), min(work_h - 1, y1),
-        ))
+        )
+        for x0, y0, x1, y1 in consolidate(proposals)
+    ]
 
-    selected = _reading_order(selected, typical_height)
+    ordering_height = float(np.median([
+        y1 - y0 + 1 for _, y0, _, y1 in selected
+    ]))
+    selected = _reading_order(selected, ordering_height)
     boxes = []
     for x0, y0, x1, y1 in selected:
         boxes.append((
@@ -1561,7 +1630,11 @@ def main():
         help='Parallel stamp workers (default: logical CPU count)',
     )
 
-    parser.add_argument('--dpi', type=float, help='Verified scan DPI for mm and perforations per 20 mm')
+    parser.add_argument(
+        '--dpi', type=float,
+        help=('Verified scan DPI for mm, perforations per 20 mm, and the '
+              '7 cm maximum stamp-side detection limit'),
+    )
     parser.add_argument(
         '--stamp', type=int, metavar='STAMP',
         help='Analyze only this 1-based stamp number',
@@ -1611,6 +1684,7 @@ def main():
         background_delta=(
             args.stamp_delta
         ),
+        dpi=args.dpi,
     )
     print(f"Found stamps: {len(boxes)}")
 
@@ -1777,6 +1851,7 @@ def main():
             parameters={
                 'stamp_delta': args.stamp_delta,
                 'processing_width': args.processing_width,
+                'max_stamp_side_cm': MAX_STAMP_SIDE_CM,
                 'workers': worker_count,
                 'selected_stamp': args.stamp,
             },
