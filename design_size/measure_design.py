@@ -24,13 +24,18 @@ nothing shears a printed design.
 """
 
 import argparse
+import contextlib
+import io
 import json
+import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 SIDES = ('top', 'bottom', 'left', 'right')
+
+COMPONENTS_DIR = Path(__file__).resolve().parent.parent / 'design_components'
 
 # Congealing schedule: (downscale factor, registration rounds at that factor).
 # The coarse levels carry the de-centring, which is several tens of pixels at
@@ -1188,6 +1193,24 @@ def measure_scan(image, document, schedule, iterations, eps, cutoff,
         skipped, candidates, registration
 
 
+def build_components(scan_path, perf_path, design_path, verbose):
+    """Split the golden into the two printing passes it was struck from.
+
+    The splitter sits in a sibling directory and imports its own siblings by
+    bare module name, so that directory goes on the path rather than the whole
+    tree being made a package.  It needs the design JSON this run just wrote.
+    """
+    if str(COMPONENTS_DIR) not in sys.path:
+        sys.path.insert(0, str(COMPONENTS_DIR))
+    import golden_components
+
+    settings = golden_components.Settings(perf=perf_path, design=design_path)
+    sink = contextlib.nullcontext() if verbose \
+        else contextlib.redirect_stdout(io.StringIO())
+    with sink:
+        return golden_components.build(scan_path, settings)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=('Measure the printed design rectangle of every stamp in a '
@@ -1256,6 +1279,10 @@ def main():
         '--rule', type=int, default=1,
         help=('Which frame rule to publish, counted inwards from the outside. '
               'All detected rules are recorded either way (default: 1)'))
+    parser.add_argument(
+        '--no-components', action='store_true',
+        help=('Stop after the golden, without splitting it into the two '
+              'printing passes it was struck from'))
     parser.add_argument('--quiet', action='store_true', help='Suppress progress')
     args = parser.parse_args()
 
@@ -1433,6 +1460,15 @@ def main():
                   + ', '.join(str(number) for number, _ in skipped))
         print(f"\nWrote {out_path}\nWrote {golden_path}\nWrote {drawn_path}\n"
               f"Wrote {reveal_path}\nWrote {clean_path}")
+
+    if not args.no_components:
+        if verbose:
+            print()
+        try:
+            build_components(input_path, perf_path, out_path, verbose)
+        except RuntimeError as error:
+            # A scan too small or too worn to separate still has a valid golden.
+            print(f'Printing passes not separated: {error}')
 
 
 if __name__ == '__main__':

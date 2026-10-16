@@ -447,6 +447,26 @@ def main() -> None:
         return result["snr"] * result["coherence"] * clear
 
     ranked = sorted(usable, key=quality, reverse=True)
+
+    # golden_components.py records which impressions its background merge kept
+    # in data_<stem>_background_selection.json.  Mark them here so the per-stamp
+    # panels say why one was left out.
+    sidecar = scan.with_name(f"data_{scan.stem}_background_selection.json")
+    merged: dict = {}
+    if sidecar.exists():
+        merged = json.loads(sidecar.read_text(encoding="utf-8"))
+        print(
+            f"  background merge used {merged.get('used')}, "
+            f"skipped {merged.get('skipped')}"
+        )
+
+    def verdict(number: int) -> str:
+        if not merged:
+            return ""
+        alone = merged.get("strength_alone", {}).get(str(number))
+        where = " merged" if number in merged.get("used", []) else " not merged"
+        return where + (f", strength {alone:.0f}" if alone is not None else "")
+
     if args.zoom_stamps:
         wanted = [int(v) for v in args.zoom_stamps.split(",") if v.strip()]
         chosen = [r for number in wanted for r in usable if r["number"] == number]
@@ -474,14 +494,15 @@ def main() -> None:
                     contrast(result["coverage"], result["field"], result["limits"]),
                     cv2.COLOR_GRAY2BGR,
                 ),
-                f"stamp {result['number']} background; {result['pitch'] * args.downsample:.2f}px screen",
+                f"stamp {result['number']} background; "
+                f"{result['pitch'] * args.downsample:.2f}px screen{verdict(result['number'])}",
             )
         )
     for result in usable:
         panels.append(
             add_label(
                 render_ink(result["coverage"], result["paper"], result["ink_ray"]),
-                f"stamp {result['number']} background in its own ink",
+                f"stamp {result['number']} background in its own ink{verdict(result['number'])}",
             )
         )
 
