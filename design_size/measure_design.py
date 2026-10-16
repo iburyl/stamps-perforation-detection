@@ -1193,8 +1193,8 @@ def measure_scan(image, document, schedule, iterations, eps, cutoff,
         skipped, candidates, registration
 
 
-def build_components(scan_path, perf_path, design_path, verbose):
-    """Split the golden into the two printing passes it was struck from.
+def build_components(scan_path, perf_path, design_path, screen_ink, verbose):
+    """Split the golden into the printing passes it was struck from.
 
     The splitter sits in a sibling directory and imports its own siblings by
     bare module name, so that directory goes on the path rather than the whole
@@ -1204,7 +1204,8 @@ def build_components(scan_path, perf_path, design_path, verbose):
         sys.path.insert(0, str(COMPONENTS_DIR))
     import golden_components
 
-    settings = golden_components.Settings(perf=perf_path, design=design_path)
+    settings = golden_components.Settings(
+        perf=perf_path, design=design_path, screen_ink=screen_ink)
     sink = contextlib.nullcontext() if verbose \
         else contextlib.redirect_stdout(io.StringIO())
     with sink:
@@ -1281,8 +1282,14 @@ def main():
               'All detected rules are recorded either way (default: 1)'))
     parser.add_argument(
         '--no-components', action='store_true',
-        help=('Stop after the golden, without splitting it into the two '
+        help=('Stop after the golden, without splitting it into the '
               'printing passes it was struck from'))
+    parser.add_argument(
+        '--screen-ink', type=int, default=0, metavar='N',
+        help=('Also read the Nth colour plate as a ruled screen and merge it '
+              'on the phase of its engraved ground, rather than on its '
+              'outline. Only applies where several colours were found; the '
+              'plates are numbered as the run reports them (default: off)'))
     parser.add_argument('--quiet', action='store_true', help='Suppress progress')
     args = parser.parse_args()
 
@@ -1300,6 +1307,8 @@ def main():
         parser.error('--uncancel-fade must be in [0, 1]')
     if args.reveal_window < 3 or args.reveal_window % 2 == 0:
         parser.error('--reveal-window must be an odd number of pixels, >= 3')
+    if args.screen_ink < 0:
+        parser.error('--screen-ink must be a plate number, counted from 1')
 
     input_path = Path(args.input)
     perf_path = Path(args.perf) if args.perf else \
@@ -1465,7 +1474,8 @@ def main():
         if verbose:
             print()
         try:
-            build_components(input_path, perf_path, out_path, verbose)
+            build_components(input_path, perf_path, out_path,
+                             args.screen_ink, verbose)
         except RuntimeError as error:
             # A scan too small or too worn to separate still has a valid golden.
             print(f'Printing passes not separated: {error}')

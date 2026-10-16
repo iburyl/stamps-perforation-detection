@@ -11,22 +11,35 @@ pass on its own evidence, averages each into its own golden, and only then puts
 them back together.  Postmarks are identified as a component and excluded
 rather than averaged down.
 
-The two passes are registered by different means, because they offer different
-evidence.  The main design is a unique aperiodic pattern, so it is registered
-by correlation against the running template; a sharp unambiguous peak exists
-and the half-set check confirms it.  The background screen is periodic, so no
-template-based match is well posed on it; instead its phase is read against an
-analytic wave at its own measured pitch, which no template bootstrap can bias.
-Only the component across the ruling is observable that way, the component
-along it being a symmetry of the screen, so only that component is corrected.
+Which passes a stamp has is read off the scan rather than assumed, because
+these denominations were not all printed the same way.  ``ink_palette`` names
+the major inks, and there turn out to be two cases.
 
-The two passes come off separate plates in separate press runs, so they also
-sit rotated with respect to each other, by about a tenth of a degree in these
-sheets -- enough to displace a corner by more than a pixel.  Each impression's
-screen bearing is therefore measured and brought to a common angle before the
-phase is matched.  Their relative *scale* is left alone deliberately: both inks
-lie on the same fibres, so every later movement of the paper carries them
-equally, and measurement puts any residual below 0.04%.
+A single major ink means one press run, which laid the design and the ruled
+ground behind it down together.  Those two are registered by different means,
+because they offer different evidence.  The design is a unique aperiodic
+pattern, so it is registered by correlation against the running template; a
+sharp unambiguous peak exists and the half-set check confirms it.  The ground
+is periodic, so no template-based match is well posed on it; instead its phase
+is read against an analytic wave at its own measured pitch, which no template
+bootstrap can bias.  Only the component across the ruling is observable that
+way, the component along it being a symmetry of the screen, so only that
+component is corrected.  The two plates still sit rotated with respect to each
+other, by about a tenth of a degree in these sheets -- enough to displace a
+corner by more than a pixel -- so each impression's screen bearing is measured
+and brought to a common angle before the phase is matched.
+
+Several major inks mean several press runs.  The bi-coloured denominations
+printed the frame from one plate and the centre from another, each a separate
+trip through the press, so each colour landed with its own small shift *and*
+its own small turn and nothing ties them together.  Each colour is registered
+as a rigid motion against its own running template.  Measured that way the
+centre plate moves three to five times as far as the frame, and turns three to
+five times as much, which is why averaging whole impressions smears it.
+
+Relative *scale* is left alone throughout, deliberately: the inks lie on the
+same fibres, so every later movement of the paper carries them equally, and
+measurement puts any residual below 0.04%.
 
 Driven by ``measure_design.py``, which calls :func:`build` once it has written
 the design JSON this reads.  Writes ``<stem>_golden_components.png`` next to
@@ -47,6 +60,8 @@ import cv2
 import numpy as np
 
 import background_ink
+import ink_palette
+from ink_palette import unmix
 from background_ink import (
     optical_density,
     render_ink,
@@ -60,18 +75,60 @@ from three_colour_refinement import add_label, bgr_hex, estimate_papers, paper_r
 from two_pass_decomposition import aligned_collection, masked_colour_median
 
 
+def move_image(image: np.ndarray, motion: np.ndarray, interpolation: int) -> np.ndarray:
+    """Apply a motion, which is either a translation or a whole affine.
+
+    Both are applied as inverse maps, so a motion always means the same thing:
+    where in this impression to read the value that belongs at ``x``.
+    """
+    motion = np.asarray(motion, np.float32)
+    if motion.shape == (2,):
+        return shift_image(image, motion, interpolation)
+    height, width = image.shape[:2]
+    return cv2.warpAffine(
+        image,
+        motion,
+        (width, height),
+        flags=interpolation | cv2.WARP_INVERSE_MAP,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+
+def recentre(warps: np.ndarray, centre: tuple[float, float]) -> np.ndarray:
+    """Pin the median rotation, and the median displacement at the centre, to
+    zero.
+
+    Only differences between impressions are measured; where the collection as
+    a whole sits is not, so a gauge has to be chosen rather than discovered.
+    """
+    origin = np.array([centre[0], centre[1], 1.0])
+    angles = np.arctan2(warps[:, 1, 0], warps[:, 0, 0])
+    offsets = warps @ origin - np.asarray(centre)
+    angles = angles - np.median(angles)
+    offsets = offsets - np.median(offsets, axis=0)
+    rebuilt = np.zeros_like(warps)
+    for index, (angle, offset) in enumerate(zip(angles, offsets)):
+        turn = np.array(
+            [[math.cos(angle), -math.sin(angle)], [math.sin(angle), math.cos(angle)]]
+        )
+        rebuilt[index, :, :2] = turn
+        rebuilt[index, :, 2] = np.asarray(centre) + offset - turn @ np.asarray(centre)
+    return rebuilt
+
+
 def robust_golden(
-    layers: np.ndarray, masks: np.ndarray, shifts: np.ndarray, quorum: int, floor: int = 2
+    layers: np.ndarray, masks: np.ndarray, motions: np.ndarray, quorum: int, floor: int = 2
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Shift every impression onto the common frame and take the median.
+    """Move every impression onto the common frame and take the median.
 
     ``quorum`` is the coverage the returned mask reports as trustworthy;
     ``floor`` is the coverage below which no value is emitted at all.
     """
     stack, coverage = [], []
-    for layer, mask, shift in zip(layers, masks, shifts):
-        stack.append(shift_image(layer, shift, cv2.INTER_CUBIC))
-        coverage.append(shift_image(mask.astype(np.uint8), shift, cv2.INTER_NEAREST) > 0)
+    for layer, mask, motion in zip(layers, masks, motions):
+        stack.append(move_image(layer, motion, cv2.INTER_CUBIC))
+        coverage.append(move_image(mask.astype(np.uint8), motion, cv2.INTER_NEAREST) > 0)
     values = np.stack(stack)
     seen = np.stack(coverage)
     values[~seen] = np.nan
@@ -88,16 +145,29 @@ def robust_golden(
 
 
 def register_pattern(
-    layers: np.ndarray, masks: np.ndarray, quorum: int, iterations: int, limit: float
+    layers: np.ndarray,
+    masks: np.ndarray,
+    quorum: int,
+    iterations: int,
+    limit: float,
+    spin: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Translation per impression, by correlation against the running template.
+    """Motion per impression, by correlation against the running template.
 
-    Sound for the main design, whose correlation peak is sharp and unique.  It
-    is deliberately not used for the periodic background screen.
+    Sound for any plate that printed a unique aperiodic pattern, whose
+    correlation peak is sharp and single.  It is deliberately not used for the
+    periodic background screen, where no such peak exists.
+
+    With ``spin`` set to a bearing in degrees the plate is also allowed to have
+    landed turned, and the returned motions are whole rigid transforms rather
+    than translations.  That is what a colour struck in its own press run
+    needs; a plate that printed in the same run as the template does not.
     """
-    shifts = np.zeros((len(layers), 2), np.float32)
+    warps = np.repeat(np.eye(2, 3, dtype=np.float32)[None], len(layers), axis=0)
     scores = np.full(len(layers), np.nan, np.float32)
-    template, _ = robust_golden(layers, masks, shifts, quorum, floor=quorum)
+    mode = cv2.MOTION_EUCLIDEAN if spin > 0.0 else cv2.MOTION_TRANSLATION
+    centre = (layers.shape[2] / 2.0, layers.shape[1] / 2.0)
+    template, _ = robust_golden(layers, masks, warps, quorum, floor=quorum)
     for _ in range(iterations):
         positive = template[template > 0]
         if len(positive) < 500:
@@ -112,30 +182,35 @@ def register_pattern(
             if len(inside) < 300:
                 continue
             moving = np.clip(layer / max(float(np.percentile(inside, 96)), 1e-6), 0, 1)
-            warp = np.array(
-                [[1.0, 0.0, shifts[index, 0]], [0.0, 1.0, shifts[index, 1]]], np.float32
-            )
+            warp = warps[index].copy()
             try:
                 score, warp = cv2.findTransformECC(
                     target,
                     moving,
                     warp,
-                    cv2.MOTION_TRANSLATION,
+                    mode,
                     (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 120, 1e-7),
                     inputMask=(support & masks[index].astype(np.uint8)) * 255,
                     gaussFiltSize=5,
                 )
             except cv2.error:
                 continue
-            candidate = warp[:, 2]
-            if np.all(np.isfinite(candidate)) and np.max(np.abs(candidate)) <= limit:
-                shifts[index] = candidate
+            if not np.all(np.isfinite(warp)):
+                continue
+            # Judge the fit by how far it moves the middle of the design, which
+            # a rotation about the top-left corner wildly overstates.
+            travel = warp @ np.array([centre[0], centre[1], 1.0]) - np.asarray(centre)
+            turned = abs(math.degrees(math.atan2(warp[1, 0], warp[0, 0])))
+            if np.max(np.abs(travel)) <= limit and turned <= max(spin, 1e-9):
+                warps[index] = warp
                 scores[index] = float(score)
         good = np.isfinite(scores)
         if good.any():
-            shifts[good] -= np.median(shifts[good], axis=0)
-        template, _ = robust_golden(layers, masks, shifts, quorum, floor=quorum)
-    return shifts, scores
+            warps[good] = recentre(warps[good], centre)
+        template, _ = robust_golden(layers, masks, warps, quorum, floor=quorum)
+    if mode == cv2.MOTION_TRANSLATION:
+        return warps[:, :, 2].copy(), scores
+    return warps, scores
 
 
 def shared_wave(patches: list[np.ndarray], start: np.ndarray) -> np.ndarray:
@@ -447,33 +522,87 @@ class Settings:
     window: int = 256  # phase window, px
     step: int = 128  # phase window stride, px
     panel_width: int = 760
+    inks: int = 4  # most colour plates to look for
+    separation: float = ink_palette.SEPARATION_DEG
+    spin_limit: float = 1.0  # most a colour plate may be turned, deg
+    screen_ink: int = 0  # which colour, if any, to also read as a screen
 
 
-def build(scan: Path, args: Settings) -> Path:
-    """Rebuild one scan's golden from its printing passes and write the panel."""
+@dataclass
+class Collection:
+    """One scan's impressions, already brought onto a common canvas."""
+
+    scan: Path
+    images: np.ndarray
+    valid: np.ndarray
+    numbers: list[int]
+    papers: np.ndarray
+    paper: np.ndarray
+    baseline: np.ndarray
+    covered: np.ndarray
+    corner: tuple[int, int]
+
+
+@dataclass
+class Pass:
+    """What one plate contributed, and how well it was recovered."""
+
+    name: str
+    golden: np.ndarray
+    seen: np.ndarray
+    ray: np.ndarray
+    density_note: str
+    ink_note: str
+    # Edges the rebuild is scored over.  Carried rather than derived from the
+    # golden above, so that an option which changes how many impressions merge
+    # is still measured over the same pixels as the run it is compared with.
+    band: np.ndarray | None = None
+
+
+def load_collection(scan: Path, args: Settings) -> Collection:
+    """Read the scan and its sidecars, and bring every impression onto one canvas."""
     perf_path = args.perf or scan.with_name(f"data_{scan.stem}_perf.json")
     design_path = args.design or scan.with_name(f"data_{scan.stem}_design.json")
-    output = args.output or scan.with_name(f"{scan.stem}_golden_components.png")
-
     perf = json.loads(perf_path.read_text(encoding="utf-8"))
     design = json.loads(design_path.read_text(encoding="utf-8"))
     images, valid, numbers = aligned_collection(scan, perf, design, args.downsample)
     print(f"Printing passes, from {len(numbers)} stamps on a "
           f"{images.shape[2]}x{images.shape[1]} canvas:")
 
-    ring = paper_ring(design, images.shape[1:3], args.downsample)
-    papers = estimate_papers(images, valid, ring)
-    paper = np.median(papers, axis=0)
-    baseline = np.clip(masked_colour_median(images, valid), 0, 255).astype(np.uint8)
-    covered = valid.sum(axis=0) >= max(3, math.ceil(0.6 * len(images)))
-
+    papers = estimate_papers(
+        images, valid, paper_ring(design, images.shape[1:3], args.downsample)
+    )
     # One screen window for the whole collection, so phases are comparable.
-    density, magnitude = optical_density(images[0], papers[0])
-    corner = screen_window(valid[0] & (magnitude < np.percentile(magnitude[valid[0]], 60)),
-                           images.shape[1:3])
+    _, magnitude = optical_density(images[0], papers[0])
+    corner = screen_window(
+        valid[0] & (magnitude < np.percentile(magnitude[valid[0]], 60)), images.shape[1:3]
+    )
+    return Collection(
+        scan=scan,
+        images=images,
+        valid=valid,
+        numbers=list(numbers),
+        papers=papers,
+        paper=np.median(papers, axis=0),
+        baseline=np.clip(masked_colour_median(images, valid), 0, 255).astype(np.uint8),
+        covered=valid.sum(axis=0) >= max(3, math.ceil(0.6 * len(images))),
+        corner=corner,
+    )
 
+
+def screen_passes(collection: Collection, args: Settings) -> list[Pass]:
+    """The main design, and the ruled screen printed behind it.
+
+    One press run laid both down, so the design is registered by correlation
+    and the screen by its own phase, against the same impressions.
+    """
+    scan, paper, covered, corner = (
+        collection.scan, collection.paper, collection.covered, collection.corner
+    )
     results, kept = [], []
-    for number, image, mask, stamp_paper in zip(numbers, images, valid, papers):
+    for number, image, mask, stamp_paper in zip(
+        collection.numbers, collection.images, collection.valid, collection.papers
+    ):
         try:
             result = separate(image, stamp_paper, mask, args.screen_tilt, corner)
         except RuntimeError as error:
@@ -501,9 +630,9 @@ def build(scan: Path, args: Settings) -> Path:
 
     quorum = max(3, math.ceil(0.6 * len(results)))
     readable = np.stack([r["valid"] & ~r["postmark"] for r in results])
-
     main_layers = np.stack(
-        [np.where(r["valid"] & ~r["postmark"], r["along_main"], 0.0).astype(np.float32) for r in results]
+        [np.where(r["valid"] & ~r["postmark"], r["along_main"], 0.0).astype(np.float32)
+         for r in results]
     )
     main_shifts, main_scores = register_pattern(
         main_layers, readable, quorum, args.iterations, args.shift_limit
@@ -517,168 +646,279 @@ def build(scan: Path, args: Settings) -> Path:
         f"{thin.sum() / max(covered.sum(), 1):.1%} on fewer than {quorum} impressions"
     )
 
-    layers = [golden_main]
-    rays = [main_ray]
-    if not args.no_background:
-        anchor = int(np.argmax([r["snr"] * r["coherence"] for r in results]))
-
-        # Bring every screen to a common bearing before matching phase.  The
-        # passes come off separate plates, so their relative rotation is a free
-        # parameter; left uncorrected it stops impressions from phasing up.
-        turned, bearings, reference = derotate(
-            results, corner, results[anchor]["wave"], args.window, args.step
+    passes = [
+        Pass(
+            name="main pass",
+            golden=golden_main,
+            seen=seen_main,
+            ray=main_ray,
+            density_note=f"main pass, density; ECC {np.nanmedian(main_scores):.2f}",
+            ink_note="main pass in its own ink "
+                     f"{bgr_hex(to_srgb(to_linear(paper) * 10.0 ** (-main_ray)))}",
+            band=edge_band(golden_main, covered & seen_main),
         )
-        back = background_golden(turned, corner, anchor, args.downsample)
-        # Refit the bearings on the rotated layers.  If the sign of the
-        # correction were wrong this spread would double rather than close.
-        settled = np.array(
-            [
-                fit_wave(r["density"], r["field"], back["wave"], args.window, args.step)[
-                    "bearing"
-                ]
-                for r in turned
-            ]
-        )
-        golden_back, seen_back = back["golden"], back["seen"]
-        used, skipped, trail = back["used"], back["skipped"], back["trail"]
-        print(
-            f"  background pass: anchored on stamp {results[anchor]['number']}, "
-            f"shared screen {back['pitch']:.3f} px, phase lock {back['lock']:.2f}, "
-            f"shift span {np.ptp(back['shifts'][:, 0]) * args.downsample:.2f}"
-            f"x{np.ptp(back['shifts'][:, 1]) * args.downsample:.2f} px"
-        )
-        print(
-            f"    bearing brought to {reference:+.3f} deg: spread "
-            f"{np.ptp(bearings):.3f} -> {np.ptp(settled):.3f} deg "
-            f"(sd {np.std(bearings):.3f} -> {np.std(settled):.3f})"
-        )
-        print(
-            f"    screen strength: best single {trail[0]:.2f}, "
-            f"merge of {len(back['chosen'])} {trail[-1]:.2f}, "
-            f"all {len(results)} merged {back['all_merged']:.2f}"
-        )
-        for index, result in enumerate(results):
-            place = back["chosen"].index(index) + 1 if index in back["chosen"] else 0
-            print(
-                f"    stamp {result['number']:2d}: alone {back['alone'][index]:6.2f}  "
-                + (f"used {place}; merge {trail[place - 1]:6.2f}" if place else "skipped")
-            )
-        print(f"    used     {used}")
-        print(f"    skipped  {skipped}")
-        back_quorum = back["quorum"]
-        back_layers, field = back["layers"], back["field"]
-        back_shifts, chosen = back["shifts"], back["chosen"]
+    ]
+    if args.no_background:
+        return passes
 
-        selection = {
-            "scan": scan.name,
-            "screen_pitch_px": back["pitch"],
-            "reference_bearing_deg": reference,
-            "bearing_deg": {
-                str(r["number"]): float(b) for r, b in zip(results, bearings)
-            },
-            "best_single": trail[0],
-            "merged": trail[-1],
-            "used": used,
-            "skipped": skipped,
-            "strength_alone": {
-                str(result["number"]): back["alone"][index]
-                for index, result in enumerate(results)
-            },
-        }
-
-        sidecar = scan.with_name(f"data_{scan.stem}_background_selection.json")
-        sidecar.write_text(json.dumps(selection, indent=2), encoding="utf-8")
-        print(f"  Wrote {sidecar}")
-
-        layers.append(golden_back)
-        rays.append(back_ray)
-
-    rebuilt = reconstruct(layers, rays, paper)
-    band = edge_band(golden_main, covered & seen_main)
-    before = sharpness(baseline, band)
-    after = sharpness(rebuilt, band)
-    gain = after / max(before, 1e-6) - 1
-    print(
-        f"  design edge energy over {band.sum()} edge pixels: "
-        f"golden {before:.2f} -> rebuilt {after:.2f} ({gain:+.1%})"
+    anchor = int(np.argmax([r["snr"] * r["coherence"] for r in results]))
+    # Bring every screen to a common bearing before matching phase.  The passes
+    # come off separate plates, so their relative rotation is a free parameter;
+    # left uncorrected it stops impressions from phasing up.
+    turned, bearings, reference = derotate(
+        results, corner, results[anchor]["wave"], args.window, args.step
     )
+    back = background_golden(turned, corner, anchor, args.downsample)
+    # Refit the bearings on the rotated layers.  If the sign of the correction
+    # were wrong this spread would double rather than close.
+    settled = np.array(
+        [fit_wave(r["density"], r["field"], back["wave"], args.window, args.step)["bearing"]
+         for r in turned]
+    )
+    trail, used, skipped = back["trail"], back["used"], back["skipped"]
+    print(
+        f"  background pass: anchored on stamp {results[anchor]['number']}, "
+        f"shared screen {back['pitch']:.3f} px, phase lock {back['lock']:.2f}, "
+        f"shift span {np.ptp(back['shifts'][:, 0]) * args.downsample:.2f}"
+        f"x{np.ptp(back['shifts'][:, 1]) * args.downsample:.2f} px"
+    )
+    print(
+        f"    bearing brought to {reference:+.3f} deg: spread "
+        f"{np.ptp(bearings):.3f} -> {np.ptp(settled):.3f} deg "
+        f"(sd {np.std(bearings):.3f} -> {np.std(settled):.3f})"
+    )
+    report_selection(back, results, len(results))
+
+    selection = {
+        "scan": scan.name,
+        "screen_pitch_px": back["pitch"],
+        "reference_bearing_deg": reference,
+        "bearing_deg": {str(r["number"]): float(b) for r, b in zip(results, bearings)},
+        "best_single": trail[0],
+        "merged": trail[-1],
+        "used": used,
+        "skipped": skipped,
+        "strength_alone": {
+            str(result["number"]): back["alone"][index]
+            for index, result in enumerate(results)
+        },
+    }
+    sidecar = scan.with_name(f"data_{scan.stem}_background_selection.json")
+    sidecar.write_text(json.dumps(selection, indent=2), encoding="utf-8")
+    print(f"  Wrote {sidecar}")
 
     if args.validate:
         print("  half-set agreement (structure the halves independently agree on):")
-        one = half_set_agreement(main_layers, readable, main_shifts, quorum, covered)
-        print(f"    main pass       {one:+.3f}")
-        if not args.no_background:
-            two = half_set_agreement(
-                back_layers[chosen], field[chosen], back_shifts[chosen], back_quorum, covered
-            )
-            unaligned = half_set_agreement(
-                back_layers[chosen],
-                field[chosen],
-                np.zeros_like(back_shifts[chosen]),
-                back_quorum,
-                covered,
-            )
-            if math.isnan(two):
-                print(
-                    f"    background pass: {len(chosen)} impressions kept, too few to "
-                    "split into halves"
-                )
-            else:
-                print(f"    background pass {two:+.3f} (unaligned control {unaligned:+.3f})")
-            if not math.isnan(two) and two < 0.2:
-                print(
-                    "    The background golden is not reproduced by independent halves.\n"
-                    "    Read that pass off single impressions with background_ink.py."
-                )
+        print(f"    main pass       "
+              f"{half_set_agreement(main_layers, readable, main_shifts, quorum, covered):+.3f}")
+        report_halves(back, covered)
 
-    # Two columns: each pass sits beside what it contributes to, density on the
-    # left and the same layer in its own ink on the right.
-    rows: list[list[tuple[np.ndarray, str]]] = [
-        [
-            (
-                baseline,
-                f"{scan.stem}: golden as averaged now ({len(results)} stamps), "
-                f"paper {bgr_hex(paper)}",
-            ),
-            (rebuilt, f"rebuilt from its passes; design edge energy {gain:+.1%}"),
-        ],
-        [
-            (
-                cv2.cvtColor(contrast(golden_main, seen_main), cv2.COLOR_GRAY2BGR),
-                f"main pass, density; ECC {np.nanmedian(main_scores):.2f}",
-            ),
-            (
-                render_ink(golden_main, paper, main_ray),
-                "main pass in its own ink "
-                f"{bgr_hex(to_srgb(to_linear(paper) * 10.0 ** (-main_ray)))}",
-            ),
-        ],
-    ]
-    if not args.no_background:
-        rows.append(
-            [
-                (
-                    cv2.cvtColor(contrast(golden_back, seen_back), cv2.COLOR_GRAY2BGR),
-                    f"background pass, density; screen {pitch * args.downsample:.2f} px "
-                    f"at {reference:+.2f} deg; "
-                    f"merged {','.join(str(n) for n in used)} of {len(results)}",
-                ),
-                (
-                    render_ink(golden_back, paper, back_ray),
-                    f"background in its own ink, {hue:.0f} deg from main; "
-                    f"strength {trail[-1]:.1f} vs {trail[0]:.1f} single",
-                ),
-            ]
+    passes.append(
+        Pass(
+            name="background pass",
+            golden=back["golden"],
+            seen=back["seen"],
+            ray=back_ray,
+            density_note=f"background pass, density; screen {pitch * args.downsample:.2f} px "
+                         f"at {reference:+.2f} deg; "
+                         f"merged {','.join(str(n) for n in used)} of {len(results)}",
+            ink_note=f"background in its own ink, {hue:.0f} deg from main; "
+                     f"strength {trail[-1]:.1f} vs {trail[0]:.1f} single",
+        )
+    )
+    return passes
+
+
+def report_selection(back: dict, results: list[dict], total: int) -> None:
+    trail = back["trail"]
+    print(
+        f"    screen strength: best single {trail[0]:.2f}, "
+        f"merge of {len(back['chosen'])} {trail[-1]:.2f}, "
+        f"all {total} merged {back['all_merged']:.2f}"
+    )
+    for index, result in enumerate(results):
+        place = back["chosen"].index(index) + 1 if index in back["chosen"] else 0
+        print(
+            f"    stamp {result['number']:2d}: alone {back['alone'][index]:6.2f}  "
+            + (f"used {place}; merge {trail[place - 1]:6.2f}" if place else "skipped")
+        )
+    print(f"    used     {back['used']}")
+    print(f"    skipped  {back['skipped']}")
+
+
+def report_halves(back: dict, covered: np.ndarray) -> None:
+    """Whether two disjoint halves of the kept impressions agree on the screen."""
+    chosen = back["chosen"]
+    layers, field, shifts = back["layers"][chosen], back["field"][chosen], back["shifts"][chosen]
+    agreement = half_set_agreement(layers, field, shifts, back["quorum"], covered)
+    control = half_set_agreement(
+        layers, field, np.zeros_like(shifts), back["quorum"], covered
+    )
+    if math.isnan(agreement):
+        print(f"    background pass: {len(chosen)} impressions kept, too few to split")
+        return
+    print(f"    background pass {agreement:+.3f} (unaligned control {control:+.3f})")
+    if agreement < 0.2:
+        print(
+            "    The background golden is not reproduced by independent halves.\n"
+            "    Read that pass off single impressions with background_ink.py."
         )
 
+
+def colour_layers(
+    collection: Collection, rays: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split every impression between the inks, and say where it is readable.
+
+    The postmark is measured separately from the split rather than solved for
+    alongside the inks, which is what keeps a nearly achromatic plate intact.
+    """
+    count, shape = len(rays), collection.images.shape[1:3]
+    layers = np.zeros((count, len(collection.images), *shape), np.float32)
+    readable = np.zeros((len(collection.images), *shape), bool)
+    for index, (image, mask, paper) in enumerate(
+        zip(collection.images, collection.valid, collection.papers)
+    ):
+        density, _ = optical_density(image, paper)
+        amounts = unmix(density, rays)
+        readable[index] = mask & ~ink_palette.postmark_mask(amounts, mask)
+        for ink in range(count):
+            layers[ink, index] = np.where(readable[index], amounts[ink], 0.0)
+    return layers, readable
+
+
+def screen_from_colour(
+    collection: Collection, layers: np.ndarray, readable: np.ndarray, ray: np.ndarray, args: Settings
+) -> dict:
+    """Read one colour plate as a ruled screen and merge it on its phase.
+
+    The engraved ground of a plate is periodic where its design is not, so the
+    phase of that ruling locates the impression far more finely than its
+    outline does.  This hands the colour to the machinery the screened
+    single-colour stamps already use, unchanged.
+    """
+    entries = []
+    for index, number in enumerate(collection.numbers):
+        coverage = layers[index]
+        # The solid lines of the design are held out along with the postmark,
+        # leaving the engraved ground.  Where the plate laid down nothing at all
+        # the coverage is a measured zero, not a gap, so those pixels stay in:
+        # holding them out as well would starve the windows the phase is read
+        # over, since one plate covers only part of the design.
+        present = readable[index] & (coverage > 0.0)
+        if present.sum() < 15000:
+            continue
+        heavy = cv2.dilate(
+            (coverage > np.percentile(coverage[present], 85)).astype(np.uint8),
+            np.ones((5, 5), np.uint8),
+        ) > 0
+        field = readable[index] & ~heavy
+        density = coverage[:, :, None] * ray[None, None, :]
+        try:
+            screen = background_ink.screen_ray(
+                density, field, (7.5, 10.5), args.screen_tilt, collection.corner
+            )
+        except RuntimeError as error:
+            print(f"    stamp {number:2d}: {error}")
+            continue
+        entries.append(
+            {**screen, "number": number, "density": density, "coverage": coverage,
+             "field": field, "valid": collection.valid[index]}
+        )
+    if len(entries) < 5:
+        raise RuntimeError("Too few impressions carry a readable ruling in that ink")
+
+    anchor = int(np.argmax([e["snr"] * e["coherence"] for e in entries]))
+    turned, bearings, reference = derotate(
+        entries, collection.corner, entries[anchor]["wave"], args.window, args.step
+    )
+    merged = background_golden(turned, collection.corner, anchor, args.downsample)
+    merged["bearings"] = bearings
+    merged["reference"] = reference
+    merged["entries"] = entries
+    merged["anchor"] = anchor
+    return merged
+
+
+def colour_passes(collection: Collection, palette: dict, args: Settings) -> list[Pass]:
+    """One pass per colour plate, each registered on its own evidence.
+
+    These plates went through the press separately, so each landed with its own
+    small shift *and* its own small turn, and nothing ties them together.  Each
+    colour is therefore registered against its own running template as a rigid
+    motion, not as a shift.
+    """
+    rays, shares = palette["rays"], palette["shares"]
+    layers, readable = colour_layers(collection, rays)
+    quorum = max(3, math.ceil(0.6 * len(collection.images)))
+    passes = []
+    for ink, (ray, share) in enumerate(zip(rays, shares)):
+        colour = bgr_hex(ink_palette.ink_colour(collection.paper, ray))
+        name = f"ink {ink + 1} {colour}"
+        warps, scores = register_pattern(
+            layers[ink], readable, quorum, args.iterations, args.shift_limit, args.spin_limit
+        )
+        turns = np.degrees(np.arctan2(warps[:, 1, 0], warps[:, 0, 0]))
+        centre = np.array([collection.images.shape[2] / 2.0, collection.images.shape[1] / 2.0])
+        travel = warps @ np.array([centre[0], centre[1], 1.0]) - centre
+        golden, seen = robust_golden(layers[ink], readable, warps, quorum)
+        band = edge_band(golden, collection.covered & seen) if ink == 0 else None
+        print(
+            f"  {name}, {share:.0%} of the ink: turn sd {np.std(turns):.3f} deg "
+            f"(spread {np.ptp(turns):.3f}), centre travel "
+            f"{np.ptp(travel[:, 0]) * args.downsample:.2f}"
+            f"x{np.ptp(travel[:, 1]) * args.downsample:.2f} px, "
+            f"median ECC {np.nanmedian(scores):.3f}"
+        )
+        note = f"turn sd {np.std(turns):.3f} deg, ECC {np.nanmedian(scores):.2f}"
+
+        if args.screen_ink == ink + 1:
+            print(f"    reading {name} as a ruled screen as well:")
+            crisped = screen_from_colour(collection, layers[ink], readable, ray, args)
+            settled = np.array(
+                [fit_wave(e["density"], e["field"], crisped["wave"], args.window, args.step)
+                 ["bearing"] for e in crisped["entries"]]
+            )
+            print(
+                f"    screen {crisped['pitch']:.3f} px, phase lock {crisped['lock']:.2f}, "
+                f"bearing brought to {crisped['reference']:+.3f} deg: spread "
+                f"{np.ptp(crisped['bearings']):.3f} -> {np.ptp(settled):.3f} deg"
+            )
+            report_selection(crisped, crisped["entries"], len(crisped["entries"]))
+            golden, seen = crisped["golden"], crisped["seen"]
+            note = (f"screen {crisped['pitch'] * args.downsample:.2f} px at "
+                    f"{crisped['reference']:+.2f} deg, merged "
+                    f"{len(crisped['chosen'])} of {len(crisped['entries'])}")
+
+        if args.validate:
+            agreement = half_set_agreement(layers[ink], readable, warps, quorum, collection.covered)
+            print(f"    half-set agreement {agreement:+.3f}")
+
+        passes.append(
+            Pass(
+                name=name,
+                golden=golden,
+                seen=seen,
+                ray=ray,
+                density_note=f"{name}, density; {note}",
+                ink_note=f"{name} in its own ink, {share:.0%} of the inked area",
+                band=band,
+            )
+        )
+    return passes
+
+
+def write_panel(
+    rows: list[list[tuple[np.ndarray, str]]], output: Path, width: int
+) -> Path:
     rendered = []
     for row in rows:
         cells = []
         for image, text in row:
-            factor = args.panel_width / image.shape[1]
+            factor = width / image.shape[1]
             resized = cv2.resize(
                 image,
-                (args.panel_width, max(1, int(round(image.shape[0] * factor)))),
+                (width, max(1, int(round(image.shape[0] * factor)))),
                 interpolation=cv2.INTER_AREA if factor < 1 else cv2.INTER_CUBIC,
             )
             cells.append(add_label(resized, text))
@@ -692,8 +932,60 @@ def build(scan: Path, args: Settings) -> Path:
         rendered.append(np.hstack(padded))
     sheet = np.vstack(rendered)
     if not cv2.imwrite(str(output), sheet):
-        raise RuntimeError(
-            f"Cannot write image: {output} ({sheet.shape} {sheet.dtype})"
-        )
+        raise RuntimeError(f"Cannot write image: {output} ({sheet.shape} {sheet.dtype})")
     print(f"Wrote {output}")
     return output
+
+
+def build(scan: Path, args: Settings) -> Path:
+    """Rebuild one scan's golden from its printing passes and write the panel."""
+    output = args.output or scan.with_name(f"{scan.stem}_golden_components.png")
+    collection = load_collection(scan, args)
+
+    palette = ink_palette.find_palette(
+        ink_palette.ink_directions(collection.images, collection.valid, collection.papers),
+        args.inks,
+        args.separation,
+    )
+    print("  " + ink_palette.describe(palette, collection.paper))
+
+    # Several colours mean several press runs, each free to have landed turned.
+    # One colour means one run, with the ruled ground printed alongside it.
+    if palette["count"] > 1:
+        passes = colour_passes(collection, palette, args)
+    else:
+        passes = screen_passes(collection, args)
+
+    rebuilt = reconstruct(
+        [p.golden for p in passes], [p.ray for p in passes], collection.paper
+    )
+    band = passes[0].band
+    if band is None:
+        band = edge_band(passes[0].golden, collection.covered & passes[0].seen)
+    before = sharpness(collection.baseline, band)
+    after = sharpness(rebuilt, band)
+    gain = after / max(before, 1e-6) - 1
+    print(
+        f"  design edge energy over {band.sum()} edge pixels: "
+        f"golden {before:.2f} -> rebuilt {after:.2f} ({gain:+.1%})"
+    )
+
+    # Two columns: each pass sits beside what it contributes to, density on the
+    # left and the same layer in its own ink on the right.
+    rows = [
+        [
+            (collection.baseline,
+             f"{scan.stem}: golden as averaged now ({len(collection.numbers)} stamps), "
+             f"paper {bgr_hex(collection.paper)}"),
+            (rebuilt, f"rebuilt from its passes; design edge energy {gain:+.1%}"),
+        ]
+    ]
+    for entry in passes:
+        rows.append(
+            [
+                (cv2.cvtColor(contrast(entry.golden, entry.seen), cv2.COLOR_GRAY2BGR),
+                 entry.density_note),
+                (render_ink(entry.golden, collection.paper, entry.ray), entry.ink_note),
+            ]
+        )
+    return write_panel(rows, output, args.panel_width)
