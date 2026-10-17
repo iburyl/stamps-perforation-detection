@@ -206,14 +206,53 @@ def screen_ray(
     }
 
 
+MIN_SEPARABILITY = 0.02
+
+
+def coverage_against(
+    frame: np.ndarray, density: np.ndarray, ink_ray: np.ndarray
+) -> tuple[np.ndarray, float]:
+    """Read one impression's background coverage in a given colour basis.
+
+    Both inks belong to the issue, not to the impression, so the caller is
+    expected to estimate them once from the whole collection and project every
+    impression through the one basis.  Where the two inks are far apart it
+    hardly matters.  Where they are close it decides everything: on 5K, 8.6
+    degrees apart, the per-impression ray estimate wanders by 2.8 degrees, and
+    that is enough to put the screen on the wrong side of the main plane.
+    Separability there ran from -0.042 to +0.148, so one impression's coverage
+    came out inverted and the rest came out on scales differing sevenfold, which
+    no median can combine -- and indeed only one impression of thirteen was ever
+    merged.  Through a shared basis they all come out alike.
+    """
+    separability = float(ink_ray @ frame[2])
+    if abs(separability) < MIN_SEPARABILITY:
+        raise RuntimeError(
+            f"Background ink is only {separability:+.3f} clear of the main plane"
+        )
+    # Dividing by the separability multiplies the noise by the same factor, so a
+    # matched smoothing at the scale of one screen dot follows.  Both steps are
+    # linear and signed, so noise is never rectified into pattern.
+    coverage = cv2.GaussianBlur(
+        ((density @ frame[2]) / separability).astype(np.float32), (0, 0), 0.8
+    )
+    return coverage, separability
+
+
 def separate(
     image: np.ndarray,
     paper: np.ndarray,
     valid: np.ndarray,
     tilt: float,
     corner: tuple[int, int] | None = None,
+    min_separability: float = MIN_SEPARABILITY,
 ) -> dict:
-    """Split one impression into main ink, postmark and background ink."""
+    """Split one impression into main ink, postmark and background ink.
+
+    ``min_separability`` is relaxed to zero by callers that will re-read the
+    coverage against the collection's shared ink ray afterwards, since this
+    impression's own estimate is then not the one that has to be sound.
+    """
     density, magnitude = optical_density(image, paper)
     ray = main_ray(density, magnitude, valid)
     frame = orthonormal_frame(ray)
@@ -233,16 +272,16 @@ def separate(
 
     screen = screen_ray(density, field, (7.5, 10.5), tilt, corner)
     separability = float(screen["ray"] @ frame[2])
-    if abs(separability) < 0.02:
+    if abs(separability) < min_separability:
         raise RuntimeError(
             f"Background ink is only {separability:+.3f} clear of the main plane"
         )
-
-    # Coverage in the background ink's own density units.  Dividing by the
-    # separability multiplies the noise by the same factor, so a matched
-    # smoothing at the scale of one screen dot follows.  Both steps are linear
-    # and signed, so noise is never rectified into pattern.
-    coverage = cv2.GaussianBlur((remainder / separability).astype(np.float32), (0, 0), 0.8)
+    try:
+        coverage, _ = coverage_against(frame, density, screen["ray"])
+    except RuntimeError:
+        # The caller relaxed the test, so it means to re-read this impression
+        # against the collection's shared ray; its own ray cannot carry it.
+        coverage = np.zeros_like(remainder, np.float32)
 
     strength = float(np.percentile(magnitude[field], 90))
     ink_linear = to_linear(np.asarray(paper, np.float64)) * 10.0 ** (-screen["ray"] * strength)

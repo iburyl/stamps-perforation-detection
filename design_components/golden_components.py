@@ -240,9 +240,20 @@ def phase_shifts(results: list[dict], corner: tuple[int, int], anchor: int) -> t
     Every phase is read in the same window at the same frequency, so the
     differences are comparable.  Only the component along the wave vector is
     recoverable; sliding along the ruling leaves the screen unchanged.
+
+    The phase is read in the extracted screen itself, not in the density it came
+    out of.  Those are different projections of the same colour -- the screen is
+    the sliver of density standing clear of the main ink's plane, while a
+    reading off the raw density is dominated by what the channels have in common
+    -- and they only agree when the two inks are well separated.  On 5K, where
+    the sliver is six hundredths of the density, they disagreed by 59 degrees of
+    phase, so the impressions were aligned to the wrong thing and merging them
+    cancelled the ruling instead of building it.  Read in the layer that is
+    actually being merged, the same impressions agree to 1.3 degrees.
     """
     patches = [
-        background_ink.screen_patch(r["density"], r["field"], corner) for r in results
+        background_ink.screen_patch(r["coverage"][:, :, None], r["field"], corner)
+        for r in results
     ]
     wave = shared_wave(patches, results[anchor]["wave"])
     shifts = np.zeros((len(results), 2), np.float32)
@@ -251,10 +262,9 @@ def phase_shifts(results: list[dict], corner: tuple[int, int], anchor: int) -> t
         return shifts, wave, 0.0
     phases, weights = [], []
     for patch in patches:
-        coefficients = background_ink.screen_coefficient(patch, wave)
-        total = coefficients.sum()
-        phases.append(np.angle(total))
-        weights.append(abs(total) / max(float(np.sum(np.abs(coefficients))), 1e-12))
+        coefficient = background_ink.screen_coefficient(patch, wave)[0]
+        phases.append(np.angle(coefficient))
+        weights.append(abs(coefficient))
     reference = phases[anchor]
     for index, phase in enumerate(phases):
         turns = (phase - reference) / (2.0 * math.pi)
@@ -265,21 +275,14 @@ def phase_shifts(results: list[dict], corner: tuple[int, int], anchor: int) -> t
     return shifts, wave, float(np.median(weights))
 
 
-def screen_strength(layer: np.ndarray, mask: np.ndarray, corner, wave: np.ndarray) -> float:
-    """How far the ruling stands above the broadband floor in one layer.
-
-    This is the crispness measure for the background, and it is comparable
-    between a single impression and an average of several, which mean gradient
-    magnitude is not: noise raises a gradient but not a Fourier peak.  A merge
-    that reinforces the screen scores above its parts, a merge that smears it
-    scores below them.
-    """
+def screen_peak_floor(layer: np.ndarray, mask: np.ndarray, corner, wave: np.ndarray) -> tuple:
+    """The ruling's Fourier amplitude, and the broadband floor beside it."""
     size = background_ink.SCREEN_WINDOW
     y0, x0 = corner
     box = (slice(y0, y0 + size), slice(x0, x0 + size))
     weight = mask[box].astype(np.float64)
     if weight.sum() < 15000:
-        return 0.0
+        return 0.0, 0.0
     patch = layer[box].astype(np.float64)
     patch = patch - patch[weight > 0].mean()
     patch = patch * np.outer(np.hanning(size), np.hanning(size)) * weight
@@ -296,15 +299,60 @@ def screen_strength(layer: np.ndarray, mask: np.ndarray, corner, wave: np.ndarra
             np.hypot(xx - centre - sign * wave[0] * size, yy - centre - sign * wave[1] * size)
             > 6.0
         )
-    floor = float(np.median(spectrum[ring])) if ring.any() else 0.0
+    return float(peak), float(np.median(spectrum[ring])) if ring.any() else 0.0
+
+
+def screen_strength(layer: np.ndarray, mask: np.ndarray, corner, wave: np.ndarray) -> float:
+    """How far the ruling stands above the broadband floor in one layer.
+
+    This is the crispness measure for the background, and it is comparable
+    between a single impression and an average of several, which mean gradient
+    magnitude is not: noise raises a gradient but not a Fourier peak.  A merge
+    that reinforces the screen scores above its parts, a merge that smears it
+    scores below them.
+    """
+    peak, floor = screen_peak_floor(layer, mask, corner, wave)
     return float(peak / max(floor, 1e-9))
+
+
+def blend(values: np.ndarray, seen: np.ndarray, weights: np.ndarray, floor: int = 1):
+    """Weighted mean of the impressions that cover each pixel.
+
+    Impressions differ several-fold in how much background ink they took, and
+    they differ again in how noisy that ink reads.  A median throws both facts
+    away and returns the middling impression; a weighted mean keeps the
+    well-inked, quiet ones in proportion.  This is safe here only because the
+    layers have been put in one colour basis, so they share a sign and a scale,
+    and because the field already excludes postmarks and heavy ink, so there
+    are no outliers left for a median to guard against.
+    """
+    spread = weights[:, None, None] * seen
+    total = spread.sum(axis=0)
+    golden = (values * spread).sum(axis=0) / np.maximum(total, 1e-9)
+    golden[seen.sum(axis=0) < floor] = 0.0
+    return golden
+
+
+def matched_weights(cropped: np.ndarray, covered: np.ndarray, wave: np.ndarray) -> np.ndarray:
+    """Weight each impression by the ruling it brings per unit of its own noise.
+
+    Maximising the merged screen against the merged noise wants amplitude over
+    variance, so an impression that carries twice the ruling counts twice, and
+    one that carries twice the noise counts a quarter.
+    """
+    weights = []
+    for layer, mask in zip(cropped, covered):
+        peak, floor = screen_peak_floor(layer, mask, (0, 0), wave)
+        weights.append(peak / max(floor, 1e-9) ** 2)
+    weights = np.array(weights, np.float64)
+    return weights / max(weights.max(), 1e-12)
 
 
 def window_scorer(layers: np.ndarray, masks: np.ndarray, shifts: np.ndarray, corner, wave):
     """Score any subset of impressions by the crispness of their merge.
 
     The shifted layers are cropped to the shared screen window once, so trying
-    a subset costs only a median over it.
+    a subset costs only a weighted mean over it.
     """
     size = background_ink.SCREEN_WINDOW
     y0, x0 = corner
@@ -314,53 +362,67 @@ def window_scorer(layers: np.ndarray, masks: np.ndarray, shifts: np.ndarray, cor
         cropped.append(shift_image(layer, shift, cv2.INTER_CUBIC)[window])
         covered.append(shift_image(mask.astype(np.uint8), shift, cv2.INTER_NEAREST)[window] > 0)
     cropped, covered = np.stack(cropped), np.stack(covered)
+    weights = matched_weights(cropped, covered, wave)
 
     def score(members) -> float:
         members = list(members)
-        values = cropped[members].astype(np.float64)
-        seen = covered[members]
-        values[~seen] = np.nan
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            golden = np.nanmedian(values, axis=0)
-        enough = seen.sum(axis=0) >= max(1, len(members) // 2)
-        golden[~np.isfinite(golden) | ~enough] = 0.0
+        golden = blend(cropped[members].astype(np.float64), covered[members], weights[members])
+        enough = covered[members].sum(axis=0) >= max(1, len(members) // 2)
+        golden[~enough] = 0.0
         return screen_strength(golden, enough, (0, 0), wave)
 
-    return score
+    return score, weights
 
 
 def choose_impressions(score, count: int) -> tuple[list[int], list[float], list[float]]:
-    """Greedily keep only the impressions whose merge sharpens the screen.
+    """Drop only the impressions whose presence blunts the merge.
 
-    Averaging every impression is wrong here.  The screen is quasi-periodic, so
-    impressions whose ruling does not actually phase up with the rest subtract
-    modulation instead of adding it, and the merge ends up flatter than the
-    single impressions it came from.  Each candidate is admitted only if the
-    golden is crisper with it than without.
+    Averaging every impression is not automatically right: the screen is
+    quasi-periodic, so an impression whose ruling does not phase up with the
+    rest subtracts modulation instead of adding it.  But the search has to run
+    backwards, from the whole set, because growing one forwards walks into a
+    dead end.  On 5K the strongest impression scores 44 alone, every one of its
+    fourteen pairings scores less, and all fifteen together score 57: the
+    impressions only pay off in bulk, each one adding a little ruling and a
+    little less noise than it adds ruling, and no pair shows that.
     """
     alone = [score([index]) for index in range(count)]
-    chosen = [int(np.argmax(alone))]
-    trail = [alone[chosen[0]]]
-    remaining = [index for index in range(count) if index not in chosen]
-    while remaining:
-        best, index = max((score(chosen + [candidate]), candidate) for candidate in remaining)
+    chosen = list(range(count))
+    trail = [score(chosen)]
+    while len(chosen) > 2:
+        best, drop = max(
+            (score([i for i in chosen if i != candidate]), candidate) for candidate in chosen
+        )
         if best <= trail[-1]:
             break
-        chosen.append(index)
+        chosen.remove(drop)
         trail.append(best)
-        remaining.remove(index)
     return chosen, trail, alone
+
+
+def screen_golden(
+    layers: np.ndarray, masks: np.ndarray, shifts: np.ndarray, weights: np.ndarray, quorum: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Shift the screen layers onto the common frame and take the weighted mean."""
+    stack, coverage = [], []
+    for layer, mask, shift in zip(layers, masks, shifts):
+        stack.append(shift_image(layer, shift, cv2.INTER_CUBIC))
+        coverage.append(shift_image(mask.astype(np.uint8), shift, cv2.INTER_NEAREST) > 0)
+    values, seen = np.stack(stack).astype(np.float64), np.stack(coverage)
+    golden = blend(values, seen, weights)
+    return golden.astype(np.float32), seen.sum(axis=0) >= quorum
 
 
 def select_and_merge(
     layers: np.ndarray, field: np.ndarray, shifts: np.ndarray, corner, wave: np.ndarray
 ) -> dict:
     """Keep only the impressions whose merge sharpens the screen, then merge them."""
-    score = window_scorer(layers, field, shifts, corner, wave)
+    score, weights = window_scorer(layers, field, shifts, corner, wave)
     chosen, trail, alone = choose_impressions(score, len(layers))
-    quorum = max(2, len(chosen) // 2)
-    golden, seen = robust_golden(layers[chosen], field[chosen], shifts[chosen], quorum)
+    quorum = min(len(chosen), max(2, len(chosen) // 2))
+    golden, seen = screen_golden(
+        layers[chosen], field[chosen], shifts[chosen], weights[chosen], quorum
+    )
     return {
         "golden": golden,
         "seen": seen,
@@ -376,15 +438,41 @@ def select_and_merge(
     }
 
 
+def merge_gain(merged: dict, corner, wave: np.ndarray) -> float:
+    """Screen amplitude of the merge against the average of one impression.
+
+    Above one the impressions reinforced; below one they cancelled, which is
+    the thing to watch, since a merge can come out smoother than any single
+    impression while holding less ruling than any of them.
+    """
+    chosen = merged["chosen"]
+    singles = [
+        abs(background_ink.screen_coefficient(
+            background_ink.screen_patch(
+                merged["layers"][index][:, :, None], merged["field"][index], corner
+            ),
+            wave,
+        )[0])
+        for index in chosen
+    ]
+    together = abs(background_ink.screen_coefficient(
+        background_ink.screen_patch(
+            merged["golden"][:, :, None], merged["seen"], corner
+        ),
+        wave,
+    )[0])
+    return float(together / max(np.mean(singles), 1e-9))
+
+
 def background_golden(results: list[dict], corner, anchor: int, downsample: int) -> dict:
     """Phase-register, select and merge the background pass of a collection."""
     field = np.stack([r["field"] for r in results])
     layers = np.stack(
         [np.where(r["field"], r["coverage"], 0.0).astype(np.float32) for r in results]
     )
-    shifts, wave, lock = phase_shifts(results, corner, anchor)
+    shifts, wave, _ = phase_shifts(results, corner, anchor)
     merged = select_and_merge(layers, field, shifts, corner, wave)
-    merged["lock"] = lock
+    merged["gain"] = merge_gain(merged, corner, wave)
     merged["pitch"] = 1.0 / max(float(np.hypot(*wave)), 1e-9) * downsample
     merged["used"] = [results[index]["number"] for index in merged["chosen"]]
     merged["skipped"] = [
@@ -464,19 +552,35 @@ def sharpness(image: np.ndarray, mask: np.ndarray) -> float:
 
 
 def half_set_agreement(
-    layers: np.ndarray, masks: np.ndarray, shifts: np.ndarray, quorum: int, mask: np.ndarray
+    layers: np.ndarray,
+    masks: np.ndarray,
+    shifts: np.ndarray,
+    quorum: int,
+    mask: np.ndarray,
+    weights: np.ndarray | None = None,
 ) -> float:
     """Correlation of two goldens built from disjoint halves of the collection.
 
     Structure the two halves do not agree on was produced by the averaging, not
-    recovered by it.
+    recovered by it.  Each half is built the way the pass itself is built, so
+    the check answers a question about the pipeline rather than about a merge
+    rule the pipeline does not use.
     """
     order = np.arange(len(layers))
     first, second = order[0::2], order[1::2]
     if len(first) < 2 or len(second) < 2:
         return float("nan")
-    one, seen_one = robust_golden(layers[first], masks[first], shifts[first], max(2, quorum // 2))
-    two, seen_two = robust_golden(layers[second], masks[second], shifts[second], max(2, quorum // 2))
+    share = max(2, quorum // 2)
+    if weights is None:
+        one, seen_one = robust_golden(layers[first], masks[first], shifts[first], share)
+        two, seen_two = robust_golden(layers[second], masks[second], shifts[second], share)
+    else:
+        one, seen_one = screen_golden(
+            layers[first], masks[first], shifts[first], weights[first], share
+        )
+        two, seen_two = screen_golden(
+            layers[second], masks[second], shifts[second], weights[second], share
+        )
     common = mask & seen_one & seen_two
     if common.sum() < 1000:
         return float("nan")
@@ -604,7 +708,10 @@ def screen_passes(collection: Collection, args: Settings) -> list[Pass]:
         collection.numbers, collection.images, collection.valid, collection.papers
     ):
         try:
-            result = separate(image, stamp_paper, mask, args.screen_tilt, corner)
+            # The impression's own ink ray is allowed to be useless here; the
+            # coverage is re-read below against the one the collection agrees on.
+            result = separate(image, stamp_paper, mask, args.screen_tilt, corner,
+                              min_separability=0.0)
         except RuntimeError as error:
             print(f"  stamp {number:2d}: {error}")
             continue
@@ -620,6 +727,26 @@ def screen_passes(collection: Collection, args: Settings) -> list[Pass]:
     main_ray /= np.linalg.norm(main_ray)
     back_ray = np.median(np.stack([r["ink_ray"] for r in results]), axis=0)
     back_ray /= np.linalg.norm(back_ray)
+
+    # One colour basis for the whole collection.  Both inks belong to the issue,
+    # so they are estimated once from every impression and each impression is
+    # then projected through the same frame, which puts every background layer
+    # on one scale and one sign.
+    own = np.array([r["separability"] for r in results])
+    basis = background_ink.orthonormal_frame(main_ray)
+    for result in results:
+        result["coverage"], separability = background_ink.coverage_against(
+            basis, result["density"], back_ray
+        )
+        result["separability"] = separability
+    # The overall sign is a gauge, not a fact; what matters is that no
+    # impression disagrees with the rest about which way the screen runs.
+    against = int((np.sign(own) != np.sign(separability)).sum())
+    print(
+        f"  background ink read in one shared basis: separability "
+        f"[{own.min():+.3f}..{own.max():+.3f}] per impression -> {separability:+.3f} "
+        f"for all, reversing {against} of {len(own)} that read inverted on their own"
+    )
     pitch = float(np.median([r["pitch"] for r in results]))
     hue = float(np.degrees(np.arccos(np.clip(main_ray @ back_ray, -1, 1))))
     print(
@@ -678,7 +805,7 @@ def screen_passes(collection: Collection, args: Settings) -> list[Pass]:
     trail, used, skipped = back["trail"], back["used"], back["skipped"]
     print(
         f"  background pass: anchored on stamp {results[anchor]['number']}, "
-        f"shared screen {back['pitch']:.3f} px, phase lock {back['lock']:.2f}, "
+        f"shared screen {back['pitch']:.3f} px, merge gain {back['gain']:.2f}x, "
         f"shift span {np.ptp(back['shifts'][:, 0]) * args.downsample:.2f}"
         f"x{np.ptp(back['shifts'][:, 1]) * args.downsample:.2f} px"
     )
@@ -732,15 +859,14 @@ def screen_passes(collection: Collection, args: Settings) -> list[Pass]:
 def report_selection(back: dict, results: list[dict], total: int) -> None:
     trail = back["trail"]
     print(
-        f"    screen strength: best single {trail[0]:.2f}, "
-        f"merge of {len(back['chosen'])} {trail[-1]:.2f}, "
-        f"all {total} merged {back['all_merged']:.2f}"
+        f"    screen strength: best single {max(back['alone']):.2f}, "
+        f"all {total} merged {back['all_merged']:.2f}, "
+        f"merge of the {len(back['chosen'])} kept {trail[-1]:.2f}"
     )
     for index, result in enumerate(results):
-        place = back["chosen"].index(index) + 1 if index in back["chosen"] else 0
         print(
             f"    stamp {result['number']:2d}: alone {back['alone'][index]:6.2f}  "
-            + (f"used {place}; merge {trail[place - 1]:6.2f}" if place else "skipped")
+            + ("kept" if index in back["chosen"] else "dropped")
         )
     print(f"    used     {back['used']}")
     print(f"    skipped  {back['skipped']}")
@@ -880,7 +1006,7 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
                  ["bearing"] for e in crisped["entries"]]
             )
             print(
-                f"    screen {crisped['pitch']:.3f} px, phase lock {crisped['lock']:.2f}, "
+                f"    screen {crisped['pitch']:.3f} px, merge gain {crisped['gain']:.2f}x, "
                 f"bearing brought to {crisped['reference']:+.3f} deg: spread "
                 f"{np.ptp(crisped['bearings']):.3f} -> {np.ptp(settled):.3f} deg"
             )
