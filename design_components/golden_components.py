@@ -742,6 +742,82 @@ def screen_peak_floor(layer: np.ndarray, mask: np.ndarray, corner, wave: np.ndar
     return float(peak), float(np.median(spectrum[ring])) if ring.any() else 0.0
 
 
+def place_in_impression(
+    golden: np.ndarray, shift: np.ndarray, rotation: float, shape: tuple[int, int]
+) -> np.ndarray:
+    """Put a merged golden back where it sits in one impression.
+
+    The merge brought every impression onto a common frame by turning it to the
+    collection's bearing and then sliding it; this undoes both, in reverse, so
+    that a quantity measured once from the whole collection can be used against
+    a single impression's own measurements.
+    """
+    local = shift_image(golden, -np.asarray(shift, np.float32), cv2.INTER_CUBIC)
+    if abs(rotation) > 1e-6:
+        height, width = shape
+        matrix = cv2.getRotationMatrix2D((width / 2.0, height / 2.0), -rotation, 1.0)
+        local = cv2.warpAffine(
+            local, matrix, (width, height),
+            flags=cv2.INTER_CUBIC | cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+        )
+    return local
+
+
+def repeatability_gain(
+    layers: np.ndarray, fields: np.ndarray, shifts: np.ndarray, common: np.ndarray
+) -> np.ndarray:
+    """Per-frequency gain from how well the impressions agree about the plate.
+
+    The background is one plate, so whatever it really printed repeats in every
+    impression once they are registered, while what the 1/separability division
+    amplified does not.  Comparing the coherent sum against the mean power, bin
+    by bin, separates the two without having to assume which frequencies a
+    background is allowed to occupy -- the assumption band-limiting got wrong,
+    by discarding the background's own low-frequency design along with the noise.
+
+    It is measured over the whole shared field rather than the screen window.
+    The window is 256 px and the background's design varies over the whole
+    stamp, so a window cannot see the low frequencies at all: measured there,
+    5K kept a thousandth of its layer and the design envelope went with it.
+
+    One over the impression count is the coherence independent noise shows by
+    chance, so it is subtracted before the gain is read.
+    """
+    aperture = common.astype(np.float64)
+    height, width = aperture.shape
+    aperture = aperture * np.outer(np.hanning(height), np.hanning(width))
+    total = np.zeros((height, width), np.complex128)
+    power = np.zeros((height, width), np.float64)
+    count = 0
+    for layer, mask, shift in zip(layers, fields, shifts):
+        moved = shift_image(layer, shift, cv2.INTER_CUBIC).astype(np.float64)
+        weight = shift_image(mask.astype(np.uint8), shift, cv2.INTER_NEAREST) > 0
+        inside = weight & common
+        if inside.sum() < 15000:
+            continue
+        spectrum = np.fft.fft2((moved - moved[inside].mean()) * aperture * weight)
+        total += spectrum
+        power += np.abs(spectrum) ** 2
+        count += 1
+    if count < 3:
+        return np.ones((height, width), np.float64)
+    coherence = np.abs(total / count) ** 2 / np.maximum(power / count, 1e-20)
+    gain = (coherence - 1.0 / count) / (1.0 - 1.0 / count)
+    # A per-bin coherence is itself a noisy statistic; neighbouring bins belong
+    # to the same structure, so the gain is smoothed before it is believed.
+    return np.fft.ifftshift(
+        np.clip(cv2.GaussianBlur(np.fft.fftshift(gain), (0, 0), 2.0), 0.0, 1.0)
+    )
+
+
+def apply_gain(layer: np.ndarray, field: np.ndarray, gain: np.ndarray) -> np.ndarray:
+    """Filter a layer by a gain measured across the collection."""
+    keep = field.astype(np.float32)
+    spectrum = np.fft.fft2(layer.astype(np.float64) * keep)
+    return (np.real(np.fft.ifft2(spectrum * gain)) * keep).astype(np.float32)
+
+
 def screen_strength(layer: np.ndarray, mask: np.ndarray, corner, wave: np.ndarray) -> float:
     """How far the ruling stands above the broadband floor in one layer.
 
@@ -948,6 +1024,10 @@ def background_golden(
             "chosen_shifts": candidate["shifts"][chosen_local],
             "chosen_weights": candidate["weights"][chosen_local],
             "quorum": candidate["quorum"],
+            # Every member's registration, not only the kept ones, so the merged
+            # result can be placed back into any impression's own frame.
+            "members": np.asarray(members, np.int32),
+            "shifts": candidate["shifts"],
         }
         comparisons.append(result)
         return result
@@ -1781,6 +1861,30 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
         f"[{own.min():+.3f}..{own.max():+.3f}] per impression -> {separability:+.3f} "
         f"for all, reversing {against} of {len(own)} that read inverted on their own"
     )
+    # Is there a second ink here at all?  Everything downstream divides by the
+    # separability, so what has to be settled first is whether the background's
+    # direction has been resolved.  Its tilt out of the main ink's plane is the
+    # signal; the scatter between the impressions' own estimates of that
+    # direction is the error on it.  Where the tilt is the smaller of the two,
+    # the collection has not measured a second ink, and dividing by it
+    # manufactures one out of noise: on 5K a 3.5 degree tilt against 4.1 of
+    # scatter produced a background that claimed 65 per cent of the main plate's
+    # density, which no background tint can be.  Hue separation is no guide --
+    # 7K is the next closest pair at 7.8 degrees and resolves cleanly, because
+    # its difference from the main ink lies out of the plane rather than toward
+    # neutral, where the main ray and the postmark grey already account for it.
+    tilt = math.degrees(math.asin(min(1.0, abs(separability))))
+    scatter = float(np.mean(np.degrees(np.arccos(np.clip(
+        np.stack([r["ink_ray"] for r in results]) @ back_ray, -1.0, 1.0
+    )))))
+    separable = tilt > scatter
+    print(
+        f"  background ink stands {tilt:.2f} deg out of the main ink's plane "
+        f"against {scatter:.2f} deg of scatter in that direction: "
+        + ("a resolved second ink" if separable
+           else "not resolved, reading the sheet as a single ink")
+    )
+    publishing = separable and not args.no_background
     pitch = float(np.median([r["pitch"] for r in results]))
     hue = float(np.degrees(np.arccos(np.clip(main_ray @ back_ray, -1, 1))))
     print(
@@ -1866,7 +1970,12 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
     comparison_band = None
     selection_note = ""
     candidate_score = baseline_score = float("nan")
-    golden_main, seen_main = robust_golden(conserved_layers, readable, main_shifts, quorum)
+    # Conserve density only against a background that is actually going to be
+    # rebuilt.  With no background pass to lay that ink back down, subtracting
+    # it would simply lose it.
+    golden_main, seen_main = robust_golden(
+        conserved_layers if publishing else main_layers, readable, main_shifts, quorum
+    )
     if main_is_achromatic:
         baseline_main = achromatic_layer(
             collection.baseline, collection.paper, covered, main_ray
@@ -1894,12 +2003,15 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
         f"{thin.sum() / max(covered.sum(), 1):.1%} on fewer than {quorum} impressions"
     )
 
+    if not separable and not selection_note:
+        selection_note = "one ink only, no separable background"
     passes = [
         Pass(
             name=main_name,
             golden=golden_main,
             seen=seen_main,
             ray=main_ray,
+            primary_note="single ink" if not separable else "",
             density_note=f"{main_name}, density"
                          f"{'; ' + selection_note if selection_note else ''}; "
                          f"ECC {np.nanmedian(main_scores):.2f}",
@@ -1910,7 +2022,7 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
                  edge_band(golden_main, covered & seen_main),
         )
     ]
-    if args.no_background:
+    if not publishing:
         return passes
 
     anchor = int(np.argmax([r["snr"] * r["coherence"] for r in results]))
@@ -2022,19 +2134,114 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
         report_halves(back, covered)
 
     by_kind = {candidate["kind"]: candidate for candidate in back["comparisons"]}
-    diagnostic_candidates = [
-        {
-            "kind": "legacy",
-            "golden": back["golden"],
-            "seen": back["seen"],
-            "note": "legacy",
-        },
-        *[
-            {**by_kind[kind], "note": kind}
-            for kind in ("best", "second", "anchor")
-            if kind in by_kind
-        ],
+    main_variants: list[tuple[np.ndarray, str]] = []
+    # Fixed, comparable columns, in a stable order: the single best impression
+    # first as the honest "one good stamp" reference, then one column per fix
+    # under test.  Both plates contribute to every column, so each one is a
+    # complete rebuild rather than a change to the background alone.
+    diagnostic_candidates = []
+    if "best" in by_kind:
+        diagnostic_candidates.append(by_kind["best"])
+        main_variants.append((passes[0].golden, f"{main_name} as accepted"))
+
+    shape = registration_readable.shape[1:]
+    chosen_back = np.asarray(accepted_back["chosen"], np.int32)
+    chosen_field = np.stack([turned[index]["field"] for index in chosen_back])
+
+    def conserved_against(backgrounds: list[np.ndarray]) -> np.ndarray:
+        return np.stack(
+            [np.where(
+                mask,
+                np.maximum(
+                    remove_background_projection(
+                        r["along_main"], estimate, main_ray, back_ray
+                    ),
+                    0.0,
+                ),
+                0.0,
+             ).astype(np.float32)
+             for r, mask, estimate in zip(results, registration_readable, backgrounds)]
+        )
+
+    # Fix 1.  Subtract the background the collection agreed on, placed back into
+    # each impression's own frame, rather than that impression's own coverage.
+    # The two are the same quantity, but the merged one has been through ten to
+    # twenty impressions, so it carries a fraction of the noise that dividing by
+    # the separability put into any single one of them.
+    placed = np.array(back["shifts"], np.float32).copy()
+    placed[accepted_back["members"]] = accepted_back["shifts"]
+    registered = [
+        place_in_impression(accepted_back["golden"], placed[index], spun["rotation"], shape)
+        for index, spun in enumerate(turned)
     ]
+    registered_main, _ = robust_golden(
+        conserved_against(registered), readable, main_shifts, quorum
+    )
+    diagnostic_candidates.append({
+        "golden": accepted_back["golden"],
+        "seen": accepted_back["seen"],
+        "note": "background as accepted",
+    })
+    main_variants.append(
+        (registered_main, f"{main_name} conserved against the registered background")
+    )
+
+    # Fix 2.  Keep each impression's own coverage, but first discount the
+    # frequencies the impressions do not agree on, which is where the division
+    # by the separability left noise rather than ink.
+    gain = repeatability_gain(
+        np.stack([turned[index]["coverage"] for index in chosen_back]),
+        chosen_field,
+        accepted_back["chosen_shifts"],
+        accepted_back["seen"],
+    )
+    agreed = [
+        apply_gain(r["coverage"], mask, gain)
+        for r, mask in zip(results, registration_readable)
+    ]
+    agreed_golden, agreed_seen = screen_golden(
+        np.stack([apply_gain(turned[index]["coverage"], turned[index]["field"], gain)
+                  for index in chosen_back]),
+        chosen_field,
+        accepted_back["chosen_shifts"],
+        accepted_back["chosen_weights"],
+        accepted_back["quorum"],
+    )
+    agreed_main, _ = robust_golden(
+        conserved_against(agreed), readable, main_shifts, quorum
+    )
+    diagnostic_candidates.append({
+        "golden": agreed_golden,
+        "seen": agreed_seen,
+        "note": "background kept only where impressions agree",
+    })
+    main_variants.append(
+        (agreed_main, f"{main_name} conserved against the agreed background")
+    )
+
+    # What each option actually charges the main plate, so the panels can be
+    # read against a number.  Sampled on a quarter grid; this is a diagnostic.
+    def debit(corrected: np.ndarray) -> float:
+        sparse, whole = corrected[:, ::4, ::4], main_layers[:, ::4, ::4]
+        seen = registration_readable[:, ::4, ::4]
+        if not seen.any():
+            return float("nan")
+        return float(
+            np.percentile(np.abs(whole - sparse)[seen], 90)
+            / max(np.percentile(np.abs(whole)[seen], 90), 1e-9)
+        )
+
+    print(
+        f"    conservation debits the main plate "
+        f"{debit(conserved_layers):.1%} of its density as accepted, "
+        f"{debit(conserved_against(registered)):.1%} against the registered background, "
+        f"{debit(conserved_against(agreed)):.1%} against the agreed one"
+    )
+
+    passes[0].comparison_goldens = [golden for golden, _ in main_variants]
+    passes[0].comparison_seen = [seen_main for _ in main_variants]
+    passes[0].comparison_rays = [main_ray.copy() for _ in main_variants]
+    passes[0].comparison_notes = [note for _, note in main_variants]
     passes.append(
         Pass(
             name="background pass",
