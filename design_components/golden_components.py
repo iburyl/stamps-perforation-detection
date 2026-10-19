@@ -1772,16 +1772,6 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
         result["coverage"], separability = background_ink.coverage_against(
             basis, result["density"], back_ray
         )
-        # ``along_main`` was measured before the background was known, so it
-        # contains the background ray's projection onto the main ray.  Keeping
-        # it there and reconstructing the recovered background separately
-        # counts that component twice.  Preserve optical density by removing
-        # precisely the recovered projection, while leaving the signed screen
-        # estimate untouched until the final render (rectifying it here would
-        # turn scanner noise into positive ink).
-        result["main_coverage"] = remove_background_projection(
-            result["along_main"], result["coverage"], basis[0], back_ray
-        )
         result["separability"] = separability
     # The overall sign is a gauge, not a fact; what matters is that no
     # impression disagrees with the rest about which way the screen runs.
@@ -1810,6 +1800,9 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
         )
         registration_masks = registration_readable
         registration_layers = main_layers
+        # An achromatic plate is read as a solid mask, not as a projection of the
+        # whole density, so there is no background component inside it to remove.
+        conserved_layers = main_layers
         if design_support is not None:
             # The support is only an alignment focus.  It is intentionally not
             # applied to the recovered layer, where it used to erase legitimate
@@ -1820,8 +1813,44 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
             registration_masks = registration_readable & focus[None, :, :]
             registration_layers = np.where(registration_masks, main_layers, 0.0)
     else:
+        # Two versions of the same plate, for two different jobs.
+        #
+        # ``along_main`` is the whole density along the main ray, so it still
+        # carries the background ray's projection onto that ray.  Rebuilding the
+        # recovered background on top of it would count that component twice, so
+        # conservation requires taking it out -- but each impression's coverage
+        # is its out-of-plane residual divided by the separability, and where the
+        # two inks are close that divisor amplifies the coverage's own noise.  On
+        # 5K, separability 0.061 with the rays 7.2 degrees apart, subtracting it
+        # put sixteen times the background's noise into the layer, which is
+        # ruinous for registration: matching on it dropped the plate's ECC from
+        # 0.910 to 0.822 and spread an essentially rigid plate's vertical travel
+        # from 0.33 to 2.35 px.
+        #
+        # So the plate is matched on the uncorrected layer, where the evidence is
+        # cleanest, and the golden is then merged from the corrected ones using
+        # those same offsets.  The correction stays per impression, in the frame
+        # where the double counting actually happened, and the merge averages
+        # down the noise it brings.  Correcting the merged goldens instead is
+        # quieter still but wrong in geometry, the two plates being registered in
+        # different frames: it leaves an inverted imprint of the background in
+        # the main golden, which showed up as the duplicate-structure correlation
+        # rising above even doing nothing at all.
         main_layers = np.stack(
-            [np.where(mask, np.maximum(r["main_coverage"], 0.0), 0.0).astype(np.float32)
+            [np.where(mask, np.maximum(r["along_main"], 0.0), 0.0).astype(np.float32)
+             for r, mask in zip(results, registration_readable)]
+        )
+        conserved_layers = np.stack(
+            [np.where(
+                mask,
+                np.maximum(
+                    remove_background_projection(
+                        r["along_main"], r["coverage"], main_ray, back_ray
+                    ),
+                    0.0,
+                ),
+                0.0,
+             ).astype(np.float32)
              for r, mask in zip(results, registration_readable)]
         )
         registration_layers = main_layers
@@ -1837,7 +1866,7 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
     comparison_band = None
     selection_note = ""
     candidate_score = baseline_score = float("nan")
-    golden_main, seen_main = robust_golden(main_layers, readable, main_shifts, quorum)
+    golden_main, seen_main = robust_golden(conserved_layers, readable, main_shifts, quorum)
     if main_is_achromatic:
         baseline_main = achromatic_layer(
             collection.baseline, collection.paper, covered, main_ray
@@ -1989,7 +2018,7 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
     if args.validate:
         print("  half-set agreement (structure the halves independently agree on):")
         print(f"    {main_name:<15} "
-              f"{half_set_agreement(main_layers, readable, main_shifts, quorum, covered):+.3f}")
+              f"{half_set_agreement(conserved_layers, readable, main_shifts, quorum, covered):+.3f}")
         report_halves(back, covered)
 
     by_kind = {candidate["kind"]: candidate for candidate in back["comparisons"]}
