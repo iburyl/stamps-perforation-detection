@@ -108,8 +108,14 @@ def aligned_collection(
     perf: dict,
     design: dict,
     downsample: int,
+    minimum: int = 5,
 ) -> tuple[np.ndarray, np.ndarray, list[int]]:
-    """Render every usable stamp directly into the common reference frame."""
+    """Render usable stamps directly into the common reference frame.
+
+    The historical two-motion experiments require five observations by
+    default.  Production callers that implement their own small-collection
+    fallbacks may explicitly lower ``minimum``.
+    """
     scan = cv2.imread(str(scan_path), cv2.IMREAD_COLOR)
     if scan is None:
         raise RuntimeError(f"Cannot read scan: {scan_path}")
@@ -158,9 +164,9 @@ def aligned_collection(
         masks.append(valid)
         numbers.append(number)
 
-    if len(patches) < 5:
+    if len(patches) < minimum:
         raise RuntimeError(
-            f"Need at least five aligned stamps for a two-motion experiment; "
+            f"Need at least {minimum} aligned stamp(s); "
             f"found {len(patches)}"
         )
     return np.stack(patches), np.stack(masks) > 0, numbers

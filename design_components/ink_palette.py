@@ -10,9 +10,10 @@ of how heavily it printed, so the inks of an issue are a few tight clusters on
 the unit sphere and a pixel's colour is a non-negative sum of them.  Density
 adds, which reflectance does not, so all of this happens in density.
 
-The postmark is carried as one more column, a neutral one.  It is not an ink of
-the issue, but it is present on most impressions and would otherwise be charged
-to whichever ink happens to point nearest to grey.
+The postmark is carried as one more neutral candidate.  A genuine near-neutral
+printing ink may also be named, but its usable area is then restricted to dark
+structure that repeats across registered impressions.  This spatial check is
+what separates an achromatic plate from an equally achromatic postmark.
 
 Reads nothing from disk.  ``--probe`` names the palette of one scan.
 """
@@ -39,10 +40,20 @@ from two_pass_decomposition import aligned_collection
 # centre in a blue frame is a small part of the design but a whole press run.
 SEPARATION_DEG = 25.0
 MINOR_SHARE = 0.01
+# A scanner-space black is rarely exactly parallel to ``NEUTRAL``: tinted
+# paper, channel response and ageing move it several degrees.  Ten degrees is
+# still safely below the coloured inks in the reference sheets, while it
+# includes the black plate in V/5K (about six degrees from neutral).
+ACHROMATIC_DEG = 10.0
+ACHROMATIC_SHARE = 0.05
 
 
 def ink_directions(
-    images: np.ndarray, valid: np.ndarray, papers: np.ndarray, stride: int = 3
+    images: np.ndarray,
+    valid: np.ndarray,
+    papers: np.ndarray,
+    stride: int = 3,
+    minimum_density: float = 0.0,
 ) -> np.ndarray:
     """Unit density directions of the pixels that are dense and coloured enough
     to name an ink, pooled over the collection.
@@ -58,9 +69,10 @@ def ink_directions(
             continue
         density, magnitude = optical_density(image, paper)
         chroma = magnitude - 0.999 * (density @ NEUTRAL)
+        density_cut = max(float(np.percentile(magnitude[mask], 70)), minimum_density)
         inked = (
             mask
-            & (magnitude > np.percentile(magnitude[mask], 70))
+            & (magnitude > density_cut)
             & (chroma > np.percentile(chroma[mask], 70))
         )
         if inked.sum() < 200:
@@ -68,6 +80,38 @@ def ink_directions(
         pooled.append(density[inked] / magnitude[inked][:, None])
     if not pooled:
         raise RuntimeError("No dense coloured pixels to name an ink")
+    return np.concatenate(pooled)
+
+
+def achromatic_directions(
+    images: np.ndarray,
+    valid: np.ndarray,
+    papers: np.ndarray,
+    stride: int = 3,
+    angle: float = ACHROMATIC_DEG,
+    minimum_density: float = 0.60,
+) -> np.ndarray:
+    """Dense near-neutral directions used by the first palette stage."""
+    pooled = []
+    cosine = math.cos(math.radians(angle))
+    for image, mask, paper in zip(
+        images[:, ::stride, ::stride], valid[:, ::stride, ::stride], papers
+    ):
+        if mask.sum() < 500:
+            continue
+        density, magnitude = optical_density(image, paper)
+        direction_cosine = np.divide(
+            density @ NEUTRAL,
+            magnitude,
+            out=np.zeros_like(magnitude),
+            where=magnitude > 1e-6,
+        )
+        selected = mask & (magnitude >= minimum_density) & (direction_cosine >= cosine)
+        if selected.sum() < 100:
+            continue
+        pooled.append(density[selected] / magnitude[selected][:, None])
+    if not pooled:
+        raise RuntimeError("No dense achromatic pixels to name an ink")
     return np.concatenate(pooled)
 
 
@@ -120,11 +164,44 @@ def find_palette(
     limit: int = 4,
     separation: float = SEPARATION_DEG,
     share: float = MINOR_SHARE,
+    achromatic_angle: float = ACHROMATIC_DEG,
+    achromatic_share: float = ACHROMATIC_SHARE,
 ) -> dict:
-    """The major inks of the issue, in order of how much they cover."""
+    """The major inks of the issue, in order of how much they cover.
+
+    The ordinary mode finder is deliberately left unchanged for coloured inks.
+    An achromatic ink is additional evidence, not a replacement colour model:
+    an existing near-neutral mode is labelled as such, or a sufficiently large
+    near-neutral population is appended when the coloured modes did not name
+    it.  The spatial, collection-wide check that distinguishes a printed black
+    plate from black cancellation ink is performed by ``golden_components``.
+    """
     centres, weights = modes(directions, separation, limit, share)
+    neutral_cosine = math.cos(math.radians(achromatic_angle))
+    achromatic = (centres @ NEUTRAL) >= neutral_cosine
+    achromatic_added = np.zeros(len(centres), bool)
+
+    neutral_members = (directions @ NEUTRAL) >= neutral_cosine
+    neutral_weight = float(np.mean(neutral_members))
+    if (
+        not achromatic.any()
+        and len(centres) < limit
+        and neutral_weight >= achromatic_share
+    ):
+        neutral_centre = np.median(directions[neutral_members], axis=0)
+        neutral_centre /= max(float(np.linalg.norm(neutral_centre)), 1e-12)
+        # Avoid adding a duplicate just across the labelling boundary.
+        nearest = float(np.max(centres @ neutral_centre))
+        if nearest < math.cos(math.radians(achromatic_angle)):
+            centres = np.vstack([centres, neutral_centre])
+            weights = np.append(weights, neutral_weight)
+            achromatic = np.append(achromatic, True)
+            achromatic_added = np.append(achromatic_added, True)
+
     order = np.argsort(-weights)
     centres, weights = centres[order], weights[order]
+    achromatic = np.asarray(achromatic, bool)[order]
+    achromatic_added = achromatic_added[order]
     if len(centres) > 1:
         gram = np.clip(centres @ centres.T, -1.0, 1.0)
         angles = np.degrees(np.arccos(gram))
@@ -136,6 +213,45 @@ def find_palette(
         "shares": weights,
         "count": len(centres),
         "separation_deg": apart,
+        "achromatic": achromatic,
+        "achromatic_added": achromatic_added,
+        "achromatic_angle_deg": achromatic_angle,
+    }
+
+
+def find_coloured_palette(
+    directions: np.ndarray,
+    limit: int = 4,
+    separation: float = SEPARATION_DEG,
+    share: float = MINOR_SHARE,
+    achromatic_angle: float = ACHROMATIC_DEG,
+) -> dict:
+    """Name chromatic inks after achromatic pixels have been removed.
+
+    Neutral directions are rejected explicitly rather than being offered as a
+    competing mode again.  This makes the second stage answer only how many
+    coloured printing inks remain.
+    """
+    coloured = directions[
+        (directions @ NEUTRAL) < math.cos(math.radians(achromatic_angle))
+    ]
+    if len(coloured) < 200:
+        raise RuntimeError("No coloured ink remains after achromatic extraction")
+    centres, weights = modes(coloured, separation, limit, share)
+    if len(centres) > 1:
+        gram = np.clip(centres @ centres.T, -1.0, 1.0)
+        angles = np.degrees(np.arccos(gram))
+        apart = float(np.min(angles[~np.eye(len(centres), dtype=bool)]))
+    else:
+        apart = float("inf")
+    return {
+        "rays": centres,
+        "shares": weights,
+        "count": len(centres),
+        "separation_deg": apart,
+        "achromatic": np.zeros(len(centres), bool),
+        "achromatic_added": np.zeros(len(centres), bool),
+        "achromatic_angle_deg": achromatic_angle,
     }
 
 
@@ -151,7 +267,9 @@ def unmix(density: np.ndarray, rays: np.ndarray) -> np.ndarray:
     stroke" and "equal parts of the two plates" become the same measurement.
 
     Grey is one more thing a pixel can be, but only instead of an ink and never
-    alongside one.  Both halves of that matter.  An ink can lie close to grey --
+    alongside one.  If a real ink is itself grey, the caller limits that ink to
+    its repeatable spatial support; colour alone cannot distinguish it from a
+    cancellation.  Both halves of that matter.  An ink can lie close to grey --
     70K's brown is eleven degrees off it -- and asking how to divide a pixel
     between two nearly parallel directions is ill posed: offered the pair, the
     fit answered "stroke" for a third of that frame and cut the rest to an
@@ -204,9 +322,10 @@ def ink_colour(paper: np.ndarray, ray: np.ndarray, strength: float = 1.0) -> np.
 
 
 def describe(palette: dict, paper: np.ndarray) -> str:
+    achromatic = palette.get("achromatic", np.zeros(len(palette["rays"]), bool))
     inks = ", ".join(
-        f"{bgr_hex(ink_colour(paper, ray))} {weight:.0%}"
-        for ray, weight in zip(palette["rays"], palette["shares"])
+        f"{'achromatic ' if neutral else ''}{bgr_hex(ink_colour(paper, ray))} {weight:.0%}"
+        for ray, weight, neutral in zip(palette["rays"], palette["shares"], achromatic)
     )
     apart = palette["separation_deg"]
     tail = "" if not np.isfinite(apart) else f", {apart:.1f} deg apart"
