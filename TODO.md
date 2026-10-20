@@ -344,3 +344,70 @@ Update `design_components/README.md` to identify `golden_components.py` and
 `background_ink.py` as the current implementation invoked by the production design
 measurement command. Keep the older experiments clearly labelled as historical
 baselines.
+
+## Regression guardrails for background routing
+
+The IX-X 7K background decision proved unstable when it used the exact crossing
+of two noisy angle estimates as a hard boundary. Rebuilding the masks moved the
+measurement to 4.141 degrees of tilt against 4.152 degrees of scatter and silently
+changed a useful two-pass reconstruction into a single-ink fallback. IX-X 5K is a
+different case (3.524 against 4.132 degrees) where the fallback is desirable.
+
+- Replace the current narrow uncertainty allowance with a confidence estimate or
+  a downstream reconstruction-quality comparison when enough representative
+  sheets are available.
+- Keep regression fixtures for both IX-X 5K (must fall back) and IX-X 7K (must
+  retain the background pass).
+- Keep integration fixtures for automatic colour-screen routing: V 1K, V 3K, and
+  V 5K must select screen consensus without a palette index, while VIII 7K must
+  retain its ordinary solid-red registration.
+- Calibrate the current strength and held-out thresholds on more issues. The
+  initial corpus separates at best-single screen strengths 20.65, 7.55, and 5.36
+  with held-out consensus scores +0.128, +0.066, and +0.017, versus VIII 7K's
+  accidental 3.60 peak and effectively zero held-out score.
+- Add a direct held-out comparison against the ordinary colour reconstruction.
+  Merge gain alone is unsuitable: the approved V 5K screen consensus is useful
+  even at 0.99x.
+
+## Fixed-count unified ink model
+
+The required `--ink-count N` option bypasses the staged achromatic/colour palette and seeds
+exactly `N` primary inks together on the full optical-density sphere. The modes
+come from the registered median so moving cancellations do not become palette
+centres, while per-impression rays preserve genuine batch, fading, and scanner
+colour differences. `N=1` deliberately leaves the existing main/background
+separation and reconstruction unchanged; the background is not counted in `N`.
+Plate identity is now spatially anchored to the nearest high-confidence median
+core. Per-impression rays control density and rendered colour inside that fixed
+form, but cannot move a pixel from one plate to another merely because its hue
+changed. This is important for inks damaged by water or represented by several
+colour batches.
+
+Current full-resolution checkpoints:
+
+- IX-X 2K with `N=1` follows the existing background route and gains 6.4% edge
+  energy over the averaged golden.
+- IX-X 35K with `N=2` finds violet and green plates, with half-set agreements
+  +0.902 and +0.936 and a 10.7% edge-energy gain.
+- V 5K with `N=2` finds neutral and blue-violet plates without a separate
+  achromatic reconstruction. Spatial ownership raises the weak colour plate's
+  half-set agreement from +0.153 to +0.596 while the neutral plate remains at
+  +0.966; the final reconstruction gains 26.5% edge energy.
+- Full comparison panels were generated for all 12 configured scans in V, VIII,
+  and IX-X. V and VIII use `N=2`; IX-X 1/2/3/5/7K use `N=1` plus the unchanged
+  background route, and IX-X 14/35/70K use `N=2`. The complete run took 1039 s
+  on the current machine. VIII 7K was the slowest case at 241 s because it has
+  32 impressions; V 5K took 174 s for 16 impressions.
+- IX-X 5K correctly rejects the unresolved background candidate and keeps a
+  single ink. IX-X 3K is the only current comparison whose rebuilt edge-energy
+  score is below the averaged golden (-2.3%); its strict agreed-background mask
+  is nearly empty and still needs visual/metric review.
+
+Next checks:
+
+- Replace the current fixed neutral-nuisance angle with a validation based on
+  spatial repeatability and held-out reconstruction quality.
+- Review whether IX-X 3K should fall back from its weak agreed-background result,
+  using held-out structure rather than edge energy alone.
+- Reduce the quadratic pairwise registration cost for large collections such as
+  VIII 7K without changing the selected consensus.

@@ -77,6 +77,10 @@ from two_pass_decomposition import aligned_collection, masked_colour_median
 
 
 MIN_COLOUR_AGREEMENT = 0.10
+BACKGROUND_DIRECTION_RELATIVE_TOLERANCE = 0.10
+AUTO_COLOUR_SCREEN_MIN_STRENGTH = 4.5
+AUTO_COLOUR_SCREEN_STRONG_STRENGTH = 10.0
+AUTO_COLOUR_SCREEN_MIN_HELD_OUT = 0.01
 DUPLICATE_INK_ANGLE_DEG = 18.0
 DUPLICATE_ACHROMATIC_CORRELATION = 0.45
 DUPLICATE_BACKGROUND_CORRELATION = 0.35
@@ -85,6 +89,23 @@ DUPLICATE_BACKGROUND_CORRELATION = 0.35
 def collection_quorum(count: int) -> int:
     """Useful majority coverage, including collections smaller than three."""
     return max(1, math.ceil(0.6 * count))
+
+
+def background_direction_resolved(tilt: float, scatter: float) -> bool:
+    """Whether a proposed second-ink direction clears measurement scatter.
+
+    The two estimates move by a few tenths of a degree when the design masks are
+    rebuilt.  Treating their exact crossing as a physical boundary made 7K flip
+    from a strong, repeatable background to a single-ink fallback at 4.141 vs
+    4.152 degrees.  A narrow relative uncertainty band keeps that near-tie in
+    the evidence-gathering branch, while 5K's 3.524 vs 4.132 degree failure
+    remains outside it and is still read as one ink.
+    """
+    if not np.isfinite(tilt) or not np.isfinite(scatter):
+        return False
+    if scatter <= 1e-9:
+        return tilt > 0.0
+    return tilt >= (1.0 - BACKGROUND_DIRECTION_RELATIVE_TOLERANCE) * scatter
 
 
 def move_image(image: np.ndarray, motion: np.ndarray, interpolation: int) -> np.ndarray:
@@ -990,7 +1011,8 @@ def merge_gain(merged: dict, corner, wave: np.ndarray) -> float:
 
 
 def background_golden(
-    results: list[dict], corner, anchor: int, downsample: int, shift_limit: float = 12.0
+    results: list[dict], corner, anchor: int, downsample: int, shift_limit: float = 12.0,
+    cell_min_strength: float | None = None,
 ) -> dict:
     """Build the legacy phase merge and candidate cell-resolved merges."""
     field = np.stack([r["field"] for r in results])
@@ -1051,7 +1073,18 @@ def background_golden(
             f"#{results[int(pair[0])]['number']} + #{results[int(pair[1])]['number']}",
         )
 
-    if len(results) >= 2:
+    strongest_screen = max(merged["alone"], default=float("nan"))
+    resolve_cells = (
+        len(results) >= 2
+        and (
+            cell_min_strength is None
+            or (
+                np.isfinite(strongest_screen)
+                and strongest_screen >= cell_min_strength
+            )
+        )
+    )
+    if resolve_cells:
         strongest = int(ranked[0])
         cells = resolve_screen_cells(
             layers, field, shifts, corner, wave, shift_limit / max(downsample, 1), strongest
@@ -1395,9 +1428,15 @@ class Settings:
     step: int = 128  # phase window stride, px
     panel_width: int = 760
     inks: int = 4  # most colour plates to look for
+    # When supplied, bypass the staged achromatic/chromatic detector and find
+    # exactly this many primary inks together in full optical-density space.
+    # A value of one still enters the existing main-plus-background route.
+    ink_count: int | None = None
     separation: float = ink_palette.SEPARATION_DEG
     spin_limit: float = 1.0  # most a colour plate may be turned, deg
-    screen_ink: int = 0  # which colour, if any, to also read as a screen
+    # Zero probes every coloured plate automatically; a one-based value forces
+    # that plate through the screen route for diagnostics.
+    screen_ink: int = 0
 
 
 @dataclass
@@ -1415,6 +1454,147 @@ class Collection:
     corner: tuple[int, int]
     # The design sidecar, kept for where each stamp sits in the original scan.
     design: dict = field(default_factory=dict)
+
+
+def unified_palette(collection: Collection, count: int) -> dict:
+    """Find a fixed number of primary inks without a hue/neutral split.
+
+    Optical density is the useful full colour space here: pigment absorption
+    adds linearly, while normalising its three-channel vector separates ink
+    direction from how heavily it printed.  Initial modes come from the
+    registered median, where moving cancellations have mostly disappeared.
+    Per-impression rays are then re-estimated inside each mode's spatial
+    support, preserving batch, water-damage and scanner colour differences.
+    """
+    density, magnitude = optical_density(collection.baseline, collection.paper)
+    values = magnitude[collection.covered]
+    if len(values) < 500:
+        raise RuntimeError("Too little registered coverage to name printing inks")
+    # Do not use a top-density percentile here.  On the V issue the neutral
+    # engraved plate is much denser than the coloured ground, so such a cut
+    # removes the second requested ink before clustering even starts.
+    density_floor = 0.06
+    selected = collection.covered & (magnitude >= density_floor)
+    if int(selected.sum()) < max(500, 100 * count):
+        raise RuntimeError("Too few dense median pixels to name printing inks")
+    directions = density[selected] / np.maximum(magnitude[selected][:, None], 1e-12)
+    rays, shares = ink_palette.fixed_modes(directions, count)
+
+    assignment = np.argmax(directions @ rays.T, axis=1)
+    cores: list[np.ndarray] = []
+    supports: list[np.ndarray] = []
+    for ink in range(count):
+        assigned = np.zeros(collection.covered.shape, bool)
+        assigned[selected] = assignment == ink
+        amount = np.maximum(density @ rays[ink], 0.0)
+        values = amount[assigned]
+        if len(values) >= 100:
+            cap = max(float(np.percentile(values, 99.5)), 1e-6)
+            scaled = np.clip(
+                np.rint(values * (255.0 / cap)), 0, 255
+            ).astype(np.uint8)
+            threshold_u8, _ = cv2.threshold(
+                scaled.reshape(-1, 1),
+                0,
+                255,
+                cv2.THRESH_BINARY | cv2.THRESH_OTSU,
+            )
+            threshold = max(0.05, float(threshold_u8) * cap / 255.0)
+            core = assigned & (amount >= threshold)
+        else:
+            core = assigned
+        cores.append(core)
+        # A near-neutral ink is colour-indistinguishable from cancellation and
+        # therefore needs a tight repeatable spatial support.  This is a common
+        # classifier with a nuisance ambiguity, not a separate achromatic
+        # reconstruction: its density, local colour and registration continue
+        # through exactly the same path as every other ink.
+        neutral_angle = math.degrees(math.acos(float(np.clip(
+            rays[ink] @ background_ink.NEUTRAL, -1.0, 1.0
+        ))))
+        width = 5 if neutral_angle <= 12.0 else 25
+        support = cv2.dilate(
+            core.astype(np.uint8), np.ones((width, width), np.uint8)
+        ) > 0
+        supports.append(support)
+
+    local_rays = np.full(
+        (len(collection.images), count, 3), np.nan, np.float64
+    )
+    cosine = math.cos(math.radians(60.0))
+    for stamp, (image, valid, paper) in enumerate(
+        zip(collection.images, collection.valid, collection.papers)
+    ):
+        stamp_density, stamp_magnitude = optical_density(image, paper)
+        stamp_directions = np.divide(
+            stamp_density,
+            stamp_magnitude[:, :, None],
+            out=np.zeros_like(stamp_density),
+            where=stamp_magnitude[:, :, None] > 1e-8,
+        )
+        for ink, core in enumerate(cores):
+            # Estimate colour only where the registered median assigned this
+            # ink itself.  The dilated support is useful for geometry, but its
+            # surrounding paper lets a dark cancellation drag a weak ink back
+            # toward grey (most visibly the green oval on 35K).
+            area = valid & core
+            if int(area.sum()) < 100:
+                continue
+            local_floor = max(float(np.percentile(stamp_magnitude[area], 45)), 0.05)
+            evidence = area & (stamp_magnitude >= local_floor)
+            if int(evidence.sum()) < 50:
+                continue
+            candidates, _ = ink_palette.modes(
+                stamp_directions[evidence],
+                separation=8.0,
+                limit=4,
+                share=0.02,
+            )
+            allowed = (candidates @ rays[ink]) >= cosine
+            if not allowed.any():
+                continue
+            # A postmark or paper cast may be the largest local mode.  The
+            # registered median already supplied the plate's direction, so use
+            # it as a weak identity prior and take the nearby mode that best
+            # continues that plate, without forcing every stamp to one hue.
+            ray = candidates[allowed][
+                int(np.argmax(candidates[allowed] @ rays[ink]))
+            ]
+            local_rays[stamp, ink] = ray
+
+    if count > 1:
+        gram = np.clip(rays @ rays.T, -1.0, 1.0)
+        angles = np.degrees(np.arccos(gram))
+        apart = float(np.min(angles[~np.eye(count, dtype=bool)]))
+    else:
+        apart = float("inf")
+    observed = np.isfinite(local_rays).all(axis=2).sum(axis=0)
+    distances = np.stack([
+        cv2.distanceTransform((~core).astype(np.uint8), cv2.DIST_L2, 5)
+        for core in cores
+    ])
+    ownership = np.argmin(distances, axis=0).astype(np.int16)
+    print(
+        f"  unified fixed-count palette in optical-density space: {count} ink(s); "
+        f"local estimates per ink {observed.tolist()}"
+    )
+    return {
+        "rays": rays,
+        "shares": shares / max(float(shares.sum()), 1e-12),
+        "count": count,
+        "separation_deg": apart,
+        "achromatic": np.zeros(count, bool),
+        "achromatic_added": np.zeros(count, bool),
+        "achromatic_angle_deg": ink_palette.ACHROMATIC_DEG,
+        "achromatic_supports": [None] * count,
+        "achromatic_thresholds": [None] * count,
+        "ink_supports": supports,
+        "ink_cores": cores,
+        "ink_distances": distances,
+        "ink_ownership": ownership,
+        "local_ink_rays": local_rays,
+        "unified": True,
+    }
 
 
 def averaged_achromatic_pass(collection: Collection, palette: dict) -> list[Pass]:
@@ -1463,6 +1643,33 @@ def achromatic_support(
     core = collection.covered & (layer > 0)
     minimum = max(500, int(round(0.001 * collection.covered.sum())))
     if int(core.sum()) < minimum:
+        return None
+
+    # A repeatable plate has strokes, not merely enough isolated dark samples
+    # to cross the area threshold.  On badly cancelled scans the registered
+    # median can contain hundreds of one-pixel neutral remnants spread over
+    # the stamp; counting their total promoted that noise to a printing ink.
+    # Close only one-pixel gaps, then require at least one coherent piece of
+    # design.  The threshold scales with the usable canvas but retains small
+    # lettering on the synthetic and low-resolution cases.
+    coherent = cv2.morphologyEx(
+        core.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)
+    )
+    component_count, _, statistics, _ = cv2.connectedComponentsWithStats(
+        coherent, connectivity=8
+    )
+    largest = (
+        int(statistics[1:, cv2.CC_STAT_AREA].max())
+        if component_count > 1
+        else 0
+    )
+    coherent_minimum = max(64, int(round(0.0001 * collection.covered.sum())))
+    if largest < coherent_minimum:
+        print(
+            "  rejected achromatic candidate: "
+            f"{int(core.sum())} dark pixels form {component_count - 1} fragments; "
+            f"largest {largest}, need {coherent_minimum}"
+        )
         return None
     support = cv2.dilate(core.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
     return support, threshold
@@ -1552,6 +1759,75 @@ def local_colour_estimates(
     return rays, evidence
 
 
+def achromatic_exclusion(
+    collection: Collection,
+    rays: np.ndarray,
+    supports: list[np.ndarray | None],
+) -> np.ndarray:
+    """Pixels safely attributable to validated achromatic printing plates.
+
+    The raw colour classifier also responds to neutral cancellation, dirt and
+    scan defects.  A validated support is the spatial evidence that separates
+    those from a printing plate, so it must be applied *before* the exclusion
+    is dilated.  Otherwise a tiny valid plate support can still cause the whole
+    raw neutral mask to erase genuine coloured ink from the second stage.
+    """
+    excluded = np.zeros_like(collection.valid)
+    kernel = np.ones((7, 7), np.uint8)
+    for ray, support in zip(rays, supports):
+        for index, (image, paper, valid) in enumerate(
+            zip(collection.images, collection.papers, collection.valid)
+        ):
+            mask = valid & (achromatic_layer(image, paper, valid, ray) > 0)
+            if support is not None:
+                mask &= support
+            excluded[index] |= cv2.dilate(mask.astype(np.uint8), kernel) > 0
+    return excluded
+
+
+def persistent_colour_modes(
+    collection: Collection,
+    remaining: np.ndarray,
+    rays: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Keep colour modes that recur as an ink within individual stamps.
+
+    A pooled colour cloud can turn a batch or fading difference into another
+    mode: a few stamps then carry almost all observations of that "ink".  A
+    separate press run instead contributes a measurable cluster within most
+    usable impressions, even when it covers only a small part of each stamp.
+    Requiring a strict majority is proportional rather than a fixed stamp
+    count, so one- and two-stamp collections still receive a best effort.
+    """
+    rays = np.asarray(rays, np.float64)
+    shares = np.zeros((len(collection.images), len(rays)), np.float64)
+    usable = np.zeros(len(collection.images), bool)
+    for index, (image, valid, paper) in enumerate(
+        zip(collection.images, remaining, collection.papers)
+    ):
+        try:
+            directions = ink_palette.ink_directions(
+                image[None, ...], valid[None, ...], paper[None, ...]
+            )
+        except RuntimeError:
+            continue
+        assigned = np.argmax(directions @ rays.T, axis=1)
+        shares[index] = np.bincount(
+            assigned, minlength=len(rays)
+        ) / len(assigned)
+        usable[index] = True
+
+    usable_count = int(usable.sum())
+    required = max(1, usable_count // 2 + 1)
+    presence = np.sum(
+        shares[usable] >= ink_palette.MINOR_SHARE, axis=0
+    ) if usable_count else np.zeros(len(rays), int)
+    keep = presence >= required
+    if not keep.any() and len(rays):
+        keep[int(np.argmax(presence))] = True
+    return keep, presence, required
+
+
 def staged_palette(collection: Collection, args: Settings) -> dict:
     """Find neutral inks first, then name colours on what they did not print."""
     first = None
@@ -1598,23 +1874,22 @@ def staged_palette(collection: Collection, args: Settings) -> dict:
         threshold for threshold, keep in zip(first["achromatic_thresholds"], neutral) if keep
     ]
 
-    excluded = np.zeros_like(collection.valid)
-    for ray in neutral_rays:
-        for index, (image, paper, valid) in enumerate(
-            zip(collection.images, collection.papers, collection.valid)
-        ):
-            mask = achromatic_layer(image, paper, valid, ray) > 0
-            excluded[index] |= cv2.dilate(
-                mask.astype(np.uint8), np.ones((7, 7), np.uint8)
-            ) > 0
+    excluded = achromatic_exclusion(
+        collection, neutral_rays, neutral_supports
+    )
     remaining = collection.valid & ~excluded
 
-    local_rays, colour_evidence = local_colour_estimates(
-        collection, remaining, args.separation
-    )
-    has_colour = np.isfinite(local_rays).all(axis=1)
-    if not has_colour.any():
-        print("  colour search after achromatic extraction: no usable local estimate")
+    try:
+        directions = ink_palette.ink_directions(
+            collection.images, remaining, collection.papers
+        )
+        colours = ink_palette.find_coloured_palette(
+            directions,
+            max(1, args.inks - len(neutral_rays)),
+            args.separation,
+        )
+    except RuntimeError:
+        print("  colour search after achromatic extraction: no usable colour")
         result = dict(first)
         result.update(
             rays=neutral_rays,
@@ -1627,21 +1902,65 @@ def staged_palette(collection: Collection, args: Settings) -> dict:
         )
         return result
 
-    observed = local_rays[has_colour]
-    colour_ray = np.median(observed, axis=0)
-    colour_ray /= max(float(np.linalg.norm(colour_ray)), 1e-12)
-    variants, variant_shares = ink_palette.modes(
-        observed, separation=12.0, limit=args.inks, share=0.12
-    )
-    variant_text = ", ".join(
-        f"{bgr_hex(ink_palette.ink_colour(collection.paper, ray))} {share:.0%}"
-        for ray, share in zip(variants, variant_shares)
-    )
+    if colours["count"] > 1:
+        persistent, presence, required = persistent_colour_modes(
+            collection, remaining, colours["rays"]
+        )
+        if not persistent.all():
+            descriptions = ", ".join(
+                f"{bgr_hex(ink_palette.ink_colour(collection.paper, ray))} "
+                f"in {int(found)} usable stamps"
+                for ray, found in zip(colours["rays"][~persistent], presence[~persistent])
+            )
+            print(
+                "  rejected pooled colour variant(s) without per-stamp recurrence: "
+                f"{descriptions}; need {required} stamps"
+            )
+            colours = dict(colours)
+            colours["rays"] = colours["rays"][persistent]
+            colours["shares"] = colours["shares"][persistent]
+            colours["count"] = int(persistent.sum())
 
-    rays = np.vstack([neutral_rays, colour_ray])
-    shares = np.array([float(excluded.sum()), float(colour_evidence.sum())])
+    colour_rays = colours["rays"]
+    local_rays = None
+    variants = colour_rays
+    variant_shares = colours["shares"]
+    if colours["count"] == 1:
+        # Preserve the per-impression hue adaptation used for inks whose batch
+        # or water damage varies from stamp to stamp.  It is valid only when
+        # the residual has one spatial colour component; with two actual inks
+        # a single local median would merge them again.
+        estimates, colour_evidence = local_colour_estimates(
+            collection, remaining, args.separation
+        )
+        has_colour = np.isfinite(estimates).all(axis=1)
+        if has_colour.any():
+            observed = estimates[has_colour]
+            colour_ray = np.median(observed, axis=0)
+            colour_ray /= max(float(np.linalg.norm(colour_ray)), 1e-12)
+            colour_rays = colour_ray[None, :]
+            local_rays = estimates
+            variants, variant_shares = ink_palette.modes(
+                observed, separation=12.0, limit=args.inks, share=0.12
+            )
+            colour_weight = float(colour_evidence.sum())
+        else:
+            colour_weight = float(len(directions) * 9)
+    else:
+        has_colour = np.ones(len(collection.images), bool)
+        colour_weight = float(len(directions) * 9)
+
+    rays = np.vstack([neutral_rays, colour_rays])
+    colour_weights = np.asarray(colours["shares"], np.float64)
+    colour_weights /= max(float(colour_weights.sum()), 1e-12)
+    shares = np.concatenate(
+        [np.full(len(neutral_rays), float(excluded.sum()) / len(neutral_rays)),
+         colour_weight * colour_weights]
+    )
     shares /= max(float(shares.sum()), 1e-12)
-    flags = np.array([True, False])
+    flags = np.concatenate(
+        [np.ones(len(neutral_rays), bool), np.zeros(len(colour_rays), bool)]
+    )
     gram = np.clip(rays @ rays.T, -1.0, 1.0)
     angles = np.degrees(np.arccos(gram))
     apart = float(np.min(angles[~np.eye(len(rays), dtype=bool)]))
@@ -1649,10 +1968,20 @@ def staged_palette(collection: Collection, args: Settings) -> dict:
         f"  staged palette: excluded {excluded.sum() / max(collection.valid.sum(), 1):.1%} "
         f"as achromatic before colour search"
     )
-    print(
-        f"    one spatial colour component, {int(has_colour.sum())} local estimates; "
-        f"observed variants: {variant_text}"
+    colour_text = ", ".join(
+        f"{bgr_hex(ink_palette.ink_colour(collection.paper, ray))} {share:.0%}"
+        for ray, share in zip(variants, variant_shares)
     )
+    if colours["count"] == 1 and local_rays is not None:
+        print(
+            f"    one spatial colour component, {int(has_colour.sum())} local estimates; "
+            f"observed variants: {colour_text}"
+        )
+    else:
+        print(
+            f"    {colours['count']} spatial colour components after neutral extraction: "
+            f"{colour_text}"
+        )
     result = {
         "rays": rays,
         "shares": shares,
@@ -1661,12 +1990,13 @@ def staged_palette(collection: Collection, args: Settings) -> dict:
         "achromatic": flags,
         "achromatic_added": np.zeros(len(rays), bool),
         "achromatic_angle_deg": ink_palette.ACHROMATIC_DEG,
-        "achromatic_supports": neutral_supports + [None],
-        "achromatic_thresholds": neutral_thresholds + [None],
-        "local_colour_rays": local_rays,
+        "achromatic_supports": neutral_supports + [None] * len(colour_rays),
+        "achromatic_thresholds": neutral_thresholds + [None] * len(colour_rays),
         "colour_variants": variants,
         "colour_variant_shares": variant_shares,
     }
+    if local_rays is not None:
+        result["local_colour_rays"] = local_rays
     return reject_duplicate_achromatic_plate(collection, result, args)
 
 
@@ -1880,10 +2210,13 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
     scatter = float(np.mean(np.degrees(np.arccos(np.clip(
         np.stack([r["ink_ray"] for r in results]) @ back_ray, -1.0, 1.0
     )))))
-    separable = tilt > scatter
+    separable = background_direction_resolved(tilt, scatter)
+    ratio = tilt / max(scatter, 1e-9)
     print(
         f"  background ink stands {tilt:.2f} deg out of the main ink's plane "
-        f"against {scatter:.2f} deg of scatter in that direction: "
+        f"against {scatter:.2f} deg of scatter in that direction "
+        f"(ratio {ratio:.3f}, required "
+        f"{1.0 - BACKGROUND_DIRECTION_RELATIVE_TOLERANCE:.3f}): "
         + ("a resolved second ink" if separable
            else "not resolved, reading the sheet as a single ink")
     )
@@ -2332,6 +2665,85 @@ def report_halves(back: dict, covered: np.ndarray) -> None:
         )
 
 
+def unified_colour_layers(
+    collection: Collection, palette: dict
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split fixed-count inks without treating neutral colour as another pass.
+
+    Every requested ink competes in the same three-dimensional density space.
+    Neutral is offered only as a nuisance cancellation direction when none of
+    the requested inks is itself near-neutral; otherwise moving cancellations
+    are left for the collection-wide robust merge to remove.
+    """
+    rays = np.asarray(palette["rays"], np.float64)
+    local = palette.get("local_ink_rays")
+    supports = palette.get("ink_supports", [None] * len(rays))
+    ownership = palette.get("ink_ownership")
+    count, shape = len(rays), collection.images.shape[1:3]
+    layers = np.zeros((count, len(collection.images), *shape), np.float32)
+    readable = np.zeros((count, len(collection.images), *shape), bool)
+    has_neutral_ink = bool(
+        np.any(rays @ background_ink.NEUTRAL >= math.cos(math.radians(12.0)))
+    )
+    for index, (image, valid, paper) in enumerate(
+        zip(collection.images, collection.valid, collection.papers)
+    ):
+        stamp_rays = rays.copy()
+        if local is not None:
+            for ink in range(count):
+                if np.isfinite(local[index, ink]).all():
+                    stamp_rays[ink] = local[index, ink]
+        # Keep plate identity tied to the collection-wide centres.  A badly
+        # faded coloured ink can move close to the neutral ink on one stamp;
+        # letting that local estimate redefine the decision boundary makes the
+        # two plates exchange pixels and turns cancellations into artwork.  The
+        # local ray still measures density and renders that stamp's own colour.
+        columns = (
+            rays
+            if has_neutral_ink
+            else np.vstack([rays, background_ink.NEUTRAL])
+        )
+        density, magnitude = optical_density(image, paper)
+        directions = np.divide(
+            density,
+            magnitude[:, :, None],
+            out=np.zeros_like(density),
+            where=magnitude[:, :, None] > 1e-8,
+        )
+        flat = density.reshape(-1, 3)
+        amounts = flat @ columns.T
+        residual = np.linalg.norm(
+            flat[:, None, :] - amounts[:, :, None] * columns[None, :, :],
+            axis=2,
+        )
+        residual[amounts < 0.0] = np.inf
+        assigned = np.argmin(residual, axis=1).reshape(shape)
+        nuisance = (
+            np.zeros(shape, bool)
+            if has_neutral_ink
+            else assigned == count
+        )
+        base = valid & ~nuisance
+        for ink in range(count):
+            similarity = directions @ stamp_rays[ink]
+            if ownership is None:
+                identity = assigned == ink
+            else:
+                identity = ownership == ink
+            ink_mask = (
+                base
+                & identity
+                & (magnitude >= 0.05)
+                & (similarity >= math.cos(math.radians(50.0)))
+            )
+            if supports[ink] is not None:
+                ink_mask &= supports[ink]
+            projection = np.maximum(density @ stamp_rays[ink], 0.0)
+            layers[ink, index] = np.where(ink_mask, projection, 0.0)
+            readable[ink, index] = base
+    return layers, readable
+
+
 def colour_layers(
     collection: Collection, palette: dict
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -2341,6 +2753,9 @@ def colour_layers(
     removed before the remaining density is assigned between coloured inks;
     the colour model therefore cannot leak back into the black component.
     """
+    if palette.get("unified"):
+        return unified_colour_layers(collection, palette)
+
     rays = palette["rays"]
     count, shape = len(rays), collection.images.shape[1:3]
     layers = np.zeros((count, len(collection.images), *shape), np.float32)
@@ -2358,13 +2773,12 @@ def colour_layers(
         excluded = np.zeros(shape, bool)
         for ink in np.flatnonzero(neutral):
             layer = achromatic_layer(image, paper, mask, rays[ink])
-            raw_ink_mask = mask & (layer > 0)
-            excluded |= cv2.dilate(
-                raw_ink_mask.astype(np.uint8), np.ones((7, 7), np.uint8)
-            ) > 0
-            ink_mask = raw_ink_mask
+            ink_mask = mask & (layer > 0)
             if supports[ink] is not None:
                 ink_mask &= supports[ink]
+            excluded |= cv2.dilate(
+                ink_mask.astype(np.uint8), np.ones((7, 7), np.uint8)
+            ) > 0
             readable[ink, index] = ink_mask
             layers[ink, index] = np.where(ink_mask, layer, 0.0)
 
@@ -2412,6 +2826,7 @@ def screen_from_colour(
     ray: np.ndarray,
     args: Settings,
     indices: np.ndarray | None = None,
+    cell_min_strength: float | None = None,
 ) -> dict:
     """Read one colour plate as a ruled screen and merge it on its phase.
 
@@ -2517,7 +2932,12 @@ def screen_from_colour(
         geometry_step,
     )
     merged = background_golden(
-        turned, screen_corner, anchor, args.downsample, args.shift_limit
+        turned,
+        screen_corner,
+        anchor,
+        args.downsample,
+        args.shift_limit,
+        cell_min_strength=cell_min_strength,
     )
     # The screen field is only a registration target.  Once its transforms are
     # known, apply them to the complete colour plate so strong ornament strokes
@@ -2544,6 +2964,46 @@ def screen_from_colour(
     merged["geometry_window"] = geometry_window
     merged["geometry_step"] = geometry_step
     return merged
+
+
+def automatic_colour_screen_decision(screen: dict) -> tuple[bool, str]:
+    """Decide whether a colour plate is genuinely registered by a ruling.
+
+    A periodic peak by itself is insufficient: a compact solid motif can put a
+    weak accidental peak in the allowed pitch band.  Strong periodic evidence
+    is useful as a small-collection best effort; otherwise require the resolved
+    two-dimensional cells to agree on held-out image structure.
+    """
+    alone = np.asarray(screen.get("alone", []), np.float64)
+    finite = alone[np.isfinite(alone)]
+    strength = float(finite.max()) if len(finite) else float("nan")
+    if not np.isfinite(strength):
+        return False, "no finite screen-strength measurement"
+    if strength >= AUTO_COLOUR_SCREEN_STRONG_STRENGTH:
+        return True, (
+            f"strong periodic evidence {strength:.2f} >= "
+            f"{AUTO_COLOUR_SCREEN_STRONG_STRENGTH:.2f}"
+        )
+    if strength < AUTO_COLOUR_SCREEN_MIN_STRENGTH:
+        return False, (
+            f"periodic evidence {strength:.2f} < "
+            f"{AUTO_COLOUR_SCREEN_MIN_STRENGTH:.2f}"
+        )
+
+    held_out = float(
+        screen.get("cell_validation", {}).get("consensus", float("nan"))
+    )
+    if not np.isfinite(held_out):
+        return False, "moderate periodic evidence has no held-out cell validation"
+    if held_out < AUTO_COLOUR_SCREEN_MIN_HELD_OUT:
+        return False, (
+            f"held-out cell agreement {held_out:+.3f} < "
+            f"{AUTO_COLOUR_SCREEN_MIN_HELD_OUT:+.3f}"
+        )
+    return True, (
+        f"periodic evidence {strength:.2f} with held-out cell agreement "
+        f"{held_out:+.3f}"
+    )
 
 
 def colour_passes(collection: Collection, palette: dict, args: Settings) -> list[Pass]:
@@ -2650,12 +3110,29 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
             else "best effort; too few selected impressions for a half-set check"
         )
 
-        local_rays = palette.get("local_colour_rays")
+        local_rays = palette.get("local_ink_rays")
+        if local_rays is None:
+            local_rays = palette.get("local_colour_rays")
+
+        def local_ray(index: int) -> np.ndarray | None:
+            if local_rays is None:
+                return None
+            candidate = (
+                local_rays[index, ink]
+                if np.asarray(local_rays).ndim == 3
+                else local_rays[index]
+            )
+            if not np.isfinite(candidate).all():
+                return None
+            result = np.asarray(candidate, np.float64).copy()
+            result /= max(float(np.linalg.norm(result)), 1e-12)
+            return result
+
         if local_rays is not None:
-            usable_rays = local_rays[selected]
-            usable_rays = usable_rays[np.isfinite(usable_rays).all(axis=1)]
+            usable_rays = [local_ray(int(index)) for index in chosen]
+            usable_rays = [value for value in usable_rays if value is not None]
             if len(usable_rays):
-                ray = np.median(usable_rays, axis=0)
+                ray = np.median(np.stack(usable_rays), axis=0)
                 ray /= max(float(np.linalg.norm(ray)), 1e-12)
                 colour = bgr_hex(ink_palette.ink_colour(collection.paper, ray))
                 name = f"{role} {ink + 1} {colour}"
@@ -2670,9 +3147,9 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
 
         def observed_ray(index: int) -> np.ndarray:
             result = ray.copy()
-            if local_rays is not None and np.isfinite(local_rays[index]).all():
-                result = np.asarray(local_rays[index], np.float64).copy()
-                result /= max(float(np.linalg.norm(result)), 1e-12)
+            observed = local_ray(index)
+            if observed is not None:
+                result = observed
             return result
 
         # The first two columns preserve the observations exactly as extracted:
@@ -2728,74 +3205,104 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
         )
         note = f"turn sd {np.std(turns):.3f} deg, ECC {median_score:.2f}"
 
-        if args.screen_ink == ink + 1:
-            print(f"    reading {name} as a ruled screen as well:")
+        forced_screen = args.screen_ink == ink + 1
+        automatic_screen = args.screen_ink == 0
+        if forced_screen or automatic_screen:
+            mode = "forced" if forced_screen else "automatic probe"
+            print(f"    reading {name} as a ruled screen as well ({mode}):")
             # Preservation ranks the whole coloured motif for the ordinary
             # ECC merge.  It is intentionally not an admission test for the
             # screen resolver: a worn impression can be poor overall while
             # still exposing a large, clean patch of ruling.  Give that route
             # every measurable impression and let its own screen-strength
             # selection decide which ones contribute.
-            crisped = screen_from_colour(
-                collection,
-                layers[ink],
-                readable[ink],
-                ray,
-                args,
-                np.arange(len(collection.numbers)),
-            )
-            settled = np.array(
-                [fit_wave(
-                    e["density"],
-                    e["field"],
-                    crisped["wave"],
-                    crisped["geometry_window"],
-                    crisped["geometry_step"],
+            try:
+                crisped = screen_from_colour(
+                    collection,
+                    layers[ink],
+                    readable[ink],
+                    ray,
+                    args,
+                    np.arange(len(collection.numbers)),
+                    cell_min_strength=(
+                        None if forced_screen else AUTO_COLOUR_SCREEN_MIN_STRENGTH
+                    ),
                 )
-                 ["bearing"] for e in crisped["entries"]]
-            )
-            print(
-                f"    screen {crisped['pitch']:.3f} px, merge gain {crisped['gain']:.2f}x, "
-                f"bearing brought to {crisped['reference']:+.3f} deg: spread "
-                f"{np.ptp(crisped['bearings']):.3f} -> {np.ptp(settled):.3f} deg; "
-                f"geometry window {crisped['geometry_window']}/"
-                f"{crisped['geometry_step']} px"
-            )
-            report_selection(crisped, crisped["entries"], len(crisped["entries"]))
-            report_cell_variants(crisped)
-            by_kind = {
-                candidate["kind"]: candidate
-                for candidate in crisped["comparisons"]
-            }
-            cells = crisped.get("cell_resolution")
-            if cells is not None:
-                for kind in ("anchor", "consensus"):
-                    candidate = by_kind.get(kind)
-                    if candidate is None:
-                        continue
-                    try:
-                        full_golden, full_seen, best_source = best_preserving_colour_merge(
-                            crisped["turned_entries"],
-                            cells[f"{kind}_shifts"],
-                            chosen,
-                            preservation,
+            except RuntimeError as error:
+                print(f"    screen route unavailable; keeping ordinary colour merge: {error}")
+                crisped = None
+
+            if crisped is not None:
+                settled = np.array(
+                    [fit_wave(
+                        e["density"],
+                        e["field"],
+                        crisped["wave"],
+                        crisped["geometry_window"],
+                        crisped["geometry_step"],
+                    )["bearing"] for e in crisped["entries"]]
+                )
+                print(
+                    f"    screen {crisped['pitch']:.3f} px, "
+                    f"merge gain {crisped['gain']:.2f}x, "
+                    f"bearing brought to {crisped['reference']:+.3f} deg: spread "
+                    f"{np.ptp(crisped['bearings']):.3f} -> {np.ptp(settled):.3f} deg; "
+                    f"geometry window {crisped['geometry_window']}/"
+                    f"{crisped['geometry_step']} px"
+                )
+                report_selection(crisped, crisped["entries"], len(crisped["entries"]))
+                report_cell_variants(crisped)
+                accepted, decision = (
+                    (True, "explicit --screen-ink override")
+                    if forced_screen
+                    else automatic_colour_screen_decision(crisped)
+                )
+                decision_kind = "forced" if forced_screen else "automatic"
+                print(
+                    f"    {decision_kind} screen decision: "
+                    f"{'accepted' if accepted else 'rejected'}; {decision}"
+                )
+
+                by_kind = {
+                    candidate["kind"]: candidate
+                    for candidate in crisped["comparisons"]
+                }
+                cells = crisped.get("cell_resolution")
+                if accepted and cells is not None:
+                    for kind in ("anchor", "consensus"):
+                        candidate = by_kind.get(kind)
+                        if candidate is None:
+                            continue
+                        try:
+                            full_golden, full_seen, best_source = best_preserving_colour_merge(
+                                crisped["turned_entries"],
+                                cells[f"{kind}_shifts"],
+                                chosen,
+                                preservation,
+                            )
+                        except RuntimeError as error:
+                            print(f"    {kind} full-colour merge unavailable: {error}")
+                            continue
+                        candidate["golden"] = full_golden
+                        candidate["seen"] = full_seen
+                        candidate["note"] += (
+                            f"; full colour anchored to preservation-best stamp "
+                            f"#{collection.numbers[best_source]}"
                         )
-                    except RuntimeError as error:
-                        print(f"    {kind} full-colour merge unavailable: {error}")
-                        continue
-                    candidate["golden"] = full_golden
-                    candidate["seen"] = full_seen
-                    candidate["note"] += (
-                        f"; full colour anchored to preservation-best stamp "
-                        f"#{collection.numbers[best_source]}"
-                    )
-                    print(
-                        f"    {kind} full-colour merge preserves stamp "
-                        f"#{collection.numbers[best_source]} and fills only its unreadable pixels"
-                    )
-            consensus = by_kind.get("consensus")
-            anchor = by_kind.get("anchor")
-            if consensus is not None:
+                        print(
+                            f"    {kind} full-colour merge preserves stamp "
+                            f"#{collection.numbers[best_source]} and fills only its unreadable pixels"
+                        )
+                consensus = by_kind.get("consensus")
+                anchor = by_kind.get("anchor")
+                screen_primary = (
+                    consensus if consensus is not None else by_kind.get("best")
+                )
+            else:
+                accepted = False
+                consensus = anchor = screen_primary = None
+
+            if accepted and screen_primary is not None:
                 # Use exactly the same primary/diagnostic layout as the
                 # single-colour background route.  Here "legacy" deliberately
                 # means the established whole-design ECC result: it is the
@@ -2805,12 +3312,16 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
                 single_seen = comparison_seen[:2]
                 single_rays = comparison_rays[:2]
 
-                golden, seen = consensus["golden"], consensus["seen"]
-                primary_note = "consensus"
-                note = (
-                    f"screen {crisped['pitch']:.2f} px; "
-                    "global pairwise 2D-cell consensus"
-                )
+                golden, seen = screen_primary["golden"], screen_primary["seen"]
+                if consensus is not None:
+                    primary_note = "consensus"
+                    note = (
+                        f"screen {crisped['pitch']:.2f} px; "
+                        "global pairwise 2D-cell consensus"
+                    )
+                else:
+                    primary_note = "screen best effort"
+                    note = f"screen {crisped['pitch']:.2f} px; strongest single impression"
                 comparison_goldens = [legacy_golden, *single_goldens]
                 comparison_seen = [legacy_seen, *single_seen]
                 comparison_rays = [ray.copy(), *single_rays]
@@ -2990,7 +3501,11 @@ def build(scan: Path, args: Settings) -> Path:
     output = args.output or scan.with_name(f"{scan.stem}_golden_components.png")
     collection = load_collection(scan, args)
 
-    palette = staged_palette(collection, args)
+    palette = (
+        unified_palette(collection, args.ink_count)
+        if args.ink_count is not None
+        else staged_palette(collection, args)
+    )
     print("  " + ink_palette.describe(palette, collection.paper))
     for index, support in enumerate(palette["achromatic_supports"]):
         if support is not None:

@@ -159,6 +159,61 @@ def modes(
     return np.stack(centres), np.array(weights)
 
 
+def fixed_modes(
+    directions: np.ndarray,
+    count: int,
+    neighbourhood_deg: float = 12.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Find exactly ``count`` dense modes on the full density sphere.
+
+    This is the fixed-count experimental counterpart of :func:`modes`.  It
+    does not remove the neutral axis and does not stop when a component is
+    small: the caller supplies the number of printing inks from external
+    knowledge.  Centres are seeded by density peeling rather than ordinary
+    k-means, because a small oval plate must not lose to a second subdivision
+    of the dominant frame colour.
+    """
+    if count < 1:
+        raise ValueError("Ink count must be positive")
+    if len(directions) < count:
+        raise RuntimeError(
+            f"Only {len(directions)} ink observations for {count} requested inks"
+        )
+    sample = np.asarray(
+        directions[:: max(1, len(directions) // 16000)], np.float64
+    )
+    sample /= np.maximum(np.linalg.norm(sample, axis=1, keepdims=True), 1e-12)
+    cosine = math.cos(math.radians(neighbourhood_deg))
+    live = np.ones(len(sample), bool)
+    centres: list[np.ndarray] = []
+    for _ in range(count):
+        pool = sample[live]
+        if not len(pool):
+            # Degenerate but still deterministic: split at the observation
+            # least well explained by the centres already selected.
+            similarities = sample @ np.stack(centres).T
+            seed = sample[int(np.argmin(np.max(similarities, axis=1)))]
+            pool = sample
+            neighbours = (pool @ seed) >= cosine
+        else:
+            probes = pool[:: max(1, len(pool) // 2000)]
+            neighbours_by_probe = (probes @ pool.T) >= cosine
+            seed_index = int(np.argmax(neighbours_by_probe.sum(axis=1)))
+            neighbours = neighbours_by_probe[seed_index]
+        centre = np.median(pool[neighbours], axis=0)
+        centre /= max(float(np.linalg.norm(centre)), 1e-12)
+        centres.append(centre)
+        live &= (sample @ centre) < cosine
+
+    centres_array = np.stack(centres)
+    assignment = np.argmax(sample @ centres_array.T, axis=1)
+    weights = np.array(
+        [float(np.mean(assignment == index)) for index in range(count)]
+    )
+    order = np.argsort(-weights)
+    return centres_array[order], weights[order]
+
+
 def find_palette(
     directions: np.ndarray,
     limit: int = 4,

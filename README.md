@@ -543,8 +543,14 @@ opposed to the perforation that surrounds it. It consumes a scan plus the `data_
 written by the detector.
 
 ```
-python design_size/measure_design.py scan.jpg --dpi 1200
+python design_size/measure_design.py scan.jpg --dpi 1200 --ink-count 2
 ```
+
+`--ink-count` is required and names the known number of primary printing inks.
+They are separated together in full optical-density space, so neutral and coloured
+inks follow the same reconstruction path. Use `1` for issues with one primary ink;
+the independently registered background pass, where applicable, is not included in
+this number.
 
 | file | contents |
 | --- | --- |

@@ -1,9 +1,26 @@
+import subprocess
+import sys
 import unittest
+from pathlib import Path
 
 import cv2
 import numpy as np
 
 from design_size import measure_design
+
+
+class CommandLineTest(unittest.TestCase):
+    def test_ink_count_is_required(self):
+        script = Path(measure_design.__file__)
+        result = subprocess.run(
+            [sys.executable, str(script), "missing.jpg", "--dpi", "1200"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("the following arguments are required: --ink-count", result.stderr)
 
 
 def synthetic_design(width, height, frame_px=14, margin=40):

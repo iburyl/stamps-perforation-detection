@@ -1193,7 +1193,7 @@ def measure_scan(image, document, schedule, iterations, eps, cutoff,
         skipped, candidates, registration
 
 
-def build_components(scan_path, perf_path, design_path, screen_ink, verbose):
+def build_components(scan_path, perf_path, design_path, screen_ink, ink_count, verbose):
     """Split the golden into the printing passes it was struck from.
 
     The splitter sits in a sibling directory and imports its own siblings by
@@ -1205,7 +1205,8 @@ def build_components(scan_path, perf_path, design_path, screen_ink, verbose):
     import golden_components
 
     settings = golden_components.Settings(
-        perf=perf_path, design=design_path, screen_ink=screen_ink)
+        perf=perf_path, design=design_path, screen_ink=screen_ink,
+        ink_count=ink_count)
     sink = contextlib.nullcontext() if verbose \
         else contextlib.redirect_stdout(io.StringIO())
     with sink:
@@ -1286,10 +1287,17 @@ def main():
               'printing passes it was struck from'))
     parser.add_argument(
         '--screen-ink', type=int, default=0, metavar='N',
-        help=('Also read the Nth colour plate as a ruled screen and merge it '
-              'on the phase of its engraved ground, rather than on its '
-              'outline. Only applies where several colours were found; the '
-              'plates are numbered as the run reports them (default: off)'))
+        help=('Force the Nth colour plate to be read as a ruled screen and '
+              'merged on the phase of its engraved ground. When omitted, '
+              'coloured plates are probed automatically and the screen route '
+              'is used only when periodic and held-out evidence supports it; '
+              'plates are numbered as the run reports them'))
+    parser.add_argument(
+        '--ink-count', type=int, required=True, metavar='N',
+        help=('Required number of primary printing inks. They are '
+              'found together in full optical-density space, including '
+              'neutral inks. N=1 keeps the existing main-plus-background '
+              'reconstruction path; background is not included in N.'))
     parser.add_argument('--quiet', action='store_true', help='Suppress progress')
     args = parser.parse_args()
 
@@ -1309,6 +1317,8 @@ def main():
         parser.error('--reveal-window must be an odd number of pixels, >= 3')
     if args.screen_ink < 0:
         parser.error('--screen-ink must be a plate number, counted from 1')
+    if args.ink_count < 1:
+        parser.error('--ink-count must be positive')
 
     input_path = Path(args.input)
     perf_path = Path(args.perf) if args.perf else \
@@ -1475,7 +1485,7 @@ def main():
             print()
         try:
             build_components(input_path, perf_path, out_path,
-                             args.screen_ink, verbose)
+                             args.screen_ink, args.ink_count, verbose)
         except RuntimeError as error:
             # A scan too small or too worn to separate still has a valid golden.
             print(f'Printing passes not separated: {error}')

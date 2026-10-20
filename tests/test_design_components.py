@@ -26,6 +26,59 @@ def render_density(density, paper):
     return background_ink.to_srgb(linear * 10.0 ** (-density)).astype(np.uint8)
 
 
+class BackgroundDirectionTests(unittest.TestCase):
+    def test_current_5k_remains_single_ink(self):
+        self.assertFalse(
+            golden_components.background_direction_resolved(3.524, 4.132)
+        )
+
+    def test_current_7k_near_tie_keeps_background_evidence(self):
+        self.assertTrue(
+            golden_components.background_direction_resolved(4.141, 4.152)
+        )
+
+    def test_nonfinite_direction_is_not_published(self):
+        self.assertFalse(
+            golden_components.background_direction_resolved(float("nan"), 4.0)
+        )
+
+
+class AutomaticColourScreenTests(unittest.TestCase):
+    @staticmethod
+    def candidate(strength, held_out=None):
+        return {
+            "alone": [strength],
+            "cell_resolution": {} if held_out is not None else None,
+            "cell_validation": (
+                {"consensus": held_out} if held_out is not None else {}
+            ),
+        }
+
+    def test_v5_moderate_screen_is_accepted_by_held_out_agreement(self):
+        accepted, _ = golden_components.automatic_colour_screen_decision(
+            self.candidate(5.36, 0.017)
+        )
+        self.assertTrue(accepted)
+
+    def test_viii_7k_accidental_period_is_rejected(self):
+        accepted, _ = golden_components.automatic_colour_screen_decision(
+            self.candidate(3.60, -0.0004)
+        )
+        self.assertFalse(accepted)
+
+    def test_moderate_period_needs_held_out_confirmation(self):
+        accepted, _ = golden_components.automatic_colour_screen_decision(
+            self.candidate(7.55)
+        )
+        self.assertFalse(accepted)
+
+    def test_strong_single_impression_remains_a_best_effort(self):
+        accepted, _ = golden_components.automatic_colour_screen_decision(
+            self.candidate(20.65)
+        )
+        self.assertTrue(accepted)
+
+
 class PaletteTests(unittest.TestCase):
     def test_achromatic_mode_does_not_replace_coloured_mode(self):
         neutral = unit([1.0, 1.0, 1.0])
@@ -55,6 +108,21 @@ class PaletteTests(unittest.TestCase):
         self.assertEqual(palette["count"], 1)
         self.assertFalse(palette["achromatic"].any())
         self.assertGreater(float(palette["rays"][0] @ coloured), 0.999)
+
+    def test_fixed_modes_include_neutral_and_small_colour_together(self):
+        neutral = unit([1.0, 1.0, 1.0])
+        coloured = unit([0.08, 0.50, 0.86])
+        directions = np.vstack(
+            [np.repeat(neutral[None, :], 9000, axis=0),
+             np.repeat(coloured[None, :], 500, axis=0)]
+        )
+
+        rays, shares = ink_palette.fixed_modes(directions, 2)
+
+        self.assertEqual(len(rays), 2)
+        self.assertGreater(float(np.max(rays @ neutral)), 0.999)
+        self.assertGreater(float(np.max(rays @ coloured)), 0.999)
+        self.assertAlmostEqual(float(shares.sum()), 1.0)
 
 
 class AchromaticLayerTests(unittest.TestCase):
@@ -110,6 +178,178 @@ class AchromaticLayerTests(unittest.TestCase):
         self.assertLess(float(np.max(layers[0, :, 5:17, 48:74])), 0.05)
         self.assertGreater(float(np.median(layers[1, :, 30:60, 82:100])), 0.5)
         self.assertTrue(readable[1, :, 40, 90].all())
+
+    def test_fragmented_neutral_speckle_is_not_a_printing_plate(self):
+        count, height, width = 7, 180, 180
+        paper = np.array([205.0, 198.0, 178.0])
+        neutral = unit([1.0, 1.0, 1.0])
+        density = np.zeros((height, width, 3), np.float64)
+        density[10:170:4, 10:170:4] = 1.0 * neutral
+        image = render_density(density, paper)
+        images = np.repeat(image[None, ...], count, axis=0)
+        valid = np.ones((count, height, width), bool)
+        collection = golden_components.Collection(
+            scan=Path("speckle.png"),
+            images=images,
+            valid=valid,
+            numbers=list(range(count)),
+            papers=np.repeat(paper[None, :], count, axis=0),
+            paper=paper,
+            baseline=image,
+            covered=np.ones((height, width), bool),
+            corner=(0, 0),
+        )
+
+        support = golden_components.achromatic_support(
+            collection, neutral[None, :], 0
+        )
+
+        self.assertIsNone(support)
+
+    def test_achromatic_exclusion_is_limited_to_validated_support(self):
+        collection, neutral, coloured = self.make_collection()
+        palette = golden_components.validate_achromatic_palette(
+            collection,
+            {
+                "rays": np.stack([neutral, coloured]),
+                "shares": np.array([0.5, 0.5]),
+                "count": 2,
+                "separation_deg": 30.0,
+                "achromatic": np.array([True, False]),
+                "achromatic_added": np.array([False, False]),
+            },
+        )
+
+        excluded = golden_components.achromatic_exclusion(
+            collection,
+            neutral[None, :],
+            [palette["achromatic_supports"][0]],
+        )
+
+        self.assertTrue(excluded[:, 40, 25].all())
+        self.assertFalse(excluded[:, 10, 60].any())
+
+    def test_staged_palette_keeps_two_colours_after_neutral_ink(self):
+        count, height, width = 7, 180, 240
+        paper = np.array([205.0, 198.0, 178.0])
+        neutral = unit([1.0, 1.0, 1.0])
+        blue = unit([0.08, 0.50, 0.86])
+        red = unit([0.86, 0.45, 0.08])
+        density = np.zeros((height, width, 3), np.float64)
+        density[20:160, 10:60] = 1.0 * neutral
+        # Keep the two coloured plates below the dense-pixel percentile as a
+        # group, while leaving more than 200 stride-sampled pixels in each.
+        density[20:110, 80:150] = 0.8 * blue
+        density[50:100, 180:230] = 0.8 * red
+        image = render_density(density, paper)
+        images = np.repeat(image[None, ...], count, axis=0)
+        valid = np.ones((count, height, width), bool)
+        collection = golden_components.Collection(
+            scan=Path("three-inks.png"),
+            images=images,
+            valid=valid,
+            numbers=list(range(count)),
+            papers=np.repeat(paper[None, :], count, axis=0),
+            paper=paper,
+            baseline=image,
+            covered=np.ones((height, width), bool),
+            corner=(0, 0),
+        )
+
+        palette = golden_components.staged_palette(
+            collection, golden_components.Settings(inks=4, separation=25.0)
+        )
+
+        self.assertEqual(palette["count"], 3)
+        self.assertEqual(int(np.sum(palette["achromatic"])), 1)
+        colours = palette["rays"][~palette["achromatic"]]
+        self.assertGreater(float(np.max(colours @ blue)), 0.99)
+        self.assertGreater(float(np.max(colours @ red)), 0.99)
+        self.assertNotIn("local_colour_rays", palette)
+
+    def test_colour_seen_only_in_a_minority_is_treated_as_a_variant(self):
+        count, height, width = 7, 140, 180
+        paper = np.array([205.0, 198.0, 178.0])
+        blue = unit([0.08, 0.50, 0.86])
+        red = unit([0.86, 0.45, 0.08])
+        images = []
+        for index in range(count):
+            density = np.zeros((height, width, 3), np.float64)
+            density[30:100, 45:135] = 0.8 * (red if index < 3 else blue)
+            images.append(render_density(density, paper))
+        images = np.stack(images)
+        valid = np.ones((count, height, width), bool)
+        collection = golden_components.Collection(
+            scan=Path("batch-variants.png"),
+            images=images,
+            valid=valid,
+            numbers=list(range(count)),
+            papers=np.repeat(paper[None, :], count, axis=0),
+            paper=paper,
+            baseline=np.median(images, axis=0).astype(np.uint8),
+            covered=np.ones((height, width), bool),
+            corner=(0, 0),
+        )
+
+        keep, presence, required = golden_components.persistent_colour_modes(
+            collection, valid, np.stack([blue, red])
+        )
+
+        np.testing.assert_array_equal(presence, np.array([4, 3]))
+        np.testing.assert_array_equal(keep, np.array([True, False]))
+        self.assertEqual(required, 4)
+
+    def test_unified_palette_keeps_neutral_ink_and_local_colour_variation(self):
+        count, height, width = 7, 180, 240
+        paper = np.array([205.0, 198.0, 178.0])
+        neutral = unit([1.0, 1.0, 1.0])
+        mauve = unit([0.43, 0.76, 0.50])
+        blue = unit([0.08, 0.50, 0.86])
+        images = []
+        for index in range(count):
+            density = np.zeros((height, width, 3), np.float64)
+            density[20:160, 15:65] = 1.0 * neutral
+            density[30:150, 100:180] = 0.75 * (
+                mauve if index < 3 else blue
+            )
+            images.append(render_density(density, paper))
+        images = np.stack(images)
+        valid = np.ones((count, height, width), bool)
+        collection = golden_components.Collection(
+            scan=Path("unified-variants.png"),
+            images=images,
+            valid=valid,
+            numbers=list(range(count)),
+            papers=np.repeat(paper[None, :], count, axis=0),
+            paper=paper,
+            baseline=np.median(images, axis=0).astype(np.uint8),
+            covered=np.ones((height, width), bool),
+            corner=(0, 0),
+        )
+
+        palette = golden_components.unified_palette(collection, 2)
+        neutral_ink = int(np.argmax(palette["rays"] @ neutral))
+        colour_ink = 1 - neutral_ink
+        local = palette["local_ink_rays"][:, colour_ink]
+        layers, _ = golden_components.colour_layers(collection, palette)
+
+        self.assertFalse(palette["achromatic"].any())
+        self.assertTrue(np.isfinite(local).all())
+        self.assertTrue(np.all(local[:3] @ mauve > local[:3] @ blue))
+        self.assertTrue(np.all(local[3:] @ blue > local[3:] @ mauve))
+        self.assertGreater(
+            float(np.median(layers[neutral_ink, :, 40:140, 25:55])), 0.7
+        )
+        colour_density = np.median(
+            layers[colour_ink, :, 50:130, 110:170], axis=(1, 2)
+        )
+        self.assertTrue(
+            np.all(colour_density > 0.55),
+            msg=f"shifted local colours lost from their plate: {colour_density}",
+        )
+        self.assertLess(
+            float(np.max(layers[colour_ink, :, 40:140, 25:55])), 0.05
+        )
 
     def test_achromatic_mask_keeps_black_and_suppresses_colour(self):
         height, width = 80, 120
