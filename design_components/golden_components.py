@@ -1413,6 +1413,8 @@ class Collection:
     baseline: np.ndarray
     covered: np.ndarray
     corner: tuple[int, int]
+    # The design sidecar, kept for where each stamp sits in the original scan.
+    design: dict = field(default_factory=dict)
 
 
 def averaged_achromatic_pass(collection: Collection, palette: dict) -> list[Pass]:
@@ -1801,6 +1803,7 @@ def load_collection(scan: Path, args: Settings) -> Collection:
         baseline=np.clip(masked_colour_median(images, valid), 0, 255).astype(np.uint8),
         covered=valid.sum(axis=0) >= collection_quorum(len(images)),
         corner=corner,
+        design=design,
     )
 
 
@@ -2841,6 +2844,118 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
     return passes
 
 
+def stamp_ink_colours(
+    collection: Collection, passes: list[Pass]
+) -> dict[int, list[tuple[float, float, float] | None]]:
+    """Each stamp's own rendering of every plate's ink.
+
+    The templates say where a plate printed; the colour is then read from the
+    impressions themselves, so a stamp struck in a different shade reports a
+    different colour instead of being averaged into the collection's.  Each
+    plate's core is taken where it printed heavily and the other plates did not,
+    so one circle stands for one ink rather than for an overprint.
+    """
+    levels = []
+    for entry in passes:
+        # Measured over the pixels the plate actually printed on, so a minor
+        # ink covering a tenth of the sheet still gets a usable threshold.
+        printed = entry.seen & collection.covered & (entry.golden > 0)
+        if printed.sum() < 400:
+            levels.append(None)
+            continue
+        heavy, light = np.percentile(entry.golden[printed], [80, 40])
+        levels.append((printed, float(heavy), float(light)))
+
+    cores = []
+    for index, entry in enumerate(passes):
+        if levels[index] is None:
+            cores.append(None)
+            continue
+        printed, heavy, _ = levels[index]
+        core = printed & (entry.golden >= heavy)
+        for other, level in enumerate(levels):
+            if other != index and level is not None:
+                core &= passes[other].golden <= level[2]
+        core = cv2.erode(core.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        cores.append(core if core.sum() >= 150 else None)
+
+    colours: dict[int, list] = {}
+    for index, number in enumerate(collection.numbers):
+        image = collection.images[index]
+        grey = cv2.cvtColor(np.clip(image, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        row = []
+        for core in cores:
+            picked = None if core is None else core & collection.valid[index]
+            if picked is None or picked.sum() < 50:
+                row.append(None)
+                continue
+            values, luminance = image[picked], grey[picked]
+            # A cancellation only ever darkens, so dropping the darkest quarter
+            # leaves a struck impression reporting its ink and not the postmark.
+            keep = luminance >= np.percentile(luminance, 25)
+            row.append(tuple(float(value) for value in np.median(values[keep], axis=0)))
+        colours[number] = row
+    return colours
+
+
+def mark_clean_scan(collection: Collection, passes: list[Pass]) -> Path | None:
+    """Write each stamp's number and its own ink colours onto the cleaned scan.
+
+    The cleaned scan is the one image in the set that still has every stamp in
+    its original place, which makes it the natural sheet to compare impressions
+    on.  Each stamp is marked with its number and one filled circle per plate,
+    in the order the passes were recovered.
+    """
+    clean = collection.scan.with_name(f"{collection.scan.stem}_design_clean.jpg")
+    if not clean.exists():
+        return None
+    image = cv2.imread(str(clean), cv2.IMREAD_COLOR)
+    if image is None:
+        return None
+    anchors = {
+        row["stamp"]: np.asarray(row["design_corners_image"], np.float64)
+        for row in collection.design.get("stamps", [])
+        if row.get("design_corners_image")
+    }
+    colours = stamp_ink_colours(collection, passes)
+    height, width = image.shape[:2]
+    radius = max(6, round(max(height, width) / 220))
+    thickness = max(1, round(max(height, width) / 1800))
+    scale = max(0.5, max(height, width) / 2600)
+    ink = (40, 40, 40)
+    for number, inks in colours.items():
+        corners = anchors.get(number)
+        shown = [colour for colour in inks if colour is not None]
+        if corners is None or not shown:
+            continue
+        label = str(number)
+        (text_width, text_height), _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness + 1
+        )
+        step = round(radius * 2.4)
+        x = int(round(corners[:, 0].min())) + radius * 2
+        y = int(round(corners[:, 1].min())) + radius * 2 + text_height
+        span = text_width + radius * 2 + step * len(shown)
+        plate = image.copy()
+        cv2.rectangle(
+            plate, (x - radius, y - text_height - radius), (x + span, y + radius),
+            (255, 255, 255), -1,
+        )
+        cv2.addWeighted(plate, 0.72, image, 0.28, 0.0, image)
+        cv2.putText(image, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, ink,
+                    thickness + 1, cv2.LINE_AA)
+        middle = y - text_height // 2
+        centre = x + text_width + radius * 2
+        for colour in shown:
+            spot = tuple(int(round(min(255.0, max(0.0, value)))) for value in colour)
+            cv2.circle(image, (centre, middle), radius, spot, -1, cv2.LINE_AA)
+            cv2.circle(image, (centre, middle), radius, ink, thickness, cv2.LINE_AA)
+            centre += step
+    if not cv2.imwrite(str(clean), image):
+        raise RuntimeError(f"Cannot write image: {clean}")
+    return clean
+
+
 def write_panel(
     rows: list[list[tuple[np.ndarray, str]]], output: Path, width: int
 ) -> Path:
@@ -2935,6 +3050,12 @@ def build(scan: Path, args: Settings) -> Path:
         f"  design edge energy over {band.sum()} edge pixels: "
         f"golden {before:.2f} -> rebuilt {after:.2f} ({gain:+.1%})"
     )
+
+    marked = mark_clean_scan(collection, passes)
+    if marked is not None:
+        print(
+            f"  Marked {len(passes)} ink(s) per stamp on {marked.name}"
+        )
 
     comparison_count = max((len(entry.comparison_goldens) for entry in passes), default=0)
     comparison_rebuilds = []

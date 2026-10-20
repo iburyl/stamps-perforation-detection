@@ -470,5 +470,65 @@ class ScreenCellRegistrationTests(unittest.TestCase):
         self.assertGreater(correct_score, wrong_score + 0.05)
 
 
+class StampInkColourTests(unittest.TestCase):
+    def make_collection(self, faded):
+        count, height, width = 5, 80, 120
+        paper = np.array([208.0, 200.0, 182.0])
+        rays = (unit([0.15, 0.30, 0.90]), unit([0.20, 0.85, 0.25]))
+        images = []
+        for index in range(count):
+            density = np.zeros((height, width, 3), np.float64)
+            weight = 0.35 if index == faded else 1.0
+            density[20:60, 10:50] = weight * 1.0 * rays[0]
+            density[20:60, 70:110] = weight * 1.0 * rays[1]
+            # A cancellation darkens part of the first plate on every stamp.
+            density[20:60, 10 + 4 * index:14 + 4 * index] += 1.6 * unit([1.0, 1.0, 1.0])
+            images.append(render_density(density, paper))
+        images = np.stack(images)
+        collection = golden_components.Collection(
+            scan=Path("synthetic.png"),
+            images=images,
+            valid=np.ones((count, height, width), bool),
+            numbers=list(range(1, count + 1)),
+            papers=np.repeat(paper[None, :], count, axis=0),
+            paper=paper,
+            baseline=np.median(images, axis=0).astype(np.uint8),
+            covered=np.ones((height, width), bool),
+            corner=(0, 0),
+        )
+        passes = []
+        for name, ray, columns in (("first", rays[0], (10, 50)), ("second", rays[1], (70, 110))):
+            golden = np.zeros((height, width), np.float32)
+            golden[20:60, columns[0]:columns[1]] = 1.0
+            passes.append(golden_components.Pass(
+                name=name, golden=golden, seen=np.ones((height, width), bool),
+                ray=ray, density_note="", ink_note="",
+            ))
+        return collection, passes
+
+    def test_each_plate_reads_its_own_colour_on_every_stamp(self):
+        collection, passes = self.make_collection(faded=3)
+
+        colours = golden_components.stamp_ink_colours(collection, passes)
+
+        self.assertEqual(sorted(colours), [1, 2, 3, 4, 5])
+        for number, inks in colours.items():
+            first, second = (np.asarray(ink, np.float64) for ink in inks)
+            # An ink is darkest in the channel it absorbs most, so each plate
+            # must dip in the channel its own ray leads in.
+            self.assertEqual(int(np.argmin(first)), 2, number)
+            self.assertEqual(int(np.argmin(second)), 1, number)
+
+    def test_a_faded_impression_reports_a_lighter_ink(self):
+        collection, passes = self.make_collection(faded=3)
+
+        colours = golden_components.stamp_ink_colours(collection, passes)
+
+        faded = np.mean(colours[4][0])
+        others = [np.mean(colours[n][0]) for n in (1, 2, 3, 5)]
+        self.assertGreater(faded, max(others) + 20.0)
+        self.assertLess(float(np.ptp(others)), 6.0)
+
+
 if __name__ == "__main__":
     unittest.main()
