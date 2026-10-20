@@ -81,6 +81,9 @@ BACKGROUND_DIRECTION_RELATIVE_TOLERANCE = 0.10
 AUTO_COLOUR_SCREEN_MIN_STRENGTH = 4.5
 AUTO_COLOUR_SCREEN_STRONG_STRENGTH = 10.0
 AUTO_COLOUR_SCREEN_MIN_HELD_OUT = 0.01
+# How far one impression's own agreement may lead the median before the rebuild
+# is reporting that impression back rather than an estimate of the sheet.
+ANCHORED_LEAD_RATIO = 2.0
 DUPLICATE_INK_ANGLE_DEG = 18.0
 DUPLICATE_ACHROMATIC_CORRELATION = 0.45
 DUPLICATE_BACKGROUND_CORRELATION = 0.35
@@ -189,6 +192,12 @@ def best_preserving_colour_merge(
     finished colour plate.  The strongest preservation-ranked impression remains
     authoritative wherever it is readable; aligned peers only fill pixels hidden
     from it by a postmark or an invalid mask.
+
+    Merging the peers instead removes the stains and evens the coverage, but a
+    single global shift per impression cannot hold an 8 px ruling in phase right
+    across a stamp, so the median then cancels the very screen this route exists
+    to recover.  Separating the broadband and narrowband parts is what would let
+    both be had; see TODO.md.
     """
     wanted = set(int(index) for index in np.asarray(preferred_sources).ravel())
     positions = [
@@ -1205,6 +1214,49 @@ def sharpness(image: np.ndarray, mask: np.ndarray) -> float:
         cv2.Sobel(grey.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3),
     )
     return float(np.mean(gradient[mask])) if mask.any() else float("nan")
+
+
+def impression_agreement(
+    rebuilt: np.ndarray, collection: "Collection", band: np.ndarray
+) -> dict:
+    """How well the rebuild predicts each impression it was built from.
+
+    Edge energy only asks whether the result is crisp, which a single
+    un-averaged impression satisfies better than any merge.  A golden is
+    supposed to be a model of the whole sheet, so the useful question is how
+    well it predicts each impression in turn.  One impression left
+    authoritative shows up as a wide gap between its own agreement and the
+    median: it is being reproduced rather than estimated.
+    """
+    target = cv2.cvtColor(
+        np.clip(rebuilt, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY
+    ).astype(np.float64)
+    scores = np.full(len(collection.images), np.nan)
+    for index, (image, valid) in enumerate(zip(collection.images, collection.valid)):
+        shared = band & valid
+        if int(shared.sum()) < 1000:
+            continue
+        grey = cv2.cvtColor(
+            np.clip(image, 0, 255).astype(np.uint8), cv2.COLOR_BGR2GRAY
+        ).astype(np.float64)
+        a = target[shared] - target[shared].mean()
+        b = grey[shared] - grey[shared].mean()
+        denominator = math.sqrt(float(a @ a) * float(b @ b))
+        if denominator > 1e-12:
+            scores[index] = float((a @ b) / denominator)
+    finite = scores[np.isfinite(scores)]
+    if not len(finite):
+        return {"scores": scores, "median": float("nan"), "best": float("nan"),
+                "lead": float("nan"), "best_number": None}
+    best = int(np.nanargmax(scores))
+    median = float(np.median(finite))
+    return {
+        "scores": scores,
+        "median": median,
+        "best": float(scores[best]),
+        "lead": float(scores[best]) - median,
+        "best_number": collection.numbers[best],
+    }
 
 
 def layer_sharpness(layer: np.ndarray, mask: np.ndarray) -> float:
@@ -3566,6 +3618,27 @@ def build(scan: Path, args: Settings) -> Path:
         f"golden {before:.2f} -> rebuilt {after:.2f} ({gain:+.1%})"
     )
 
+    # Edge energy cannot tell recovered design from a reproduced impression, so
+    # report how well the rebuild models the sheet as well as how crisp it is.
+    averaged_fit = impression_agreement(collection.baseline, collection, band)
+    rebuilt_fit = impression_agreement(rebuilt, collection, band)
+    print(
+        f"  rebuild agreement with its own impressions: median "
+        f"{rebuilt_fit['median']:+.3f} against the averaged golden's "
+        f"{averaged_fit['median']:+.3f}"
+    )
+    if rebuilt_fit["best_number"] is not None:
+        anchored = rebuilt_fit["lead"] >= ANCHORED_LEAD_RATIO * max(
+            averaged_fit["lead"], 0.01
+        )
+        print(
+            f"    closest impression stamp #{rebuilt_fit['best_number']} at "
+            f"{rebuilt_fit['best']:+.3f}, {rebuilt_fit['lead']:+.3f} above the median "
+            f"(averaged golden leads by {averaged_fit['lead']:+.3f}); "
+            + ("one impression is being reproduced rather than estimated"
+               if anchored else "no single impression dominates")
+        )
+
     marked = mark_clean_scan(collection, passes)
     if marked is not None:
         print(
@@ -3609,7 +3682,10 @@ def build(scan: Path, args: Settings) -> Path:
             (collection.baseline,
              f"{scan.stem}: golden as averaged now ({len(collection.numbers)} stamps), "
              f"paper {bgr_hex(collection.paper)}"),
-            (rebuilt, f"{primary_label}; design edge energy {gain:+.1%}"),
+            (rebuilt,
+             f"{primary_label}; design edge energy {gain:+.1%}; "
+             f"impression agreement {rebuilt_fit['median']:+.3f} "
+             f"(#{rebuilt_fit['best_number']} leads by {rebuilt_fit['lead']:+.3f})"),
             *list(zip(comparison_rebuilds, comparison_labels)),
         ]
     ]

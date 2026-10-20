@@ -411,3 +411,50 @@ Next checks:
   using held-out structure rather than edge energy alone.
 - Reduce the quadratic pairwise registration cost for large collections such as
   VIII 7K without changing the selected consensus.
+
+## Impression agreement, and why the V colour plate is one impression
+
+Edge energy answers only whether the rebuild is crisp, and a single un-averaged
+impression satisfies that better than any merge. XXI 3K scores the corpus's
+largest gain, +85.6%, from a plate rebuilt out of one of nine impressions with
+its postmark attached, while IX-X 3K scores -2.6% on a visibly better result. The
+rebuild is now also scored by how well it predicts each impression it was built
+from: `impression_agreement` reports the median correlation over the edge band
+and the gap between the closest impression and that median. A plate left
+authoritative shows up as a wide gap, because it is being reproduced rather than
+estimated. On V 3K the rebuild agrees at +0.617 against the averaged golden's
++0.636, so the extra edge energy there is not a better model of the sheet.
+
+`best_preserving_colour_merge` deliberately keeps one impression authoritative
+wherever it is readable, which is why all three V colour grounds carry the stains
+and uneven inking of a single stamp: V 1K #10, V 3K #1, V 5K #7. Replacing that
+with a merge, and letting the best impression fill only what no two impressions
+corroborated, was tried and backed out. It does remove the stains and even the
+coverage, and edge energy even rose on V 3K from +16.2% to +18.6%, but at 4x
+magnification the burelage is gone: the triangular ground on V 5K and the
+ornamental ground on V 3K are smeared into a flat wash. One global shift per
+impression cannot hold an 8 px ruling in phase right across a stamp, so the
+median cancels the narrowband component while the stains, being broadband,
+average constructively. The screen-strength figures do not show this because
+they are measured on a different, phase-aware merge inside the 256 px window.
+
+To have both, split the two regimes rather than choosing between them: take the
+broadband part from the merge of all impressions, and the narrowband part at the
+known pitch from a phase-coherent source. Notes for whoever picks this up:
+
+- The phase-aware merge already exists; `add_variant` fills `candidate["golden"]`
+  from it before `best_preserving_colour_merge` overwrites it. V 5K measures 45.33
+  best single against 69.60 for that merge, so the screen does reinforce when the
+  cells are respected.
+- The removed `narrow_band` demodulate/low-pass/remodulate helper is the shape of
+  the extraction needed. It was dropped from the background route because the low
+  band there carries the background's own design envelope; here the low band is
+  wanted, so that objection does not apply.
+- Keep fixtures for both directions: V 5K must keep a resolvable triangular
+  ground, and V 1K must stop reporting stamp #10's stains as the plate.
+- The three V panels also mislabel this. The screen route rewrites
+  `comparison_notes` to bare `legacy`/`best`/`second`/`anchor`, discarding the
+  stamp number the candidate note already carried, and the top row joins notes
+  positionally across passes whose variant lists are unrelated. Column 4 of V 5K
+  therefore reads "second-best single stamp #9" over an ink 2 image sourced from
+  #7, because #9 is ink 1's ranking. Give each comparison column one owning pass.

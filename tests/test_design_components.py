@@ -1,3 +1,4 @@
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -621,6 +622,19 @@ class ColourPreservationTests(unittest.TestCase):
         np.testing.assert_allclose(merged[~best_mask], 0.4)
         self.assertTrue(seen.all())
 
+    def test_a_lone_selected_impression_is_still_used_whole(self):
+        shape = (12, 16)
+        only = np.full(shape, 0.7, np.float32)
+        entries = [{"source_index": 0, "coverage": only, "readable": np.ones(shape, bool)}]
+
+        merged, seen, source = golden_components.best_preserving_colour_merge(
+            entries, np.zeros((1, 2), np.float32), np.array([0]), np.array([1.0])
+        )
+
+        self.assertEqual(source, 0)
+        np.testing.assert_allclose(merged, 0.7)
+        self.assertTrue(seen.all())
+
     def test_background_projection_is_not_counted_twice(self):
         main_ray = unit([0.82, 0.50, 0.28])
         background_ray = unit([0.60, 0.66, 0.45])
@@ -708,6 +722,67 @@ class ScreenCellRegistrationTests(unittest.TestCase):
         )
 
         self.assertGreater(correct_score, wrong_score + 0.05)
+
+
+class ImpressionAgreementTests(unittest.TestCase):
+    def make_collection(self):
+        count, height, width = 6, 90, 120
+        paper = np.array([206.0, 199.0, 180.0])
+        ray = unit([0.30, 0.55, 0.78])
+        random = np.random.default_rng(5)
+        images = []
+        for index in range(count):
+            density = np.zeros((height, width, 3), np.float64)
+            density[18:72, 14:106] = 0.9 * ray
+            density[30:60, 30:90] = 0.2 * ray
+            # Each impression carries its own stain, so no two agree on it.
+            x0 = 16 + 14 * index
+            density[20:34, x0:x0 + 10] += 0.8 * ray
+            density += random.normal(0.0, 0.01, density.shape)
+            images.append(render_density(np.clip(density, 0.0, None), paper))
+        images = np.stack(images)
+        return golden_components.Collection(
+            scan=Path("synthetic.png"),
+            images=images,
+            valid=np.ones((count, height, width), bool),
+            numbers=list(range(1, count + 1)),
+            papers=np.repeat(paper[None, :], count, axis=0),
+            paper=paper,
+            baseline=np.median(images, axis=0).astype(np.uint8),
+            covered=np.ones((height, width), bool),
+            corner=(0, 0),
+        )
+
+    def test_a_copied_impression_leads_the_median_further_than_an_average(self):
+        collection = self.make_collection()
+        band = np.zeros(collection.images.shape[1:3], bool)
+        band[18:72, 14:106] = True
+
+        averaged = golden_components.impression_agreement(
+            collection.baseline, collection, band
+        )
+        copied = golden_components.impression_agreement(
+            collection.images[2], collection, band
+        )
+
+        self.assertEqual(copied["best_number"], 3)
+        self.assertGreater(copied["lead"], averaged["lead"])
+        self.assertGreater(
+            copied["lead"],
+            golden_components.ANCHORED_LEAD_RATIO * max(averaged["lead"], 0.01),
+        )
+
+    def test_too_little_overlap_reports_no_agreement(self):
+        collection = self.make_collection()
+        band = np.zeros(collection.images.shape[1:3], bool)
+        band[0:5, 0:5] = True
+
+        fit = golden_components.impression_agreement(
+            collection.baseline, collection, band
+        )
+
+        self.assertIsNone(fit["best_number"])
+        self.assertTrue(math.isnan(fit["median"]))
 
 
 class StampInkColourTests(unittest.TestCase):
