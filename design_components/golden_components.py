@@ -87,6 +87,10 @@ ANCHORED_LEAD_RATIO = 2.0
 DUPLICATE_INK_ANGLE_DEG = 18.0
 DUPLICATE_ACHROMATIC_CORRELATION = 0.45
 DUPLICATE_BACKGROUND_CORRELATION = 0.35
+# How many periods of the ruling the screen's envelope is allowed to vary over.
+# The envelope has to be free enough to follow the phase drift a global shift
+# leaves behind, and tight enough that the carrier itself cannot leak into it.
+SCREEN_ENVELOPE_PERIODS = 3.0
 
 
 def collection_quorum(count: int) -> int:
@@ -185,19 +189,29 @@ def best_preserving_colour_merge(
     shifts: np.ndarray,
     preferred_sources: np.ndarray,
     preservation: np.ndarray,
+    screen_source: np.ndarray | None = None,
+    screen_seen: np.ndarray | None = None,
+    wave: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Apply screen geometry without allowing averaging to erase the best plate.
 
     The clean periodic field chooses the transformations, not the density of the
-    finished colour plate.  The strongest preservation-ranked impression remains
-    authoritative wherever it is readable; aligned peers only fill pixels hidden
-    from it by a postmark or an invalid mask.
+    finished colour plate.
 
-    Merging the peers instead removes the stains and evens the coverage, but a
+    Without a ``screen_source`` the strongest preservation-ranked impression
+    remains authoritative wherever it is readable, and aligned peers only fill
+    pixels hidden from it by a postmark or an invalid mask.  That keeps the
+    ruling resolvable but publishes one stamp's stains and uneven inking as the
+    plate.  Merging the peers instead fixes that and evens the coverage, but a
     single global shift per impression cannot hold an 8 px ruling in phase right
-    across a stamp, so the median then cancels the very screen this route exists
-    to recover.  Separating the broadband and narrowband parts is what would let
-    both be had; see TODO.md.
+    across a stamp, so the median cancels the very screen this route exists to
+    recover.
+
+    Given the screen's own phase-coherent merge the two regimes no longer have
+    to be traded against each other: the peers supply the broadband plate, and
+    the ruling is swapped back in at its own frequency from a merge that
+    respected its cells.  The best impression then fills only what no two
+    impressions corroborated.
     """
     wanted = set(int(index) for index in np.asarray(preferred_sources).ravel())
     positions = [
@@ -212,7 +226,6 @@ def best_preserving_colour_merge(
     layers = np.stack([entries[position]["coverage"] for position in positions])
     masks = np.stack([entries[position]["readable"] for position in positions])
     motions = np.asarray(shifts, np.float32)[positions]
-    merged, merged_seen = robust_golden(layers, masks, motions, quorum=1, floor=1)
 
     best_local = int(np.argmax(preservation[sources]))
     best_source = int(sources[best_local])
@@ -220,8 +233,21 @@ def best_preserving_colour_merge(
     best_seen = move_image(
         masks[best_local].astype(np.uint8), motions[best_local], cv2.INTER_NEAREST
     ) > 0
-    merged[best_seen] = best_layer[best_seen]
-    return merged.astype(np.float32), best_seen | merged_seen, best_source
+
+    banded = screen_source is not None and screen_seen is not None and wave is not None
+    if not banded:
+        merged, merged_seen = robust_golden(layers, masks, motions, quorum=1, floor=1)
+        merged[best_seen] = best_layer[best_seen]
+        return merged.astype(np.float32), best_seen | merged_seen, best_source
+
+    merged, corroborated = robust_golden(layers, masks, motions, quorum=2, floor=1)
+    alone = best_seen & ~corroborated
+    merged[alone] = best_layer[alone]
+    seen = best_seen | corroborated
+    merged = band_separated_golden(
+        merged, np.asarray(screen_source, np.float32), seen & np.asarray(screen_seen, bool), wave
+    )
+    return merged.astype(np.float32), seen, best_source
 
 
 def colour_preservation_selection(
@@ -678,6 +704,7 @@ def resolve_screen_cells(
     wave: np.ndarray,
     limit: float,
     strongest: int,
+    numbers: list[int] | None = None,
 ) -> dict:
     """Resolve the integer-period and along-ruling ambiguity of screen phase.
 
@@ -734,11 +761,20 @@ def resolve_screen_cells(
             "median_cell_gap": float(np.median([m["cell_gap"] for m in matches]))
             if matches else 0.0,
         })
+    anchor_shifts = phase + anchor_residuals
+    consensus_shifts = phase + consensus_residuals
     return {
-        "anchor_shifts": phase + anchor_residuals,
-        "consensus_shifts": phase + consensus_residuals,
+        "anchor_shifts": anchor_shifts,
+        "consensus_shifts": consensus_shifts,
         "anchor_residuals": anchor_residuals,
         "consensus_residuals": consensus_residuals,
+        "anchor_margins": broadband_branch_margin(
+            layers, masks, anchor_shifts, corner, wave
+        ),
+        "consensus_margins": broadband_branch_margin(
+            layers, masks, consensus_shifts, corner, wave
+        ),
+        "numbers": list(numbers) if numbers is not None else list(range(count)),
         "confidence": confidence,
         "pair_count": len(edges),
         "elapsed_seconds": time.perf_counter() - started,
@@ -859,6 +895,178 @@ def screen_strength(layer: np.ndarray, mask: np.ndarray, corner, wave: np.ndarra
     """
     peak, floor = screen_peak_floor(layer, mask, corner, wave)
     return float(peak / max(floor, 1e-9))
+
+
+def narrow_band(
+    layer: np.ndarray,
+    field: np.ndarray,
+    wave: np.ndarray,
+    periods: float = SCREEN_ENVELOPE_PERIODS,
+) -> np.ndarray:
+    """The part of a layer that sits at the ruling's own frequency.
+
+    Demodulate against the measured wave, low-pass what that leaves, and
+    remodulate.  The low pass keeps the slowly varying complex envelope of the
+    ruling, so the extraction follows a phase that drifts across the stamp
+    instead of assuming one phase for the whole frame.
+
+    A plain Fourier band-stop would do the same job in one step, but only for a
+    phase that holds everywhere; the envelope is the point here.
+
+    The blur is normalised by the same blur of the field, so masked-out pixels
+    thin the evidence rather than dragging the envelope toward zero.
+    """
+    keep = field.astype(np.float64)
+    if keep.sum() < 1.0:
+        return np.zeros(layer.shape[:2], np.float32)
+    density = layer.astype(np.float64)
+    values = (density - density[keep > 0].mean()) * keep
+
+    height, width = layer.shape[:2]
+    across, down = (float(value) for value in np.asarray(wave, np.float64))
+    phase = 2.0 * math.pi * (
+        across * np.arange(width, dtype=np.float64)[None, :]
+        + down * np.arange(height, dtype=np.float64)[:, None]
+    )
+    cosine, sine = np.cos(phase), np.sin(phase)
+
+    sigma = max(periods / max(math.hypot(across, down), 1e-9), 1.0)
+
+    def smooth(data: np.ndarray) -> np.ndarray:
+        return cv2.GaussianBlur(data, (0, 0), sigma, borderType=cv2.BORDER_REPLICATE)
+
+    support = np.maximum(smooth(keep), 1e-6)
+    real = smooth(values * cosine) / support
+    imaginary = smooth(values * sine) / support
+    band = 2.0 * (real * cosine + imaginary * sine)
+    return (band * keep).astype(np.float32)
+
+
+def band_separated_golden(
+    broad: np.ndarray,
+    screen: np.ndarray,
+    field: np.ndarray,
+    wave: np.ndarray,
+    periods: float = SCREEN_ENVELOPE_PERIODS,
+) -> np.ndarray:
+    """Broadband from one merge, the ruling from a phase-coherent other.
+
+    The two regimes want opposite estimators.  Postmarks, stains and uneven
+    inking are broadband and land in a different place on every impression, so
+    merging many impressions cancels them.  The ruling is narrowband and
+    survives a merge only where the merge respected its phase, which the
+    screen's own cell-aware merge does and a single global shift does not.
+
+    Taking each part from the merge that serves it replaces the older choice
+    between a stain-free wash and a stained but resolvable ground.
+    """
+    inside = field.astype(bool)
+    if not inside.any():
+        return broad.astype(np.float32)
+    swap = narrow_band(screen, inside, wave, periods) - narrow_band(broad, inside, wave, periods)
+    return (broad + swap * inside).astype(np.float32)
+
+
+def masked_agreement(
+    moving: np.ndarray,
+    moving_mask: np.ndarray,
+    reference: np.ndarray,
+    reference_mask: np.ndarray,
+) -> float:
+    """Zero-mean correlation over the pixels both sides can see."""
+    both = moving_mask & reference_mask
+    if int(both.sum()) < 500:
+        return float("nan")
+    first = moving[both].astype(np.float64)
+    second = reference[both].astype(np.float64)
+    first -= first.mean()
+    second -= second.mean()
+    scale = math.sqrt(float(first @ first) * float(second @ second))
+    if scale < 1e-12:
+        return float("nan")
+    return float(first @ second / scale)
+
+
+def broadband_branch_margin(
+    layers: np.ndarray,
+    masks: np.ndarray,
+    shifts: np.ndarray,
+    corner: tuple[int, int],
+    wave: np.ndarray,
+    periods: float = SCREEN_ENVELOPE_PERIODS,
+    reach: int = 2,
+) -> list[dict]:
+    """Whether the design agrees with the cell the ruling was given.
+
+    A branch cannot be wrong by a whole period and show it in the ruling: one
+    period is exactly one turn of the carrier, so both cells present the same
+    ruling, and every score read off that ruling is blind to the difference.
+    The design around it is not.  Strip the ruling with ``narrow_band`` and what
+    remains is free to disagree, which is the only evidence that separates
+    neighbouring cells.
+
+    Each impression's own aperiodic remainder is scored against the median of
+    the others at the cell it was given and at whole periods either side.  A
+    positive margin means the design wanted a different cell -- the one-period
+    error that leaves a ghost in the merge.  The median excludes the impression
+    being judged, so an outlier cannot vote for its own position.
+    """
+    count = len(layers)
+    length = float(np.hypot(*np.asarray(wave, np.float64)))
+    if count < 3 or length < 1e-12:
+        return []
+    step = np.asarray(wave, np.float64) / (length * length)
+
+    residuals, covered = [], []
+    for layer, mask, shift in zip(layers, masks, shifts):
+        aligned = shift_image(layer, shift, cv2.INTER_CUBIC)
+        seen = shift_image(mask.astype(np.uint8), shift, cv2.INTER_NEAREST) > 0
+        residuals.append(aligned - narrow_band(aligned, seen, wave, periods))
+        covered.append(seen)
+
+    size = background_ink.SCREEN_WINDOW
+    y0, x0 = corner
+    box = (
+        slice(y0, min(y0 + size, layers.shape[1])),
+        slice(x0, min(x0 + size, layers.shape[2])),
+    )
+    windowed = np.stack([
+        np.where(seen[box], residual[box], np.nan)
+        for residual, seen in zip(residuals, covered)
+    ])
+
+    report = []
+    for index in range(count):
+        others = np.delete(windowed, index, axis=0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            template = np.nanmedian(others, axis=0)
+        template_mask = np.isfinite(others).sum(axis=0) >= 2
+        template = np.nan_to_num(template)
+
+        scores = {}
+        for branch in range(-reach, reach + 1):
+            offset = shifts[index] + branch * step
+            moved = shift_image(residuals[index], offset, cv2.INTER_CUBIC)
+            moved_mask = (
+                shift_image(masks[index].astype(np.uint8), offset, cv2.INTER_NEAREST) > 0
+            )
+            scores[branch] = masked_agreement(
+                moved[box], moved_mask[box], template, template_mask
+            )
+
+        usable = {branch: score for branch, score in scores.items() if np.isfinite(score)}
+        if not usable:
+            report.append({"branch": 0, "kept": float("nan"), "margin": float("nan")})
+            continue
+        wanted = max(usable, key=usable.get)
+        kept = scores[0] if np.isfinite(scores[0]) else float("nan")
+        report.append({
+            "branch": wanted,
+            "kept": kept,
+            "margin": usable[wanted] - kept if np.isfinite(kept) else float("nan"),
+        })
+    return report
 
 
 def blend(values: np.ndarray, seen: np.ndarray, weights: np.ndarray, floor: int = 1):
@@ -1096,7 +1304,8 @@ def background_golden(
     if resolve_cells:
         strongest = int(ranked[0])
         cells = resolve_screen_cells(
-            layers, field, shifts, corner, wave, shift_limit / max(downsample, 1), strongest
+            layers, field, shifts, corner, wave, shift_limit / max(downsample, 1), strongest,
+            numbers=[r["number"] for r in results],
         )
         all_members = np.arange(len(results))
         anchor_candidate = add_variant(
@@ -2696,6 +2905,44 @@ def report_cell_variants(back: dict) -> None:
             f"consensus {validation.get('consensus', float('nan')):+.3f}; "
             f"preferred {preferred}"
         )
+    report_branch_margins(cells)
+
+
+def report_branch_margins(cells: dict) -> None:
+    """How decisive each impression's cell was, and whether the design agrees.
+
+    The cell gap is the margin the ruling itself gave the winning cell over the
+    runner-up; a gap near zero means the impression was placed on a coin toss.
+    The branch margin is the second opinion, taken from the design once the
+    ruling has been removed, and it is the only one of the two that can see a
+    whole-period error.
+    """
+    numbers = cells.get("numbers") or []
+    gaps = [entry["median_cell_gap"] for entry in cells.get("confidence", [])]
+    if gaps and numbers:
+        weakest = int(np.argmin(gaps))
+        print(
+            f"      per-impression cell gap: median {np.median(gaps):.3f}, "
+            f"least decisive stamp #{numbers[weakest]} at {gaps[weakest]:.3f}"
+        )
+    for kind in ("anchor", "consensus"):
+        margins = cells.get(f"{kind}_margins") or []
+        if not margins or not numbers:
+            continue
+        disputed = [
+            (numbers[index], entry)
+            for index, entry in enumerate(margins)
+            if entry["branch"] != 0 and np.isfinite(entry["margin"])
+        ]
+        print(
+            f"      {kind} branch margin on the design: "
+            f"{len(disputed)} of {len(margins)} impressions want another cell"
+        )
+        for number, entry in sorted(disputed, key=lambda item: -item[1]["margin"])[:5]:
+            print(
+                f"        stamp #{number} wants {entry['branch']:+d} period, "
+                f"{entry['margin']:+.3f} better than the kept {entry['kept']:+.3f}"
+            )
 
 
 def report_halves(back: dict, covered: np.ndarray) -> None:
@@ -3325,6 +3572,12 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
                         candidate = by_kind.get(kind)
                         if candidate is None:
                             continue
+                        # The cell-aware merge standing in candidate["golden"]
+                        # is the only source whose ruling is in phase, so keep
+                        # it before the overwrite: it supplies that band to the
+                        # band-separated variant below.
+                        cell_golden = candidate["golden"]
+                        cell_seen = candidate["seen"]
                         try:
                             full_golden, full_seen, best_source = best_preserving_colour_merge(
                                 crisped["turned_entries"],
@@ -3344,6 +3597,27 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
                         print(
                             f"    {kind} full-colour merge preserves stamp "
                             f"#{collection.numbers[best_source]} and fills only its unreadable pixels"
+                        )
+
+                        banded_golden, banded_seen, _ = best_preserving_colour_merge(
+                            crisped["turned_entries"],
+                            cells[f"{kind}_shifts"],
+                            chosen,
+                            preservation,
+                            screen_source=cell_golden,
+                            screen_seen=cell_seen,
+                            wave=crisped["wave"],
+                        )
+                        candidate["banded_golden"] = banded_golden
+                        candidate["banded_seen"] = banded_seen
+                        print(
+                            f"    {kind} screen strength: "
+                            f"{screen_strength(cell_golden, cell_seen, crisped['corner'], crisped['wave']):.2f} "
+                            f"cell merge, "
+                            f"{screen_strength(full_golden, full_seen, crisped['corner'], crisped['wave']):.2f} "
+                            f"preserved best stamp, "
+                            f"{screen_strength(banded_golden, banded_seen, crisped['corner'], crisped['wave']):.2f} "
+                            f"band-separated"
                         )
                 consensus = by_kind.get("consensus")
                 anchor = by_kind.get("anchor")
@@ -3387,6 +3661,16 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
                     comparison_seen.append(anchor["seen"])
                     comparison_rays.append(ray.copy())
                     comparison_notes.append("anchor")
+                # The published column keeps one impression authoritative and so
+                # carries its stains.  This one takes the broadband plate from
+                # the merge of all of them and the ruling from the cell merge,
+                # and is here to be compared against the column it would
+                # replace.
+                if screen_primary.get("banded_golden") is not None:
+                    comparison_goldens.append(screen_primary["banded_golden"])
+                    comparison_seen.append(screen_primary["banded_seen"])
+                    comparison_rays.append(ray.copy())
+                    comparison_notes.append("band-separated")
 
         passes.append(
             Pass(

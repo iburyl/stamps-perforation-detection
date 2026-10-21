@@ -845,5 +845,245 @@ class StampInkColourTests(unittest.TestCase):
         self.assertLess(float(np.ptp(others)), 6.0)
 
 
+class ScreenBandSeparationTests(unittest.TestCase):
+    """The ruling and the stains want opposite merges; both must survive.
+
+    V 5K must keep a resolvable ground and V 1K must stop publishing one
+    stamp's stains as the plate, so each direction is pinned here on a
+    synthetic sheet whose ruling, design and stains are known.
+    """
+
+    size = background_ink.SCREEN_WINDOW
+    wave = np.array([1.0 / 8.0, 0.0])
+    field = np.ones((size, size), bool)
+    corner = (0, 0)
+
+    def ruling(self, phase=0.0, amplitude=1.0):
+        column = np.arange(self.size, dtype=np.float64)[None, :]
+        return np.repeat(
+            amplitude * np.cos(2.0 * math.pi * self.wave[0] * column + phase), self.size, axis=0
+        )
+
+    def design(self):
+        """Broadband ornament: what a merge is supposed to keep."""
+        rows, columns = np.mgrid[: self.size, : self.size].astype(np.float64)
+        return (
+            3.0 * np.exp(-((columns - 180.0) ** 2 + (rows - 200.0) ** 2) / (2.0 * 60.0 ** 2))
+            + 2.0 * np.exp(-((columns - 330.0) ** 2 + (rows - 350.0) ** 2) / (2.0 * 80.0 ** 2))
+        )
+
+    def stain(self, centre, amplitude=4.0):
+        """A postmark-like blot: broadband, and in a different place each time."""
+        rows, columns = np.mgrid[: self.size, : self.size].astype(np.float64)
+        return amplitude * np.exp(
+            -((columns - centre[1]) ** 2 + (rows - centre[0]) ** 2) / (2.0 * 40.0 ** 2)
+        )
+
+    def amplitude(self, layer):
+        """The ruling's own Fourier amplitude, read at the measured wave.
+
+        Not ``screen_strength``: that divides by the broadband floor beside the
+        peak, which on a synthetic plate is numerical noise.
+        """
+        return golden_components.screen_peak_floor(
+            np.asarray(layer, np.float32), self.field, self.corner, self.wave
+        )[0]
+
+    def sheet(self, count=6):
+        """One plate, printed with a phase a global shift cannot follow."""
+        plate = self.design() + self.ruling()
+        centres = [(120, 120), (150, 380), (380, 150), (400, 400), (260, 90), (90, 260)]
+        layers, phases = [], np.linspace(0.0, 2.0 * math.pi, count, endpoint=False)
+        for index in range(count):
+            layers.append(
+                (self.design() + self.ruling(phases[index]) + self.stain(centres[index]))
+                .astype(np.float32)
+            )
+        return plate.astype(np.float32), np.stack(layers), centres
+
+    def test_narrow_band_recovers_the_ruling_and_leaves_the_design(self):
+        band = golden_components.narrow_band(
+            self.design() + self.ruling(0.7), self.field, self.wave
+        )
+        inner = band[64:-64, 64:-64]
+
+        self.assertAlmostEqual(float(inner.max()), 1.0, delta=0.08)
+        self.assertAlmostEqual(float(inner.min()), -1.0, delta=0.08)
+        # The ornament is broadband, so none of it may ride along in the band.
+        self.assertLess(abs(float(inner.mean())), 0.05)
+
+    def test_removing_the_band_removes_the_ruling(self):
+        layer = self.design() + self.ruling(0.7)
+
+        residual = layer - golden_components.narrow_band(layer, self.field, self.wave)
+
+        self.assertLess(self.amplitude(residual), 0.1 * self.amplitude(layer))
+
+    def test_narrow_band_follows_a_phase_that_drifts_across_the_stamp(self):
+        column = np.arange(self.size, dtype=np.float64)[None, :]
+        drift = np.linspace(0.0, math.pi, self.size)[:, None]
+        layer = np.cos(2.0 * math.pi * self.wave[0] * column + drift)
+
+        band = golden_components.narrow_band(layer, self.field, self.wave)
+
+        inner, truth = band[64:-64, 64:-64].ravel(), layer[64:-64, 64:-64].ravel()
+        agreement = float(np.corrcoef(inner, truth)[0, 1])
+        self.assertGreater(agreement, 0.95)
+
+    def test_merging_phase_spread_impressions_cancels_the_ruling(self):
+        plate, layers, _ = self.sheet()
+        masks = np.ones(layers.shape, bool)
+        motions = np.zeros((len(layers), 2), np.float32)
+
+        merged, _ = golden_components.robust_golden(layers, masks, motions, quorum=2, floor=1)
+
+        # The fixture is only meaningful if the plain merge really does lose the
+        # ground, which is what was observed on V 3K and V 5K.
+        self.assertLess(self.amplitude(merged), 0.35 * self.amplitude(plate))
+
+    def test_band_separation_keeps_the_ground_and_drops_the_stains(self):
+        plate, layers, centres = self.sheet()
+        masks = np.ones(layers.shape, bool)
+        motions = np.zeros((len(layers), 2), np.float32)
+        merged, seen = golden_components.robust_golden(layers, masks, motions, quorum=2, floor=1)
+
+        rebuilt = golden_components.band_separated_golden(merged, plate, seen, self.wave)
+
+        self.assertGreater(self.amplitude(rebuilt), 0.8 * self.amplitude(plate))
+        row, column = centres[0]
+        box = (slice(row - 20, row + 20), slice(column - 20, column + 20))
+        stained = float(np.mean(layers[0][box] - plate[box]))
+        left = float(np.mean(rebuilt[box] - plate[box]))
+        self.assertLess(abs(left), 0.2 * stained)
+
+
+class BestPreservingColourMergeTests(unittest.TestCase):
+    """Both routes through the full-colour merge, on one synthetic sheet."""
+
+    def setUp(self):
+        self.sheet = ScreenBandSeparationTests()
+        self.plate, self.layers, self.centres = self.sheet.sheet()
+        self.entries = [
+            {
+                "source_index": index,
+                "coverage": layer,
+                "readable": np.ones(layer.shape, bool),
+            }
+            for index, layer in enumerate(self.layers)
+        ]
+        self.shifts = np.zeros((len(self.layers), 2), np.float32)
+        self.chosen = np.arange(len(self.layers))
+        # The first impression is the best preserved one, and it is the one
+        # carrying the stain this fixture watches.
+        self.preservation = np.linspace(1.0, 0.5, len(self.layers))
+
+    def stain_left(self, golden):
+        row, column = self.centres[0]
+        box = (slice(row - 20, row + 20), slice(column - 20, column + 20))
+        return float(np.mean(golden[box] - self.plate[box]))
+
+    def test_without_a_screen_source_the_best_stamp_and_its_stains_are_published(self):
+        golden, _, best_source = golden_components.best_preserving_colour_merge(
+            self.entries, self.shifts, self.chosen, self.preservation
+        )
+
+        self.assertEqual(best_source, 0)
+        expected = self.stain_left(self.layers[0])
+        self.assertAlmostEqual(self.stain_left(golden), expected, delta=0.05 * expected)
+
+    def test_with_a_screen_source_the_stains_go_and_the_ground_stays(self):
+        golden, seen, best_source = golden_components.best_preserving_colour_merge(
+            self.entries,
+            self.shifts,
+            self.chosen,
+            self.preservation,
+            screen_source=self.plate,
+            screen_seen=np.ones(self.plate.shape, bool),
+            wave=self.sheet.wave,
+        )
+
+        self.assertEqual(best_source, 0)
+        self.assertTrue(seen.all())
+        self.assertLess(abs(self.stain_left(golden)), 0.2 * self.stain_left(self.layers[0]))
+        self.assertGreater(
+            self.sheet.amplitude(golden), 0.8 * self.sheet.amplitude(self.plate)
+        )
+
+
+class BroadbandBranchMarginTests(unittest.TestCase):
+    """Whether a whole-period misregistration can be seen at all.
+
+    The ruling cannot show it, so the detector has to read the design instead.
+    The fixture plants one impression exactly one period off and asks which
+    impressions the design disputes.
+    """
+
+    size = 640
+    pitch = 9.0
+    wave = np.array([0.0, 1.0 / pitch])
+    corner = (64, 64)
+
+    def plate(self):
+        """A ruling the eye cannot place, over a design that can be placed."""
+        rows, columns = np.mgrid[: self.size, : self.size].astype(np.float64)
+        ruling = np.cos(2.0 * math.pi * rows / self.pitch)
+        random = np.random.default_rng(11)
+        design = np.zeros((self.size, self.size), np.float64)
+        for _ in range(40):
+            centre = random.integers(80, self.size - 80, size=2)
+            design += random.uniform(2.0, 5.0) * np.exp(
+                -((columns - centre[1]) ** 2 + (rows - centre[0]) ** 2) / (2.0 * 22.0 ** 2)
+            )
+        return (ruling + design).astype(np.float32)
+
+    def impressions(self, offsets):
+        """One plate seen through the given per-impression displacements."""
+        plate = self.plate()
+        random = np.random.default_rng(5)
+        layers = np.stack([
+            golden_components.shift_image(plate, -np.asarray(offset, np.float32), cv2.INTER_CUBIC)
+            + random.normal(0.0, 0.02, plate.shape).astype(np.float32)
+            for offset in offsets
+        ])
+        return layers, np.ones(layers.shape, bool)
+
+    def margins(self, offsets, shifts):
+        layers, masks = self.impressions(offsets)
+        return golden_components.broadband_branch_margin(
+            layers, masks, np.asarray(shifts, np.float32), self.corner, self.wave
+        )
+
+    def test_a_correctly_placed_sheet_is_not_disputed(self):
+        offsets = [(0.0, 0.0)] * 5
+        report = self.margins(offsets, offsets)
+
+        self.assertEqual([entry["branch"] for entry in report], [0] * 5)
+
+    def test_one_impression_a_whole_period_off_is_named(self):
+        # The third impression printed one full period down the ruling's
+        # normal, and every impression is registered as though none had.
+        offsets = [(0.0, 0.0)] * 5
+        offsets[2] = (0.0, self.pitch)
+        report = self.margins(offsets, [(0.0, 0.0)] * 5)
+
+        self.assertEqual(report[2]["branch"], 1)
+        self.assertGreater(report[2]["margin"], 0.05)
+        self.assertEqual([report[i]["branch"] for i in (0, 1, 3, 4)], [0] * 4)
+
+    def test_the_ruling_alone_cannot_tell_the_two_cells_apart(self):
+        """Why the design has to be consulted: the carrier scores a tie."""
+        layers, masks = self.impressions([(0.0, 0.0), (0.0, self.pitch)])
+        box = (slice(64, 576), slice(64, 576))
+        bands = [
+            golden_components.narrow_band(layer, mask, self.wave)[box]
+            for layer, mask in zip(layers, masks)
+        ]
+        inside = np.ones(bands[0].shape, bool)
+
+        self.assertGreater(
+            golden_components.masked_agreement(bands[0], inside, bands[1], inside), 0.95
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
