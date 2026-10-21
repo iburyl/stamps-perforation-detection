@@ -408,6 +408,184 @@ premise is that multiple impressions from one plate/die/block differ in informat
 
 ---
 
+## 8. Deciding which repeat you are on: the integer-ambiguity literature
+
+Section 6 notes that our correlation search "sometimes jumped to the neighbouring repeat".
+`broadband_branch_margin` has since measured how often: on V 5K's anchor variant, 10 of 16
+impressions sit on a cell the design disputes, one of them by two periods. That turns a
+nuisance into the main open problem, and it has a name outside imaging. A measurement that
+is precise but periodic determines a quantity only modulo one period; recovering the
+integer is **ambiguity resolution**, and four separate fields have mature machinery for it.
+This is the most directly useful addition to this document since Weiss.
+
+- **Temporal phase unwrapping in fringe projection.** **Huntley & Saldner, "Temporal
+  phase-unwrapping algorithm for automated interferogram analysis", *Appl. Opt.* 32(17),
+  3047, 1993** ([abstract](https://opg.optica.org/ao/abstract.cfm?uri=ao-32-17-3047)) and
+  **Saldner & Huntley, *Appl. Opt.* 36(13), 2770, 1997**
+  ([abstract](https://opg.optica.org/ao/abstract.cfm?uri=ao-36-13-2770)) resolve the 2π
+  ambiguity by measuring phase at several fringe pitches and unwrapping each pixel
+  independently over the sequence, coarsest first, so errors cannot propagate spatially.
+  The comparative review in *Optics and Lasers in Engineering* 85, 2016
+  ([DOI](https://doi.org/10.1016/j.optlaseng.2016.04.022)) sorts the field into three
+  families — multi-frequency (hierarchical), multi-wavelength (heterodyne/beat), and
+  number-theoretic — and ranks them against a stochastic noise model. **Its conclusion
+  decides our open design question: multi-frequency hierarchical unwrapping is the most
+  reliable, and the multi-wavelength beat approach is the most susceptible to
+  noise-induced unwrapping errors.** `TODO.md` proposes exactly these two options — resolve
+  the branch from the broadband design (coarse, unambiguous, then refine with the carrier)
+  versus resolve it from the beat between the oval's pitch and the ground's. The review
+  says to do the first and treat the second with suspicion, which is also what our own
+  signal-to-noise figures suggest. See also the follow-up on choosing the pattern sequence,
+  *Opt. Express* 25(17), 20381, 2017
+  ([full text](https://opg.optica.org/fulltext.cfm?uri=oe-25-17-20381)).
+- **GNSS carrier-phase ambiguity resolution.** The closest formal match to
+  `solve_screen_cell_graph`, which is an integer least-squares problem whether or not it
+  was written as one. **Teunissen, "The least-squares ambiguity decorrelation adjustment",
+  *J. Geodesy* 70(1–2), 65, 1995** ([DOI](https://doi.org/10.1007/bf00863419)) is the LAMBDA
+  method: decorrelate the float ambiguities by a Z-transformation, *then* search the integer
+  space, because searching a correlated lattice directly is both slow and error-prone. The
+  [LAMBDA toolbox](https://www.tudelft.nl/en/ceg/about-faculty/departments/geoscience-remote-sensing/research/lambda/lambda)
+  is open source, and **LAMBDA 4.0, *GPS Solutions*, 2024**
+  ([DOI](https://doi.org/10.1007/s10291-024-01738-z)) is the current version. Three things
+  transfer directly:
+  1. **Our `cell_gap` is the ratio test**, best over second-best. "On GNSS Ambiguity
+     Acceptance Tests" (Teunissen, 2007,
+     [PDF](https://gnss.curtin.edu.au/wp-content/uploads/sites/21/2016/04/Teunissen2007GNSS.pdf);
+     journal version *Survey Review*, 2009, [DOI](https://doi.org/10.1179/003962609x390058))
+     shows that the ratio test **is not a test of whether the integer solution is correct**,
+     and that using it with a fixed critical value — which is what our hard-coded
+     `tolerance` in `best_screen_cell` does — has known shortcomings. The replacement is the
+     fixed-failure-rate ratio test, which derives the threshold from the covariance and a
+     declared tolerable failure rate; ready-made fitting functions are published in
+     *Sensors*, 2016 ([PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC4969832/)). This would
+     give our cell gaps of 0.03–0.18 an actual meaning instead of a guess.
+  2. **Partial ambiguity resolution** — fix only the subset of integers that can be fixed
+     at the required confidence and leave the rest floating — is the field's standard answer
+     to precisely our situation, where most impressions are confident and a third are not.
+     Applied here it means merging the ruling only from impressions whose cell is decided,
+     and letting the disputed ones contribute their broadband content alone. We currently
+     force a cell on every impression.
+  3. **Integer bootstrapping and best-integer-equivariant estimation** are the graceful
+     degradations between "fix" and "do not fix", which is the choice our code treats as
+     binary.
+- **Number-theoretic unwrapping, robustly.** If we do pursue two pitches, plain
+  Chinese-remainder reconstruction is a trap: a small remainder error produces a large
+  integer error. **Xia & Wang, "Phase Unwrapping and A Robust Chinese Remainder Theorem",
+  *IEEE SPL* 14(4), 247, 2007** ([DOI](https://doi.org/10.1109/lsp.2006.884898),
+  [PDF](https://www.eecis.udel.edu/~xxia/RobustCRT.pdf)) and **Wang & Xia, *IEEE TSP*,
+  2009** ([DOI](https://doi.org/10.1109/tsp.2009.2025079)) give the robust version together
+  with the condition that makes it safe: the reconstruction error is bounded by the
+  remainder error provided that error stays **below a quarter of the greatest common divisor
+  of the moduli**. That is a concrete, checkable feasibility test for the dual-pitch idea
+  before any of it is built — measure the phase residual, compare it with a quarter of the
+  gcd of the two pitches, and if it fails, the idea is dead and we have saved the work. For
+  choosing pitches rather than inheriting them, see **"Optimum frequency selection in
+  multifrequency interferometry", *Opt. Lett.* 28(11), 887, 2003**
+  ([DOI](https://doi.org/10.1364/ol.28.000887)) and the method of excess fractions
+  ([theory](https://doi.org/10.1364/ao.50.005484),
+  [analytical solution](https://doi.org/10.1364/ao.52.005758)).
+- **Registration of aliased images.** **Vandewalle, Süsstrunk & Vetterli, "Registration of
+  aliased images for super-resolution imaging", SPIE/IS&T Electronic Imaging 2006**
+  ([DOI](https://doi.org/10.1117/12.644032), book chapter
+  [PDF](https://pixeltje.be/wp-content/uploads/VandewalleSV10.pdf)) is the same architecture
+  we arrived at, published in the super-resolution setting: when part of the spectrum is
+  free of aliasing, **estimate the shift from that part alone — equivalently, low-pass
+  before registering — and only then disambiguate the aliased part.** Their analysis also
+  describes our comb exactly: the objective splits into orthogonal Fourier subspaces, each
+  with "periodically repeating minima", and subspaces that are fully ambiguous can simply be
+  skipped because any offset fits them. That is the formal statement of why scoring cells on
+  the carrier is scoring nothing.
+- **Moiré overlay metrology.** Two overlaid gratings of pitch `p₁` and `p₂` beat at
+  `p₁p₂/|p₁−p₂|`, and a small relative displacement shifts the moiré fringes by an amplified
+  amount — 5× to 120× in published imaging-overlay targets
+  ([SPIE 2021](https://doi.org/10.1117/12.2583733),
+  [Opt. Eng. 53(8), 084101, 2014](https://doi.org/10.1117/1.oe.53.8.084101),
+  and for field stitching **Murphy et al., JVST B 18, 3287, 2000**
+  [PDF](https://www.photonics.umd.edu/wp-content/uploads/pubs/ja-5/Murphy_JVSTB_18_3287_2000.pdf)).
+  Measurement *error* is divided by the same factor, which is why the technique is used at
+  all. The catch, stated plainly in the stitching paper, is that it needs a reference
+  pattern showing where the fringes would lie at zero error. We have no such reference — we
+  are trying to build it — so this is a measurement we could only make between two
+  impressions, never against truth. Worth knowing as the principled version of the
+  dual-pitch idea, and as the reason it is a comparison and not a calibration.
+
+---
+
+## 9. Averaging a periodic pattern over many deformed copies: crystallographic image processing
+
+Section 6's lattice-detection papers find a deformed lattice in *one* image. There is an
+older field that then **averages many such images into one high-resolution unit cell**,
+which is our periodic-ground problem end to end, and it has had production software for
+thirty years: the MRC programs, **2dx** (**"2dx_merge: data management and merging for 2D
+crystal images", *J. Struct. Biol.*, 2007**,
+[PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC2157552/)), its successor
+[FOCUS](https://lbem-focus.epfl.ch/wiki/doku.php?id=1_0%3A2dx_image_processing), the
+[Methods chapter](https://doi.org/10.1007/978-1-62703-176-9_10), and **CRISP**
+(Hovmöller, *Ultramicroscopy* 41, 1992, [PDF](http://www.fos.su.se/~svenh/CRISP.pdf));
+overview at [Crystallographic image processing](https://en.wikipedia.org/wiki/Crystallographic_image_processing).
+Three pieces of it are of dedicated value.
+
+- **Crystal unbending is the answer to our global-shift problem.** `TODO.md` records that
+  "one global shift per impression cannot hold an 8 px ruling in phase right across a
+  stamp", and `narrow_band`'s low-passed envelope is our workaround — it lets the amplitude
+  absorb a phase error rather than correcting it. Unbending corrects it: cross-correlate the
+  image against a *tightly masked* version of its own transform, which acts as a locally
+  perfect reference, obtain a **distortion vector plus a correlation goodness for every
+  single unit cell**, then re-interpolate the image onto an ideal lattice. The literature
+  estimates unbending roughly doubles the resolution at which shape can be recovered. This
+  is strictly stronger than what we do, and it is also how to get the per-cell confidence
+  map that `broadband_branch_margin` currently approximates with one number per impression.
+- **Phase-origin refinement is our anchor-versus-consensus question, already solved.**
+  Merging many images of one 2D crystal requires putting them on a common phase origin, and
+  2dx's `Merge & Refine` does this **iteratively over the whole dataset**, then regenerates
+  image maps to verify the origins it chose. CRISP is specifically noted for superior
+  phase-origin refinement, obtained by testing symmetry constraints and moving the origin to
+  the best centre. Our `recentre_screen_cells` takes the gauge from the median of the
+  branches it was handed, which `TODO.md` now records failing on V 5K consensus, where five
+  impressions all want to move one period together. A symmetry- or consensus-driven origin
+  refinement is the published alternative.
+- **Per-reflection quality, and iterating against the merged result.** These pipelines
+  record an `IQ` value per diffraction spot — a per-frequency reliability, which is what
+  `repeatability_gain` computes — and `MAKETRAN` re-unbends each image against a *synthetic
+  reference generated from the merged dataset*, which is our "register against the running
+  template" done in Fourier space with the lattice imposed. Both are cheap to adopt.
+
+The caveat is the usual one: these programs assume a genuine crystal with a plane-group
+symmetry to exploit, and a printed ruling has a one-dimensional repeat and no symmetry
+constraint beyond translation. The unbending and origin-refinement machinery does not depend
+on that symmetry; only the plane-group steps do.
+
+---
+
+## 10. How much of a merged result is just the reference?
+
+Section 2 flags the cryo-EM community's argument against a chosen reference. That argument
+has since been quantified, and the quantitative form speaks directly to a number we measured.
+
+**Henderson, "Avoiding the pitfalls of single particle cryo-electron microscopy: Einstein
+from noise", *PNAS* 110(45), 2013** ([paper](https://doi.org/10.1073/pnas.1314449110)) is the
+canonical statement: align pure noise to a template by cross-correlation, average, and the
+template reappears. **"Quantification of model bias underlying the phenomenon of Einstein
+from Noise", *Statistica Sinica*** ([DOI](https://doi.org/10.5705/ss.202020.0334)) derives
+the size of the bias in terms of the sample count, dimension and selection size.
+**"Einstein from Noise: Statistical Analysis", arXiv 2407.05277, 2024**
+([arXiv](https://arxiv.org/abs/2407.05277)) proves the result that matters here: **the
+Fourier *phases* of the aligned-and-averaged estimator converge to the Fourier phases of the
+template**, which is why the structure reappears at all.
+
+Read that against our own pipeline. The anchor variant aligns every impression to one
+strongest impression by maximising correlation of the ruling, and `screen_strength` then
+scores the merge by its Fourier amplitude **at that same wave**. The anchor's carrier phase
+is therefore partly imposed on the result, and the statistic used to judge the result is the
+one most sensitive to it. A high anchor score is to some degree guaranteed by construction.
+That is not a hypothetical: on V 1K the anchor variant scores 83.76 against consensus's
+72.07 while `broadband_branch_margin` disputes twice as many of anchor's cells. The
+literature predicted the discrepancy, and it argues for judging any variant on evidence the
+alignment did not optimise — a held-out band, or the broadband remainder — rather than on
+the quantity the alignment maximised.
+
+---
+
 ## What is actually novel in our setting
 
 Combining the above, the parts of our problem that are *not* covered by existing work:
@@ -440,6 +618,14 @@ Combining the above, the parts of our problem that are *not* covered by existing
 | Cancellation mask "instead of hoping for the median" | RASL, TPAMI 2012 | Low-rank plate + sparse corruption, jointly with the warps, as one convex program |
 | Joint generative model (3 templates + per-stamp transforms) | Jojic & Frey, CVPR 2001 / TPAMI 2003 | The model already written down and solved by variational EM |
 | Periodic ground: false jumps to the next repeat | Park et al., TPAMI 2009; Hays et al., ECCV 2006 | Lattice + deformation field; phase modulo a known basis instead of free correlation |
+| Impressions placed on the wrong whole-period cell | Temporal phase unwrapping review, OLEN 2016 | Which of our two candidate fixes to build: hierarchical beats beat-frequency |
+| `cell_gap` used as a fixed-threshold acceptance test | Teunissen 2007/2009; FFRT, *Sensors* 2016 | Our ratio test does not test what we think; a failure-rate-calibrated threshold instead |
+| A third of impressions on disputed cells | Partial ambiguity resolution (LAMBDA) | Fix only the confident cells; let the rest contribute broadband only |
+| Dual-pitch (oval plus ground) branch resolution | Robust CRT, IEEE SPL 2007 / TSP 2009 | A checkable precondition — phase error below ¼ gcd of the pitches — before building it |
+| Registering a signal whose spectrum repeats | Vandewalle et al., SPIE EI 2006 | Estimate the shift on the unambiguous band, then disambiguate the rest |
+| One global shift cannot hold the ruling in phase | Crystal unbending (MRC / 2dx / FOCUS) | Per-unit-cell distortion vectors and goodness, then re-interpolation onto an ideal lattice |
+| Which gauge, and anchor versus consensus | Phase-origin refinement (2dx `Merge & Refine`, CRISP) | Iterative dataset-wide origin refinement with verification, not a median of branches |
+| Is a high `screen_strength` real? | Einstein-from-noise, PNAS 2013; arXiv 2407.05277 | Aligned averages inherit the reference's Fourier phases; judge on evidence alignment did not optimise |
 | Validation on synthetic known shifts and hold-out | Vogler et al., AAAI 2023 | A print-process-aware synthetic degradation scheme for exactly this validation |
 | Ink vectors estimated per stamp, stability of the split | Macenko et al., ISBI 2009; Iordache et al., TGRS 2014 | Robust per-image OD-vector estimation; a shared-endmember constraint across the sheet |
 | Reporting shifts as a result | CMYK misregistration (EI 2022); overlay metrology | Per-sheet registration fingerprint with systematic + residual, not a scalar per stamp |
@@ -456,3 +642,11 @@ sequences*, *batch image alignment*, *congealing*, *groupwise / population regis
 *blind source separation of document images*, *colour plane misregistration*, *overlay
 metrology*, *near-regular texture*, *deformed lattice detection*, *digital collation*,
 *type-imprint analysis*, *die study*.
+
+For the ambiguity problem specifically, which indexes under none of the above: *temporal
+phase unwrapping*, *multi-frequency / hierarchical unwrapping*, *fringe order
+determination*, *integer ambiguity resolution*, *integer least squares*, *LAMBDA*, *ratio
+test*, *partial ambiguity resolution*, *robust Chinese remainder theorem*, *method of excess
+fractions*, *synthetic wavelength*, *registration of aliased images*, *moiré metrology*,
+*crystal unbending*, *phase origin refinement*, *crystallographic image processing*,
+*reference bias*, *Einstein from noise*.

@@ -537,21 +537,54 @@ Three changes follow, two of them deletions:
   of V 5K consensus is that hack failing; once branches are decided on absolute
   evidence the gauge is determined rather than guessed.
 
-A second, stronger constraint is available if the two rulings have different
-pitches. The oval's ruling and the frame ground both constrain the same global
-translation, and their ambiguity lattices differ, so jointly they are ambiguous
-only at the beat period -- for pitches near 8.3 and 9.0 px that is about 75 px,
-outside the search limit, and the ambiguity disappears. The attraction is that
-this uses only narrowband evidence, which has far better signal here than the
-design does: the engraved ink registers at ECC 0.80 while the ink carrying the
-ruling manages 0.410 on V 1K, 0.259 on V 3K and 0.315 on V 5K. It does not
-matter that the two rulings occupy different parts of the stamp, since a global
-translation is constrained by both wherever each is measured. Unverified
-precondition: that the oval's pitch is measurably different from the ground's.
-Do the broadband unwrapping first, since the margins above prove that evidence
-discriminates on these exact sheets, then add this as a check on it.
+A second constraint is available if the two rulings have different pitches. The
+oval's ruling and the frame ground both constrain the same global translation,
+and their ambiguity lattices differ, so jointly they are ambiguous only at the
+beat period -- for pitches near 8.3 and 9.0 px that is about 75 px, outside the
+search limit, and the ambiguity disappears. It does not matter that the two
+rulings occupy different parts of the stamp, since a global translation is
+constrained by both wherever each is measured. The attraction is that it uses
+only narrowband evidence, which has far better signal here than the design does:
+the engraved ink registers at ECC 0.80 while the ink carrying the ruling manages
+0.410 on V 1K, 0.259 on V 3K and 0.315 on V 5K.
+
+Do the broadband unwrapping first anyway. The margins above prove that evidence
+discriminates on these exact sheets, and `research.md` section 8 records that
+the fringe-projection literature, which has compared the two families against a
+noise model, finds hierarchical coarse-to-fine unwrapping the most reliable of
+the three and the beat approach the most susceptible to noise-induced errors --
+which is this choice exactly. Before building the dual-pitch version at all,
+check its published precondition: robust Chinese-remainder reconstruction is
+only safe while the phase error stays below a quarter of the greatest common
+divisor of the two pitches. Measure that first; if it fails, the idea is dead
+and the work is saved.
 
 Also still to do:
+
+- Fix only the cells that can be fixed. Partial ambiguity resolution is the
+  standard answer to a third of the set being undecidable: merge the ruling from
+  the impressions whose cell is settled and let the disputed ones contribute
+  their broadband content alone. We currently force a cell on all of them.
+- Give `cell_gap` a calibrated threshold. It is the ratio test, and the GNSS
+  literature shows the ratio test with a fixed critical value -- our hard-coded
+  `tolerance` -- does not test what it appears to. The fixed-failure-rate form
+  derives the threshold from the covariance and a declared tolerable failure
+  rate, which would turn gaps of 0.03 to 0.18 into a decision instead of a guess.
+- Replace the envelope workaround with unbending. `narrow_band`'s low pass lets
+  the amplitude absorb a phase error that one global shift leaves behind;
+  electron crystallography corrects it instead, cross-correlating against a
+  tightly masked transform of the image itself to get a distortion vector and a
+  goodness for every unit cell, then re-interpolating onto an ideal lattice.
+  That also yields the per-cell confidence map `broadband_branch_margin`
+  currently reduces to one number per impression.
+- Stop judging a variant by the quantity its own alignment maximised. The anchor
+  variant aligns to one impression by correlating the ruling, and
+  `screen_strength` scores the result by its Fourier amplitude at that same
+  wave; aligned averages are known to inherit the reference's Fourier phases, so
+  part of the anchor's score is guaranteed by construction. V 1K shows it
+  directly -- anchor 83.76 against consensus 72.07 while twice as many of
+  anchor's cells are disputed. Score on a held-out band or on the broadband
+  remainder instead.
 
 - Stop remodulating the carrier where no ruling was printed. The band-separated
   column paints a faint ruling over flat paper, because `band_separated_golden`
