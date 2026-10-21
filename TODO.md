@@ -438,20 +438,128 @@ median cancels the narrowband component while the stains, being broadband,
 average constructively. The screen-strength figures do not show this because
 they are measured on a different, phase-aware merge inside the 256 px window.
 
-To have both, split the two regimes rather than choosing between them: take the
-broadband part from the merge of all impressions, and the narrowband part at the
-known pitch from a phase-coherent source. Notes for whoever picks this up:
+Everything described from here to the end of this section is implemented on the
+branch `screen-band-separation`, not on `main`. `main` carries these notes and
+`research.md` only. The branch holds `narrow_band`, `band_separated_golden`,
+`masked_agreement` and `broadband_branch_margin` in `golden_components.py`, the
+extra panel column, the new reporting, and `ScreenBandSeparationTests`,
+`BestPreservingColourMergeTests` and `BroadbandBranchMarginTests`. It is kept
+separate because the branch-margin measurement below shows the registration it
+builds on to be wrong often enough that none of it should be published yet.
 
-- The phase-aware merge already exists; `add_variant` fills `candidate["golden"]`
-  from it before `best_preserving_colour_merge` overwrites it. V 5K measures 45.33
-  best single against 69.60 for that merge, so the screen does reinforce when the
-  cells are respected.
-- The removed `narrow_band` demodulate/low-pass/remodulate helper is the shape of
-  the extraction needed. It was dropped from the background route because the low
-  band there carries the background's own design envelope; here the low band is
-  wanted, so that objection does not apply.
-- Keep fixtures for both directions: V 5K must keep a resolvable triangular
-  ground, and V 1K must stop reporting stamp #10's stains as the plate.
+Both regimes are now split rather than traded against each other.
+`best_preserving_colour_merge` takes the broadband plate from the merge of all
+preservation-selected impressions, and swaps the ruling back in at the known
+pitch from the cell-aware merge already standing in `candidate["golden"]` — the
+only source whose phase is coherent, and the one V 5K measures at 69.60 against
+45.33 for its best single impression. The best impression now fills only what no
+two impressions corroborated. The older behaviour is still what runs when no
+screen source is passed, so the ordinary colour merge is unchanged.
+
+`narrow_band` is back for the extraction, demodulating against the measured
+wave, low-passing, and remodulating. The low pass is what makes this work here:
+the envelope is free to follow a phase that drifts across the stamp, which is
+exactly what one global shift per impression leaves behind. It was dropped from
+the background route because the low band there carries the background's own
+design envelope; here the low band is wanted, so that objection does not apply.
+`SCREEN_ENVELOPE_PERIODS` sets how far the envelope may vary.
+
+`ScreenBandSeparationTests` and `BestPreservingColourMergeTests` pin both
+directions on a synthetic sheet whose ruling, design and stains are known: the
+ground must survive a merge that cancels it without band separation, and the
+best impression's stain must not reach the published plate. The variant is
+published as a seventh `band-separated` panel column beside `anchor`, and the
+screen strength of all three routes is printed per pass, so the trade is visible
+without replacing anything.
+
+The three V sheets confirm the stain half and contradict the ground half. Ink 2
+screen strength rises on every pass — 1K anchor 50.81 to 59.62, 1K consensus
+37.42 to 44.78, 3K anchor 39.08 to 40.70, 3K consensus 35.26 to 39.80, 5K
+consensus 48.31 to 50.10 — and the horizontal ruling inside the oval comes back
+at full contrast on all three. Stamp #10's stains leave the 1K plate, and the
+postmark blobs leave the 3K and 5K plates. But the frame's ornamental ground
+goes soft: the 3K cartouches stop reading as a "3" and the 5K triangles lose
+most of their contrast. Only the one measured wave vector is swapped back, so a
+2D ornament keeps all its harmonics in the broadband part, where they stay
+smeared. Screen strength cannot see this, because it measures only the
+fundamental that was restored. 5K anchor is the one pass that falls, 53.60 to
+50.90, which is the same effect reaching the fundamental.
+
+The cells themselves are wrong, and that is now measured rather than suspected.
+`best_screen_cell` restricts every candidate to a whole period of the one
+measured wave, which is the frame ground's. The oval's horizontal ruling is a
+second periodic structure with its own pitch, and a displacement that is a whole
+period of the ground is in general not a whole period of the oval, so "right
+ground cell, oval a line or two off" is inside the allowed candidate set and
+scores almost the same. `broadband_branch_margin` strips the ruling with
+`narrow_band` and asks the aperiodic remainder, against a leave-one-out median
+of the other impressions, whether it would rather sit a whole period away. A
+period is exactly one turn of the carrier, so no measurement read off the ruling
+can answer that; the design can.
+
+It disputes a great many impressions. V 5K anchor: 10 of 16, the worst being
+stamp #19 at +0.176 over a kept +0.258, and stamp #6 wanting two periods. V 1K
+anchor: 4 of 10, stamp #8 at +0.188 over a kept +0.448. V 3K anchor: 3 of 8,
+stamp #4 at +0.173 over a kept +0.423. Consensus is better everywhere but not
+clean: 7 of 16, 2 of 10, 2 of 8. Two further readings matter. On V 1K the screen
+strength prefers anchor, 83.76 against consensus's 72.07, while the design
+disputes twice as many of anchor's cells — the metric that picks between the two
+variants is blind to the error being compared. And on V 5K consensus five
+impressions all want -1, which is not five independent mistakes but one gauge:
+`recentre_screen_cells` takes the zero from the median of the branches, and the
+design says the whole set should sit a period the other way.
+
+`median_cell_gap` is now printed too, having been computed and discarded since
+the resolver was written. It is the margin the ruling gave the winning cell over
+the runner-up, and it is small: median 0.184 on V 1K, 0.164 on V 3K, 0.109 on
+V 5K, with the least decisive impression at 0.038, 0.102 and 0.031. Those are
+coin tosses, and they are being read off evidence that cannot see the question.
+
+The approach that should fix this is integer-ambiguity resolution, as used for
+phase unwrapping and for carrier-phase positioning: let the unambiguous but
+imprecise measurement choose the integer, and the precise but ambiguous one
+refine within it. Both halves are already here and are wired the wrong way
+round. `phase_shifts` is the precise-ambiguous half and is correct as written,
+giving sub-pixel position modulo the pitch. The aperiodic design, once
+`narrow_band` has taken the ruling out of it, is the unambiguous half, good to a
+pixel or two with no periodic ambiguity at all, and it currently does no work.
+Three changes follow, two of them deletions:
+
+- Compute the correlation surface on `layer - narrow_band(layer, ...)` rather
+  than on `screen_cell_feature`, so the comb of equal peaks is gone before
+  anything is ranked.
+- Delete the whole-period restriction in `best_screen_cell`. It exists only
+  because the carrier could not be trusted beyond one period, and on broadband
+  evidence it is actively harmful: it pins the answer to a lattice whose spacing
+  is the ground's period, which is exactly how the oval ends up a line off at no
+  cost. Replace it with a snap to the phase branch nearest the broadband peak.
+- Delete the median gauge in `recentre_screen_cells`. The uniform -1 across most
+  of V 5K consensus is that hack failing; once branches are decided on absolute
+  evidence the gauge is determined rather than guessed.
+
+A second, stronger constraint is available if the two rulings have different
+pitches. The oval's ruling and the frame ground both constrain the same global
+translation, and their ambiguity lattices differ, so jointly they are ambiguous
+only at the beat period -- for pitches near 8.3 and 9.0 px that is about 75 px,
+outside the search limit, and the ambiguity disappears. The attraction is that
+this uses only narrowband evidence, which has far better signal here than the
+design does: the engraved ink registers at ECC 0.80 while the ink carrying the
+ruling manages 0.410 on V 1K, 0.259 on V 3K and 0.315 on V 5K. It does not
+matter that the two rulings occupy different parts of the stamp, since a global
+translation is constrained by both wherever each is measured. Unverified
+precondition: that the oval's pitch is measurably different from the ground's.
+Do the broadband unwrapping first, since the margins above prove that evidence
+discriminates on these exact sheets, then add this as a check on it.
+
+Also still to do:
+
+- Stop remodulating the carrier where no ruling was printed. The band-separated
+  column paints a faint ruling over flat paper, because `band_separated_golden`
+  swaps the band across the whole field.
+- Swap back every frequency at which the impressions agree, not just the
+  measured wave. `repeatability_gain` already computes that per-frequency
+  coherence and `apply_gain` already applies it, so the ornament's harmonics
+  can travel with the fundamental instead of staying in the smeared part.
 - The three V panels also mislabel this. The screen route rewrites
   `comparison_notes` to bare `legacy`/`best`/`second`/`anchor`, discarding the
   stamp number the candidate note already carried, and the top row joins notes
