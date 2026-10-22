@@ -71,7 +71,7 @@ from background_ink import (
     to_linear,
     to_srgb,
 )
-from pass_geometry import fit_wave
+from pass_geometry import fit_wave, window_phase
 from three_colour_refinement import add_label, bgr_hex, estimate_papers, paper_ring, shift_image
 from two_pass_decomposition import aligned_collection, masked_colour_median
 
@@ -260,9 +260,15 @@ def colour_preservation_selection(
     Returns the selection, scores relative to the strongest impression, and
     the relative-score boundary when a distinct group was found.
     """
+    # The union is the plate's observable footprint.  Score each impression
+    # only over the part of that footprint which is visible in it.  A readable
+    # zero there is genuine loss and lowers completeness; an overprint mask is
+    # unknown and is excluded from both numerator and denominator.
+    plate_support = np.any(np.asarray(layers) > 0.0, axis=0)
     raw = np.zeros(len(layers), np.float64)
     for index, (layer, mask) in enumerate(zip(layers, masks)):
-        values = np.clip(layer[mask], 0.0, None)
+        visible = np.asarray(mask, bool) & plate_support
+        values = np.clip(layer[visible], 0.0, None)
         positive = values[values > 0.0]
         if not len(positive):
             continue
@@ -296,8 +302,22 @@ def colour_preservation_selection(
     if not distinct:
         return selected, relative, None
 
+    high = ordered[split + 1 :]
+    low = ordered[: split + 1]
+    # A tiny high tail is often one unusually dense impression, not a
+    # separately well-preserved class.  Let it define the main reconstruction
+    # only when the rest of the sheet is genuinely faint.  This guards small
+    # collections such as IX-X/35K, where one saturated stamp otherwise pulls
+    # one neighbour into a two-stamp "class" and the merge reproduces that
+    # impression.  A majority-sized high group remains fully adaptive.
+    if (
+        len(high) < math.ceil(len(live) / 2)
+        and float(relative[low].max()) >= 0.5
+    ):
+        return selected, relative, None
+
     selected[:] = False
-    selected[ordered[split + 1 :]] = True
+    selected[high] = True
     if int(selected.sum()) == 1 and len(live) >= 2:
         selected[ordered[-2:]] = True
     boundary = math.sqrt(
@@ -768,6 +788,228 @@ def resolve_screen_cells(
     }
 
 
+def broadband_screen_feature(
+    layer: np.ndarray, mask: np.ndarray, wave: np.ndarray
+) -> np.ndarray:
+    """Aperiodic plate evidence used to choose the screen's integer branch.
+
+    The carrier is precise but identical one period away.  Remove its slowly
+    varying complex envelope before registration, leaving the design and the
+    two-dimensional ornament that can distinguish those periods.  Robust
+    clipping prevents one surviving cancellation edge from owning the match.
+    """
+    valid = np.asarray(mask, bool)
+    feature = np.asarray(layer, np.float32) - periodic_narrow_band(layer, wave, valid)
+    feature = np.where(valid, feature, 0.0).astype(np.float32)
+    values = feature[valid]
+    if len(values):
+        centre = float(np.median(values))
+        cap = float(np.percentile(np.abs(values - centre), 99.0))
+        if cap > 1e-9:
+            feature = np.where(
+                valid, np.clip(feature, centre - cap, centre + cap), 0.0
+            ).astype(np.float32)
+    return feature
+
+
+def masked_agreement(
+    moving: np.ndarray,
+    moving_mask: np.ndarray,
+    reference: np.ndarray,
+    reference_mask: np.ndarray,
+) -> float:
+    """Zero-mean correlation over pixels visible on both sides."""
+    common = np.asarray(moving_mask, bool) & np.asarray(reference_mask, bool)
+    if int(common.sum()) < 500:
+        return float("nan")
+    first = np.asarray(moving[common], np.float64)
+    second = np.asarray(reference[common], np.float64)
+    first -= first.mean()
+    second -= second.mean()
+    scale = math.sqrt(float(first @ first) * float(second @ second))
+    return float(first @ second / scale) if scale > 1e-12 else float("nan")
+
+
+def broadband_branch_audit(
+    layers: np.ndarray,
+    masks: np.ndarray,
+    shifts: np.ndarray,
+    corner: tuple[int, int],
+    wave: np.ndarray,
+    reach: int = 2,
+) -> list[dict]:
+    """Ask leave-one-out plate evidence whether a neighbouring cell is better."""
+    count = len(layers)
+    frequency = float(np.hypot(*np.asarray(wave, np.float64)))
+    if count < 3 or frequency < 1e-12:
+        return []
+    step = np.asarray(wave, np.float64) / (frequency * frequency)
+    features = np.stack([
+        broadband_screen_feature(layer, mask, wave)
+        for layer, mask in zip(layers, masks)
+    ])
+    aligned = np.stack([
+        shift_image(feature, shift, cv2.INTER_CUBIC)
+        for feature, shift in zip(features, shifts)
+    ])
+    covered = np.stack([
+        shift_image(mask.astype(np.uint8), shift, cv2.INTER_NEAREST) > 0
+        for mask, shift in zip(masks, shifts)
+    ])
+    size = background_ink.SCREEN_WINDOW
+    y0, x0 = corner
+    box = (
+        slice(y0, min(y0 + size, layers.shape[1])),
+        slice(x0, min(x0 + size, layers.shape[2])),
+    )
+    report = []
+    for index in range(count):
+        others = np.arange(count) != index
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            other_seen = covered[others][:, box[0], box[1]]
+            other_values = aligned[others][:, box[0], box[1]]
+            values = np.where(other_seen, other_values, np.nan)
+            template = np.nanmedian(values, axis=0)
+        template_mask = np.isfinite(values).sum(axis=0) >= 2
+        template = np.nan_to_num(template)
+        scores = {}
+        for branch in range(-reach, reach + 1):
+            offset = shifts[index] + branch * step
+            moved = shift_image(features[index], offset, cv2.INTER_CUBIC)[box]
+            moved_mask = (
+                shift_image(masks[index].astype(np.uint8), offset, cv2.INTER_NEAREST) > 0
+            )[box]
+            scores[branch] = masked_agreement(
+                moved, moved_mask, template, template_mask
+            )
+        usable = {key: value for key, value in scores.items() if np.isfinite(value)}
+        if not usable:
+            report.append({"branch": 0, "kept": float("nan"), "margin": float("nan")})
+            continue
+        wanted = max(usable, key=usable.get)
+        kept = scores.get(0, float("nan"))
+        report.append({
+            "branch": int(wanted),
+            "kept": float(kept),
+            "margin": float(usable[wanted] - kept) if np.isfinite(kept) else float("nan"),
+        })
+    return report
+
+
+def broadband_unwrap_screen_cells(
+    layers: np.ndarray,
+    masks: np.ndarray,
+    phase: np.ndarray,
+    initial: np.ndarray,
+    corner: tuple[int, int],
+    wave: np.ndarray,
+    limit: float,
+    iterations: int = 3,
+) -> dict:
+    """Choose whole-period branches from aperiodic evidence, then use phase.
+
+    ``phase`` contains the accurate displacement modulo the screen pitch.
+    ``initial`` is used only to bootstrap leave-one-out broadband templates;
+    the returned shift is chosen by an unrestricted correlation peak and then
+    snapped to the phase branch nearest that peak.  Thus the carrier never
+    decides which repeat it is on.
+    """
+    started = time.perf_counter()
+    layers = np.asarray(layers, np.float32)
+    masks = np.asarray(masks, bool)
+    phase = np.asarray(phase, np.float32)
+    shifts = np.asarray(initial, np.float32).copy()
+    count = len(layers)
+    frequency = float(np.hypot(*np.asarray(wave, np.float64)))
+    if count < 2 or frequency < 1e-12:
+        return {
+            "shifts": shifts,
+            "confidence": [],
+            "elapsed_seconds": time.perf_counter() - started,
+        }
+
+    normal = np.asarray(wave, np.float64) / frequency
+    tangent = np.array([-normal[1], normal[0]], np.float64)
+    pitch = 1.0 / frequency
+    search = max(1, int(math.ceil(limit)))
+    features = np.stack([
+        broadband_screen_feature(layer, mask, wave)
+        for layer, mask in zip(layers, masks)
+    ])
+    reports: list[dict] = []
+
+    for _ in range(max(1, iterations)):
+        updated = shifts.copy()
+        reports = []
+        for index in range(count):
+            others = np.arange(count) != index
+            other_count = int(others.sum())
+            quorum = collection_quorum(other_count)
+            template, template_seen = robust_golden(
+                features[others], masks[others], shifts[others],
+                quorum, floor=min(2, other_count),
+            )
+            surface = masked_translation_surface(
+                features[index], masks[index], template, template_seen,
+                corner, search,
+            )
+            finite = np.isfinite(surface)
+            if not finite.any():
+                reports.append({
+                    "branch": 0,
+                    "score": float("nan"),
+                    "cell_gap": 0.0,
+                    "coarse_shift": shifts[index].copy(),
+                })
+                continue
+
+            ranked = np.where(finite, surface, -np.inf)
+            flat = int(np.argmax(ranked))
+            row, column = np.unravel_index(flat, ranked.shape)
+            coarse = np.array([column - search, row - search], np.float64)
+
+            phase_across = float(phase[index] @ normal)
+            branch = int(round((float(coarse @ normal) - phase_across) / pitch))
+            across = phase_across + branch * pitch
+            along = float(coarse @ tangent)
+            snapped = across * normal + along * tangent
+            if np.max(np.abs(snapped)) <= limit + 0.75:
+                updated[index] = snapped.astype(np.float32)
+
+            yy, xx = np.mgrid[-search:search + 1, -search:search + 1]
+            turns = np.rint(
+                ((xx * normal[0] + yy * normal[1]) - phase_across) / pitch
+            ).astype(np.int32)
+            cell_scores = sorted([
+                (
+                    float(np.max(surface[finite & (turns == cell)])), int(cell)
+                )
+                for cell in np.unique(turns[finite])
+            ], reverse=True)
+            gap = (
+                cell_scores[0][0] - cell_scores[1][0]
+                if len(cell_scores) > 1 else 0.0
+            )
+            reports.append({
+                "branch": branch,
+                "score": float(surface[row, column]),
+                "cell_gap": float(gap),
+                "coarse_shift": coarse.astype(np.float32),
+            })
+
+        change = float(np.max(np.linalg.norm(updated - shifts, axis=1)))
+        shifts = updated
+        if change < 0.25:
+            break
+
+    return {
+        "shifts": shifts,
+        "confidence": reports,
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+
+
 def screen_peak_floor(layer: np.ndarray, mask: np.ndarray, corner, wave: np.ndarray) -> tuple:
     """The ruling's Fourier amplitude, and the broadband floor beside it."""
     size = background_ink.SCREEN_WINDOW
@@ -1208,6 +1450,77 @@ def derotate(results: list[dict], corner, start: np.ndarray, window: int, step: 
     return turned, bearings, reference
 
 
+def pair_local_phase_audit(
+    entries: list[dict],
+    shifts: np.ndarray,
+    wave: np.ndarray,
+    phase_corner: tuple[int, int],
+    size: int = 256,
+    step: int = 64,
+) -> dict:
+    """Measure the residual screen displacement across one aligned pair.
+
+    A single carrier phase is exact only in the window where it was measured.
+    This samples smaller windows over the whole common field and expresses the
+    remaining phase difference as pixels across the ruling.  A spatial trend
+    reveals pitch, bearing, or paper-distortion error that no global shift can
+    remove, even when both impressions chose the correct integer screen cell.
+    """
+    if len(entries) != 2:
+        raise ValueError("local phase audit requires exactly two impressions")
+    frequency = float(np.hypot(*np.asarray(wave, np.float64)))
+    if frequency < 1e-12:
+        return {"centres": np.empty((0, 2)), "residuals": np.empty(0)}
+
+    layers = [
+        shift_image(entry["coverage"], shift, cv2.INTER_CUBIC)
+        for entry, shift in zip(entries, shifts)
+    ]
+    fields = [
+        shift_image(entry["field"].astype(np.uint8), shift, cv2.INTER_NEAREST) > 0
+        for entry, shift in zip(entries, shifts)
+    ]
+    height, width = layers[0].shape
+    centres, residuals, inside_phase_window = [], [], []
+    phase_y, phase_x = phase_corner
+    phase_size = background_ink.SCREEN_WINDOW
+    for y0 in range(0, height - size + 1, step):
+        for x0 in range(0, width - size + 1, step):
+            coefficients = [
+                window_phase(layer[:, :, None], field, (y0, x0), size, wave)[0]
+                for layer, field in zip(layers, fields)
+            ]
+            if not all(coefficient != 0j for coefficient in coefficients):
+                continue
+            phase = float(np.angle(coefficients[1] * np.conj(coefficients[0])))
+            centres.append((x0 + size / 2.0, y0 + size / 2.0))
+            residuals.append(phase / (2.0 * math.pi * frequency))
+            inside_phase_window.append(
+                phase_x <= x0 + size / 2.0 <= phase_x + phase_size
+                and phase_y <= y0 + size / 2.0 <= phase_y + phase_size
+            )
+
+    centres = np.asarray(centres, np.float64)
+    residuals = np.asarray(residuals, np.float64)
+    inside_phase_window = np.asarray(inside_phase_window, bool)
+    result = {
+        "centres": centres,
+        "residuals": residuals,
+        "inside_phase_window": inside_phase_window,
+    }
+    if len(residuals) >= 3:
+        origin = centres.mean(axis=0)
+        design = np.column_stack([np.ones(len(centres)), centres - origin])
+        plane, *_ = np.linalg.lstsq(design, residuals, rcond=None)
+        fitted = design @ plane
+        result.update({
+            "plane": plane,
+            "fitted": fitted,
+            "detrended_sd": float(np.std(residuals - fitted)),
+        })
+    return result
+
+
 def edge_band(layer: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """A narrow band along the design's own edges.
 
@@ -1509,6 +1822,10 @@ class Settings:
     # Zero probes every coloured plate automatically; a one-based value forces
     # that plate through the screen route for diagnostics.
     screen_ink: int = 0
+    # Experimental colour-screen registration.  The production cell resolver
+    # remains the main path; this builds one comparison by locating the
+    # aperiodic plate first and only then snapping to the measured screen phase.
+    broadband_cells: bool = False
 
 
 @dataclass
@@ -2223,6 +2540,9 @@ class Pass:
     spectral_seen: np.ndarray | None = None
     spectral_ray: np.ndarray | None = None
     spectral_note: str = ""
+    # Optional nested 1..N impression experiment for one screen plate.  Other
+    # passes stay fixed when the resulting two-row panel is reconstructed.
+    subset_comparison: dict | None = None
     # Short, stable label for the accepted reconstruction column.
     primary_note: str = ""
     # Edges the rebuild is scored over.  Carried rather than derived from the
@@ -2999,6 +3319,35 @@ def unified_ink_observation(
     return masks, readable, residual
 
 
+def per_ink_readable_masks(
+    masks: np.ndarray,
+    readable: np.ndarray,
+) -> np.ndarray:
+    """Turn other printing inks into occlusions for each individual plate.
+
+    A pixel assigned to another ink is not evidence that this plate printed
+    paper there: the other pass may have been laid over it.  Treating that
+    pixel as a readable zero cuts its silhouette into the target layer, and
+    registration can then follow that false edge.  Exclude only observed pixels
+    of the other ink: a fixed geometric expansion can consume an entire fine or
+    interlaced design, and the image contains no reliable printing-order signal
+    that would make such an expansion directional.  Clean paper and every
+    pixel assigned to the target ink remain observations.
+    """
+    masks = np.asarray(masks, bool)
+    readable = np.asarray(readable, bool)
+    if masks.ndim != 3 or masks.shape[1:] != readable.shape:
+        raise ValueError("ink masks and readable mask have incompatible shapes")
+    result = np.repeat(readable[None, :, :], len(masks), axis=0)
+    if len(masks) < 2:
+        return result
+    any_ink = masks.any(axis=0)
+    for ink in range(len(masks)):
+        occlusion = any_ink & ~masks[ink]
+        result[ink] &= ~occlusion
+    return result
+
+
 def unified_colour_layers(
     collection: Collection, palette: dict
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -3027,10 +3376,11 @@ def unified_colour_layers(
             ownership,
             supports,
         )
+        ink_readable = per_ink_readable_masks(masks, observation_readable)
         for ink in range(count):
             projection = np.maximum(density @ stamp_rays[ink], 0.0)
             layers[ink, index] = np.where(masks[ink], projection, 0.0)
-            readable[ink, index] = observation_readable
+            readable[ink, index] = ink_readable[ink]
     return layers, readable
 
 
@@ -3107,6 +3457,193 @@ def shared_screen_corner(fields: list[np.ndarray]) -> tuple[int, int]:
     )
     y0, x0 = np.unravel_index(int(np.argmax(scores)), scores.shape)
     return int(y0), int(x0)
+
+
+def complete_screen_candidate(
+    entries: list[dict], candidate: dict
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply a field-fitted candidate to the complete cleaned colour plate."""
+    chosen = np.asarray(candidate["chosen"], np.int32)
+    layers = np.stack([entries[int(index)]["coverage"] for index in chosen])
+    readable = np.stack([entries[int(index)]["readable"] for index in chosen])
+    return screen_golden(
+        layers,
+        readable,
+        candidate["chosen_shifts"],
+        candidate["chosen_weights"],
+        candidate["quorum"],
+    )
+
+
+def screen_subset_comparison(
+    entries: list[dict],
+    quality: np.ndarray,
+    corner: tuple[int, int],
+    args: Settings,
+    cell_min_strength: float | None,
+    geometry_window: int,
+    geometry_step: int,
+    maximum: int = 5,
+) -> dict:
+    """Re-run old and broadband screen registration on nested best subsets."""
+    ranked = sorted(
+        range(len(entries)),
+        key=lambda index: float(quality[int(entries[index]["source_index"])]),
+        reverse=True,
+    )[:maximum]
+    current_goldens, current_seen = [], []
+    broadband_goldens, broadband_seen = [], []
+    labels = []
+
+    for size in range(1, len(ranked) + 1):
+        picked = ranked[:size]
+        raw_subset = [entries[index] for index in picked]
+        numbers = [entry["number"] for entry in raw_subset]
+        anchor = int(np.argmax([
+            entry["snr"] * entry["coherence"] for entry in raw_subset
+        ]))
+        subset, subset_bearings, subset_reference = derotate(
+            raw_subset,
+            corner,
+            raw_subset[anchor]["wave"],
+            geometry_window,
+            geometry_step,
+        )
+        back = background_golden(
+            subset,
+            corner,
+            anchor,
+            args.downsample,
+            args.shift_limit,
+            cell_min_strength=cell_min_strength,
+        )
+        by_kind = {candidate["kind"]: candidate for candidate in back["comparisons"]}
+        current = by_kind.get("consensus") or by_kind.get("best")
+        if current is None:
+            raise RuntimeError("The subset screen route produced no current candidate")
+        current_golden, current_mask = complete_screen_candidate(subset, current)
+        current_goldens.append(current_golden)
+        current_seen.append(current_mask)
+
+        cells = back.get("cell_resolution")
+        if cells is None or size < 2:
+            broadband_goldens.append(current_golden.copy())
+            broadband_seen.append(current_mask.copy())
+        else:
+            full_layers = np.stack([entry["coverage"] for entry in subset])
+            full_readable = np.stack([entry["readable"] for entry in subset])
+            field_layers = np.stack([
+                np.where(entry["field"], entry["coverage"], 0.0).astype(np.float32)
+                for entry in subset
+            ])
+            fields = np.stack([entry["field"] for entry in subset])
+            unwrapped = broadband_unwrap_screen_cells(
+                full_layers,
+                full_readable,
+                back["shifts"],
+                cells["consensus_shifts"],
+                corner,
+                back["wave"],
+                args.shift_limit / max(args.downsample, 1),
+            )
+            candidate = select_and_merge(
+                field_layers, fields, unwrapped["shifts"], corner, back["wave"]
+            )
+            chosen = np.asarray(candidate["chosen"], np.int32)
+            trial = {
+                "chosen": chosen,
+                "chosen_shifts": candidate["shifts"][chosen],
+                "chosen_weights": candidate["weights"][chosen],
+                "quorum": candidate["quorum"],
+            }
+            broadband_golden, broadband_mask = complete_screen_candidate(subset, trial)
+            broadband_goldens.append(broadband_golden)
+            broadband_seen.append(broadband_mask)
+            if size == 2:
+                current_shifts = np.asarray(current["chosen_shifts"], np.float64)
+                broad_shifts = np.asarray(trial["chosen_shifts"], np.float64)
+                local = pair_local_phase_audit(
+                    subset,
+                    np.asarray(current["shifts"], np.float64),
+                    back["wave"],
+                    corner,
+                )
+                fitted = [
+                    fit_wave(
+                        entry["density"], entry["field"], raw_subset[anchor]["wave"],
+                        geometry_window, geometry_step,
+                    )
+                    for entry in raw_subset
+                ]
+                print(
+                    "    two-stamp subset diagnostics: "
+                    f"stamps {numbers}, bearing {subset_bearings[0]:+.4f}/"
+                    f"{subset_bearings[1]:+.4f} deg -> reference "
+                    f"{subset_reference:+.4f} deg, pitch {back['pitch']:.3f} px"
+                )
+                print(
+                    "      fitted pitch "
+                    + ", ".join(
+                        f"#{number} {entry['pitch'] * args.downsample:.4f} px"
+                        for number, entry in zip(numbers, fitted)
+                    )
+                )
+                print(
+                    "      phase shifts "
+                    + ", ".join(
+                        f"#{number} ({shift[0]:+.3f},{shift[1]:+.3f})"
+                        for number, shift in zip(numbers, back["shifts"])
+                    )
+                )
+                print(
+                    "      current shifts "
+                    + ", ".join(
+                        f"#{number} ({shift[0]:+.3f},{shift[1]:+.3f})"
+                        for number, shift in zip(numbers, current_shifts)
+                    )
+                )
+                print(
+                    "      broadband shifts "
+                    + ", ".join(
+                        f"#{number} ({shift[0]:+.3f},{shift[1]:+.3f})"
+                        for number, shift in zip(numbers, broad_shifts)
+                    )
+                )
+                residuals = local["residuals"] * args.downsample
+                if len(residuals):
+                    inside = local["inside_phase_window"]
+                    inside_values = residuals[inside]
+                    outside_values = residuals[~inside]
+                    print(
+                        f"      local phase residual across {len(residuals)} windows: "
+                        f"median {np.median(residuals):+.3f} px, "
+                        f"10--90% {np.percentile(residuals, 10):+.3f}.."
+                        f"{np.percentile(residuals, 90):+.3f} px, "
+                        f"range {np.min(residuals):+.3f}..{np.max(residuals):+.3f} px"
+                    )
+                    if len(inside_values) and len(outside_values):
+                        print(
+                            f"      calibration-window median {np.median(inside_values):+.3f} px; "
+                            f"outside median {np.median(outside_values):+.3f} px"
+                        )
+                    if "plane" in local:
+                        plane = local["plane"] * args.downsample
+                        fitted_span = float(np.ptp(local["fitted"])) * args.downsample
+                        print(
+                            f"      residual plane {plane[1] * 100:+.3f} px/100px x, "
+                            f"{plane[2] * 100:+.3f} px/100px y; "
+                            f"fitted span {fitted_span:.3f} px, "
+                            f"detrended sd {local['detrended_sd'] * args.downsample:.3f} px"
+                        )
+        labels.append(numbers)
+
+    return {
+        "numbers": labels,
+        "current": current_goldens,
+        "current_seen": current_seen,
+        "broadband": broadband_goldens,
+        "broadband_seen": broadband_seen,
+    }
 
 
 def screen_from_colour(
@@ -3229,6 +3766,101 @@ def screen_from_colour(
         args.shift_limit,
         cell_min_strength=cell_min_strength,
     )
+
+    # Keep the production consensus untouched.  This comparison asks the
+    # aperiodic plate which whole-period branch each impression belongs to,
+    # then returns to the carrier only for its precise fractional phase.
+    if args.broadband_cells and merged.get("cell_resolution") is not None:
+        _, preservation_quality, _ = colour_preservation_selection(layers, readable)
+        merged["subset_comparison"] = screen_subset_comparison(
+            entries,
+            preservation_quality,
+            screen_corner,
+            args,
+            cell_min_strength,
+            geometry_window,
+            geometry_step,
+        )
+        full_layers = np.stack([entry["coverage"] for entry in turned])
+        full_readable = np.stack([entry["readable"] for entry in turned])
+        field_layers = np.stack([
+            np.where(entry["field"], entry["coverage"], 0.0).astype(np.float32)
+            for entry in turned
+        ])
+        fields = np.stack([entry["field"] for entry in turned])
+        initial = merged["cell_resolution"]["consensus_shifts"]
+        broadband = broadband_unwrap_screen_cells(
+            full_layers,
+            full_readable,
+            merged["shifts"],
+            initial,
+            screen_corner,
+            merged["wave"],
+            args.shift_limit / max(args.downsample, 1),
+        )
+        candidate = select_and_merge(
+            field_layers, fields, broadband["shifts"], screen_corner, merged["wave"]
+        )
+        chosen_local = np.asarray(candidate["chosen"], np.int32)
+        experimental_golden, experimental_seen = screen_golden(
+            full_layers[chosen_local],
+            full_readable[chosen_local],
+            candidate["shifts"][chosen_local],
+            candidate["weights"][chosen_local],
+            candidate["quorum"],
+        )
+        experimental = {
+            "kind": "broadband",
+            "golden": experimental_golden,
+            "seen": experimental_seen,
+            "score": candidate["trail"][-1],
+            "note": "broadband-first whole-period unwrapping",
+            "chosen": chosen_local,
+            "chosen_shifts": candidate["shifts"][chosen_local],
+            "chosen_weights": candidate["weights"][chosen_local],
+            "quorum": candidate["quorum"],
+            "members": np.arange(len(turned), dtype=np.int32),
+            "shifts": candidate["shifts"],
+        }
+        merged["comparisons"].append(experimental)
+        merged["broadband_resolution"] = broadband
+        frequency = float(np.hypot(*merged["wave"]))
+        normal = np.asarray(merged["wave"], np.float64) / frequency
+        pitch = 1.0 / frequency
+        old_branches = np.rint(
+            ((initial - merged["shifts"]) @ normal) / pitch
+        ).astype(np.int32)
+        old_audit = broadband_branch_audit(
+            full_layers, full_readable, initial, screen_corner, merged["wave"]
+        )
+        new_audit = broadband_branch_audit(
+            full_layers, full_readable, broadband["shifts"],
+            screen_corner, merged["wave"]
+        )
+        old_disputed = sum(entry["branch"] != 0 for entry in old_audit)
+        new_disputed = sum(entry["branch"] != 0 for entry in new_audit)
+        fixed = sum(
+            report["cell_gap"] >= 0.02
+            for report in broadband["confidence"]
+        )
+        print(
+            f"    broadband unwrap: {broadband['elapsed_seconds']:.2f} s, "
+            f"{fixed}/{len(broadband['confidence'])} cells clear a provisional "
+            f"0.02 gap; leave-one-out disputes {old_disputed} old vs "
+            f"{new_disputed} broadband cells"
+        )
+        for entry, old_branch, report, audit in zip(
+            turned, old_branches, broadband["confidence"], new_audit
+        ):
+            print(
+                f"      stamp {entry['number']:2d}: consensus {old_branch:+d} -> "
+                f"broadband {report['branch']:+d}; score {report['score']:+.3f}, "
+                f"gap {report['cell_gap']:.3f}, residual dispute {audit['branch']:+d}"
+            )
+    else:
+        merged["broadband_resolution"] = None
+        merged["subset_comparison"] = None
+
     # The screen field is only a registration target.  Once its transforms are
     # known, apply them to the complete colour plate so strong ornament strokes
     # excluded from phase estimation are not also erased from the result.
@@ -3519,6 +4151,7 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
         best_two_note = best_note
         spectral_golden = spectral_seen = spectral_ray = None
         spectral_note = ""
+        subset_comparison = None
 
         # Then show what the same merger does to only those two observations.
         if len(ranked) >= 2:
@@ -3626,14 +4259,16 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
                 }
                 consensus = by_kind.get("consensus")
                 anchor = by_kind.get("anchor")
+                broadband = by_kind.get("broadband")
                 screen_primary = (
                     consensus if consensus is not None else by_kind.get("best")
                 )
             else:
                 accepted = False
-                consensus = anchor = screen_primary = None
+                consensus = anchor = broadband = screen_primary = None
 
             if accepted and screen_primary is not None:
+                subset_comparison = crisped.get("subset_comparison")
                 golden, seen = screen_primary["golden"], screen_primary["seen"]
                 used_numbers = [
                     crisped["turned_entries"][int(index)]["number"]
@@ -3650,7 +4285,22 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
                 else:
                     primary_note = f"screen best effort from {len(used_numbers)} stamp(s)"
                     note = f"screen {crisped['pitch']:.2f} px; phase merge"
-                if consensus is not None:
+                if broadband is not None:
+                    matched, density_scale = match_layer_density(
+                        broadband["golden"],
+                        consensus["golden"] if consensus is not None else golden,
+                        broadband["seen"] & (
+                            consensus["seen"] if consensus is not None else seen
+                        ),
+                    )
+                    spectral_golden = matched
+                    spectral_seen = broadband["seen"]
+                    spectral_ray = ray.copy()
+                    spectral_note = (
+                        "experimental broadband-first cell unwrap; "
+                        f"density {density_scale:.2f}x"
+                    )
+                elif consensus is not None:
                     experiments = consensus.get("experimental_variants", [])
                     if experiments:
                         experiment = experiments[0]
@@ -3688,6 +4338,7 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
                 spectral_seen=spectral_seen,
                 spectral_ray=spectral_ray,
                 spectral_note=spectral_note,
+                subset_comparison=subset_comparison,
                 band=band,
                 primary_note=primary_note,
                 comparison_goldens=comparison_goldens,
@@ -3870,6 +4521,40 @@ def optional_reconstruction(
     return reconstruct(layers, rays, paper), owners
 
 
+def write_subset_count_panel(
+    passes: list[Pass], paper: np.ndarray, output: Path, width: int
+) -> Path | None:
+    """Compare current and broadband cell registration on identical subsets."""
+    owners = [
+        index for index, entry in enumerate(passes)
+        if entry.subset_comparison is not None
+    ]
+    if not owners:
+        return None
+    owner = owners[0]
+    comparison = passes[owner].subset_comparison
+    assert comparison is not None
+    rows = []
+    for key, title in (
+        ("current", "current cell consensus"),
+        ("broadband", "broadband-first cells"),
+    ):
+        row = []
+        for index, (layer, numbers) in enumerate(
+            zip(comparison[key], comparison["numbers"]), start=1
+        ):
+            selected = [entry.golden for entry in passes]
+            selected[owner] = layer
+            rebuilt = reconstruct(selected, [entry.ray for entry in passes], paper)
+            stamps = " + ".join(f"#{number}" for number in numbers)
+            row.append((
+                rebuilt,
+                f"{title}: {index} best ({stamps}); other ink fixed from full consensus",
+            ))
+        rows.append(row)
+    return write_panel(rows, output, width)
+
+
 def build(scan: Path, args: Settings) -> Path:
     """Rebuild one scan's golden from its printing passes and write the panel."""
     output = args.output or scan.with_name(f"{scan.stem}_golden_components.png")
@@ -3990,6 +4675,12 @@ def build(scan: Path, args: Settings) -> Path:
         passes[index].spectral_note or passes[index].name
         for index in spectral_owners
     ) or "unavailable for this reconstruction"
+    experiment_title = (
+        "broadband unwrap"
+        if any("broadband-first" in passes[index].spectral_note
+               for index in spectral_owners)
+        else "spectral hybrid"
+    )
 
     # Three stable columns precede all temporary experiments.  In particular,
     # a sharp singleton must never make the main-path column look successful.
@@ -4004,7 +4695,7 @@ def build(scan: Path, args: Settings) -> Path:
              f"(#{rebuilt_fit['best_number']} leads by {rebuilt_fit['lead']:+.3f})"),
             (best_rebuilt, f"from best ({best_label})"),
             (best_two_rebuilt, f"from best 2 ({best_two_label})"),
-            (spectral_rebuilt, f"spectral hybrid: {spectral_label}"),
+            (spectral_rebuilt, f"{experiment_title}: {spectral_label}"),
         ]
     ]
     for entry in passes:
@@ -4048,4 +4739,12 @@ def build(scan: Path, args: Settings) -> Path:
              entry.spectral_note or f"{entry.name}; unchanged in spectral hybrid"),
         ]
         rows.append(row)
-    return write_panel(rows, output, args.panel_width)
+    written = write_panel(rows, output, args.panel_width)
+    if args.broadband_cells:
+        subset_output = scan.with_name(
+            f"{scan.stem}_golden_components_stamp_counts.png"
+        )
+        write_subset_count_panel(
+            passes, collection.paper, subset_output, args.panel_width
+        )
+    return written

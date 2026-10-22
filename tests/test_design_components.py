@@ -167,6 +167,36 @@ class AutomaticColourScreenTests(unittest.TestCase):
         )
 
 class PaletteTests(unittest.TestCase):
+    def test_other_inks_are_unknown_not_zero_for_each_plate(self):
+        shape = (40, 60)
+        masks = np.zeros((2, *shape), bool)
+        masks[0, 10:30, 10:25] = True
+        masks[1, 10:30, 25:40] = True
+        readable = np.ones(shape, bool)
+
+        per_ink = golden_components.per_ink_readable_masks(masks, readable)
+
+        # Clean paper and the interior of each plate remain observations.
+        self.assertTrue(per_ink[:, 5, 5].all())
+        self.assertTrue(per_ink[0, 20, 15])
+        self.assertTrue(per_ink[1, 20, 35])
+        # Only the other plate is an occlusion. Adjacent target pixels remain
+        # observations; expanding this boundary destroys fine interlaced inks.
+        self.assertFalse(per_ink[0, 20, 30])
+        self.assertTrue(per_ink[0, 20, 23])
+        self.assertFalse(per_ink[1, 20, 15])
+        self.assertTrue(per_ink[1, 20, 26])
+
+    def test_single_ink_readability_is_unchanged(self):
+        readable = np.ones((20, 30), bool)
+        readable[2:5, 4:8] = False
+        masks = np.zeros((1, 20, 30), bool)
+        masks[0, 8:15, 10:20] = True
+
+        per_ink = golden_components.per_ink_readable_masks(masks, readable)
+
+        np.testing.assert_array_equal(per_ink[0], readable)
+
     def test_unified_observation_rejects_colour_spatial_disagreement(self):
         shape = (12, 16)
         neutral = unit([1.0, 1.0, 1.0])
@@ -646,6 +676,38 @@ class ColourPreservationTests(unittest.TestCase):
         self.assertTrue(selected.all())
         self.assertIsNone(boundary)
 
+    def test_dense_outlier_does_not_reduce_small_collection_to_a_pair(self):
+        # IX-X/35K has one unusually dense impression.  It is not evidence
+        # that the two strongest stamps form a separate preservation class:
+        # the remaining four still carry at least half-strength ink.
+        # With a constant footprint the score is proportional to density
+        # squared, hence the square roots reproduce those relative scores.
+        layers, masks = self.layers(
+            np.sqrt([0.60, 0.54, 0.61, 1.00, 0.49, 0.51])
+        )
+
+        selected, _, boundary = golden_components.colour_preservation_selection(
+            layers, masks
+        )
+
+        self.assertTrue(selected.all())
+        self.assertIsNone(boundary)
+
+    def test_unrelated_occlusion_does_not_raise_preservation_quality(self):
+        layers, masks = self.layers([1.0, 1.0])
+        # The second observation loses readable paper to another printing
+        # plate, but retains exactly the same target-ink evidence.
+        masks[1, :, :8] = False
+        masks[1, :, 42:] = False
+
+        selected, scores, boundary = golden_components.colour_preservation_selection(
+            layers, masks
+        )
+
+        self.assertTrue(selected.all())
+        self.assertIsNone(boundary)
+        np.testing.assert_allclose(scores, [1.0, 1.0])
+
     def test_single_impression_is_kept_as_best_effort(self):
         layers, masks = self.layers([0.45])
 
@@ -766,6 +828,48 @@ class ColourPreservationTests(unittest.TestCase):
 
 
 class ScreenCellRegistrationTests(unittest.TestCase):
+    def test_broadband_unwrap_chooses_the_period_before_carrier_phase(self):
+        height = width = 320
+        yy, xx = np.indices((height, width), dtype=np.float32)
+        pitch = 9.0
+        ruling = 0.35 * (1.0 + np.cos(2.0 * np.pi * yy / pitch))
+        design = np.zeros((height, width), np.float32)
+        cv2.circle(design, (91, 83), 19, 1.2, -1)
+        cv2.rectangle(design, (183, 57), (231, 104), 0.9, -1)
+        cv2.line(design, (73, 211), (247, 266), 1.1, 7)
+        plate = ruling + cv2.GaussianBlur(design, (0, 0), 2.0)
+        expected = np.zeros((5, 2), np.float32)
+        expected[2, 1] = pitch
+        layers = np.stack([
+            golden_components.shift_image(plate, -shift, cv2.INTER_CUBIC)
+            for shift in expected
+        ])
+        masks = np.ones_like(layers, bool)
+        phase = np.zeros_like(expected)
+
+        resolved = golden_components.broadband_unwrap_screen_cells(
+            layers,
+            masks,
+            phase,
+            np.zeros_like(expected),
+            (32, 32),
+            np.array([0.0, 1.0 / pitch]),
+            12.0,
+        )
+
+        np.testing.assert_allclose(resolved["shifts"], expected, atol=1.0)
+        self.assertEqual(resolved["confidence"][2]["branch"], 1)
+        self.assertGreater(resolved["confidence"][2]["cell_gap"], 0.02)
+        before = golden_components.broadband_branch_audit(
+            layers, masks, phase, (32, 32), np.array([0.0, 1.0 / pitch])
+        )
+        after = golden_components.broadband_branch_audit(
+            layers, masks, resolved["shifts"], (32, 32),
+            np.array([0.0, 1.0 / pitch]),
+        )
+        self.assertEqual(before[2]["branch"], 1)
+        self.assertEqual([entry["branch"] for entry in after], [0] * 5)
+
     def test_resolves_whole_period_and_along_ruling_offsets(self):
         height = width = 320
         pattern = np.zeros((height, width), np.float32)

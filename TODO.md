@@ -644,3 +644,78 @@ V 1K cancellation-colour check:
   its global cell consensus wins held-out agreement (+0.070 versus +0.037), and
   the final multi-impression rebuild gains 11.8% edge energy over the averaged
   golden. Keep this case as a regression fixture before generalising the rule.
+
+V 1K broadband-first cell experiment:
+
+- Checkpoint `8d388df` preserves the unified arbitrary-colour-residual result
+  before changing periodic registration. The experimental resolver leaves the
+  production consensus untouched: it removes the measured carrier, builds
+  leave-one-out aperiodic templates, finds an unrestricted two-dimensional
+  correlation peak, and only then snaps the across-ruling coordinate to the
+  closest measured phase branch.
+- The synthetic neighbouring-period fixture is resolved correctly even though
+  the carrier phase is identical in both cells. The full suite has 128 passing
+  tests with this fixture included.
+- On the corrected V 1K decomposition, both the existing consensus and the new
+  broadband resolver select branch zero for all ten impressions. Independent
+  leave-one-out audits dispute 0 old and 0 new cells. Eight decisions clear the
+  provisional 0.02 cell-gap threshold; stamps #4 (0.019) and #6 (0.008) remain
+  low-confidence, but neither prefers a neighbouring period.
+- The experiment adds 15.7 s on ten impressions. Its rendered ink-2 result is
+  correspondingly almost identical to the current consensus (0.47 mean channel
+  difference in the panel crop, 4.3% of pixels differing by more than five
+  levels). This indicates that the earlier two disputed V 1K cells disappeared
+  when arbitrary-colour cancellation stopped contaminating the ink layer; the
+  new resolver is a confirmation/control on this sheet rather than a visible
+  correction. Do not expand to the other sheets until V 1K is visually accepted.
+
+Overprint-aware production pass:
+
+- A pixel owned by another printing ink is now unknown for the plate being
+  reconstructed, rather than readable evidence that the target ink was absent.
+  This is deliberately an exact mask, without geometric dilation: a fixed
+  five-pixel buffer badly damages fine interlaced plates such as XXI 1K, and no
+  reliable printing order is available to apply it directionally. Clean visible
+  paper and pixels assigned to the target ink remain meaningful observations.
+- The direct V 1K #7/#10 diagnostic established the actual failure: making the
+  black silhouette unknown to the yellow plate moves the preferred horizontal
+  branch by 8.0 pixels, matching the ornament visually. The first experiment
+  used a five-pixel dilation, but that result justified removing the black
+  observation, not expanding it geometrically; the final mask is exact.
+- Preservation quality is measured only on the shared footprint of the plate
+  that remains visible in each impression. Occlusion therefore neither rewards
+  a smaller readable mask nor penalises ink hidden by an overprint.
+- A small high-score tail is treated as a density outlier, not as a preservation
+  class, unless the discarded impressions are genuinely faint. This prevents
+  IX-X 35K stamp #4 from reducing a six-stamp reconstruction to #4 + #3. The
+  corrected run uses all six impressions for both inks, restores half-set
+  agreement to +0.788/+0.748, gains 8.3% edge energy, and no longer reproduces
+  one impression.
+- Full validation is 132 tests. The dilated-mask review panels were generated
+  for V 1K, 3K, 5K; VIII 7K; and IX-X 1K, 2K, 3K, 5K, 7K, 14K, 35K, 70K. They
+  are historical controls now, not results from the exact-mask checkpoint.
+
+Exact-mask checkpoint after removing the five-pixel buffer:
+
+- V 1K, V 3K, V 5K and XXI 1K panels have been regenerated. The wider batch was
+  stopped before VIII 7K at the checkpoint request; VIII and IX-X panels have
+  not yet been regenerated with the exact mask.
+- V 1K visibly recovers the black plate that the dilated mask had eaten, while
+  retaining the improved yellow ornament. A new ambiguity is exposed: the
+  automatic probe sees the yellow ruling leaking into the black layer (single
+  strength 22.68) and accepts the screen route for both inks. The rendered black
+  result looks substantially better, but the combined edge metric falls 29.8%
+  and impression agreement falls from +0.550 to +0.305. Do not interpret that
+  metric conflict as resolved; the next change must prevent one physical screen
+  signal from independently switching two ink passes to screen registration.
+- V 3K remains stable: black uses ordinary registration with half-set agreement
+  +0.746; the green screen uses five impressions and has +0.407. V 5K improves
+  materially: black half-set agreement rises from +0.347 with dilation to
+  +0.673, and the damaged second ink finds five usable screen impressions
+  (#7, #11, #12, #15, #19) instead of three.
+- XXI 1K is the counterexample that rules out fixed dilation. Its red and green
+  designs are densely interlaced; the exact mask preserves both. All 12 stamps
+  contribute to both ordinary plate estimates, with half-set agreement
+  +0.961/+0.945. The red pass is still accepted as a screen by the automatic
+  probe, so it is also a regression case for separating a periodic engraved
+  design from a genuine background-screen registration problem.
