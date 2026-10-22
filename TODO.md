@@ -425,18 +425,19 @@ authoritative shows up as a wide gap, because it is being reproduced rather than
 estimated. On V 3K the rebuild agrees at +0.617 against the averaged golden's
 +0.636, so the extra edge energy there is not a better model of the sheet.
 
-`best_preserving_colour_merge` deliberately keeps one impression authoritative
-wherever it is readable, which is why all three V colour grounds carry the stains
-and uneven inking of a single stamp: V 1K #10, V 3K #1, V 5K #7. Replacing that
-with a merge, and letting the best impression fill only what no two impressions
-corroborated, was tried and backed out. It does remove the stains and even the
-coverage, and edge energy even rose on V 3K from +16.2% to +18.6%, but at 4x
-magnification the burelage is gone: the triangular ground on V 5K and the
-ornamental ground on V 3K are smeared into a flat wash. One global shift per
-impression cannot hold an 8 px ruling in phase right across a stamp, so the
-median cancels the narrowband component while the stains, being broadband,
-average constructively. The screen-strength figures do not show this because
-they are measured on a different, phase-aware merge inside the 256 px window.
+The earlier `best_preserving_colour_merge` response made one impression
+authoritative wherever it was readable. It made the V colour grounds look
+plausible, but only by hiding the multi-impression reconstruction failure behind
+V 1K #10, V 3K #1, or V 5K #7. That is not an acceptable production fallback.
+The main path must remain a genuine collection reconstruction whenever two or
+more usable observations exist; the best singleton is now a separate, stable
+`from best (#...)` diagnostic column. The known failure is therefore visible
+again: at 4x magnification the triangular ground on V 5K and the ornamental
+ground on V 3K can smear or acquire phase shadows. One global shift per
+impression cannot hold an 8 px ruling in phase right across a stamp, so a merge
+can cancel or double the narrowband component while broadband stains average
+constructively. The screen-strength figures do not show the whole failure
+because they are measured inside one phase-aware 256 px window.
 
 Everything described from here to the end of this section is implemented on the
 branch `screen-band-separation`, not on `main`. `main` carries these notes and
@@ -599,3 +600,47 @@ Also still to do:
   positionally across passes whose variant lists are unrelated. Column 4 of V 5K
   therefore reads "second-best single stamp #9" over an ink 2 image sourced from
   #7, because #9 is ink 1's ranking. Give each comparison column one owning pass.
+
+Interim implementation for review:
+
+- Every panel is limited to `as averaged | main path | from best (#...) |
+  from best 2 (...) | spectral hybrid`.
+  Component rows under `as averaged` show the corresponding best source crop as
+  observed, while the next two cells show the accepted multi-stamp component and
+  its explicit singleton control.
+- `choose_impressions()` and colour preservation keep at least two observations
+  in the main route when two are available. A sharper singleton is reported but
+  cannot silently replace the reconstruction.
+- `from best 2` is built independently for every printing pass. Its heading
+  lists, per ink, the pair actually used; it no longer changes one ink while
+  silently leaving another at its many-stamp result.
+- The one retained non-production spectral column splits the colour screen into
+  a robust broadband median and a complex-demodulated narrow band at the
+  measured wave.
+- Only a scalar 75th-percentile density normalization is borrowed from the
+  accepted consensus; no pixels or spatial structure come from the singleton.
+- The production/main-path column now exposes the genuine multi-impression
+  consensus. The spectral hybrids remain non-production review columns.
+
+V 1K cancellation-colour check:
+
+- The unified path must not model cancellation as a neutral-grey nuisance.
+  Stamp #10 has a strong reddish-brown cancellation (a representative residual
+  colour is about `#8A694E`), while #7 and #8 contain darker brown/black marks.
+  Cancellation colour is therefore arbitrary external evidence, not another
+  printing ink and not necessarily close to the neutral direction.
+- The former 50-degree colour gate was wider than the 44.9-degree separation
+  between the two V 1K inks. Spatial ownership could consequently override the
+  observed colour and project the cancellation onto the orange ray. For stamp
+  #7, pixels actually closer to ink 1 supplied 38.1% of the old ink-2 density.
+- The experimental correction accepts a pixel only when its nearest local ink
+  direction agrees with the collection's spatial owner and the ink's repeatable
+  support. The colour tolerance is derived from inter-ink separation (20.2
+  degrees for V 1K, clipped to 12--25 degrees); every other dense pixel is an
+  arbitrary-colour residual and casts no vote for any plate.
+- On the corrected V 1K run, #7, #8, and #10 have residual fractions 22.7%,
+  20.2%, and 18.9%. Their cancellation marks disappear from both reconstructed
+  inks, while #10 remains usable for both passes. Ink 2 keeps nine impressions,
+  its global cell consensus wins held-out agreement (+0.070 versus +0.037), and
+  the final multi-impression rebuild gains 11.8% edge energy over the averaged
+  golden. Keep this case as a regression fixture before generalising the rule.

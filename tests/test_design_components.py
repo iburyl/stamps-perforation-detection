@@ -79,8 +79,141 @@ class AutomaticColourScreenTests(unittest.TestCase):
         )
         self.assertTrue(accepted)
 
+    def test_panel_comparisons_belong_to_the_screen_pass(self):
+        shape = (8, 10)
+        layer = np.zeros(shape, np.float32)
+        seen = np.ones(shape, bool)
+        ray = unit([1.0, 0.4, 0.2])
+        main = golden_components.Pass(
+            "ink 1", layer, seen, ray, "", "",
+            comparison_goldens=[layer + 1],
+            comparison_seen=[seen],
+            comparison_rays=[ray],
+            comparison_notes=["second-best single stamp #9"],
+        )
+        screen = golden_components.Pass(
+            "ink 2", layer, seen, ray, "", "",
+            primary_note="consensus",
+            comparison_goldens=[layer + 2, layer + 3],
+            comparison_seen=[seen, seen],
+            comparison_rays=[ray, ray],
+            comparison_notes=["legacy", "best single stamp #7"],
+        )
+
+        columns = golden_components.panel_comparisons([main, screen])
+
+        self.assertEqual([column.owner for column in columns], [1, 1])
+        self.assertEqual([column.label for column in columns], ["legacy", "best single stamp #7"])
+        self.assertNotIn("#9", " ".join(column.label for column in columns))
+
+    def test_best_column_is_separate_from_the_main_reconstruction(self):
+        shape = (8, 10)
+        seen = np.ones(shape, bool)
+        ray = unit([0.8, 0.5, 0.2])
+        main = np.full(shape, 0.25, np.float32)
+        single = np.full(shape, 0.75, np.float32)
+        entry = golden_components.Pass(
+            "ink", main, seen, ray, "", "",
+            best_golden=single,
+            best_seen=seen,
+            best_ray=ray,
+            best_source=3,
+        )
+
+        rebuilt, sources = golden_components.best_reconstruction(
+            [entry], np.array([220.0, 210.0, 190.0])
+        )
+
+        self.assertEqual(sources, [3])
+        np.testing.assert_array_equal(entry.golden, main)
+        self.assertFalse(
+            np.array_equal(
+                rebuilt,
+                golden_components.reconstruct([main], [ray], np.array([220.0, 210.0, 190.0])),
+            )
+        )
+
+    def test_spectral_hybrid_restores_screen_on_a_robust_broadband_merge(self):
+        height = width = 192
+        yy, _ = np.indices((height, width), dtype=np.float32)
+        wave = np.array([0.0, 1.0 / 8.0])
+        carrier = np.cos(2.0 * math.pi * yy / 8.0).astype(np.float32)
+        layers = np.stack(
+            [1.0 + 0.30 * carrier, 1.0 + 0.30 * carrier, *([np.ones_like(carrier)] * 3)]
+        )
+        masks = np.ones_like(layers, bool)
+        shifts = np.zeros((len(layers), 2), np.float32)
+        weights = np.array([1.0, 1.0, 0.05, 0.05, 0.05])
+
+        hybrid, _ = golden_components.spectral_screen_hybrid(
+            layers, masks, shifts, weights, wave, quorum=3
+        )
+        broad, _ = golden_components.robust_golden(
+            layers, masks, shifts, quorum=3
+        )
+        hybrid_amplitude = float(2.0 * np.mean((hybrid - hybrid.mean()) * carrier))
+        broad_amplitude = float(2.0 * np.mean((broad - broad.mean()) * carrier))
+
+        self.assertGreater(hybrid_amplitude, broad_amplitude + 0.20)
+        self.assertAlmostEqual(float(hybrid.mean()), 1.0, delta=0.03)
+        matched, scale = golden_components.match_layer_density(
+            0.25 * hybrid, hybrid, np.ones_like(hybrid, bool)
+        )
+        self.assertAlmostEqual(scale, 4.0, places=5)
+        self.assertAlmostEqual(
+            float(np.percentile(matched, 75)),
+            float(np.percentile(hybrid, 75)),
+            places=5,
+        )
 
 class PaletteTests(unittest.TestCase):
+    def test_unified_observation_rejects_colour_spatial_disagreement(self):
+        shape = (12, 16)
+        neutral = unit([1.0, 1.0, 1.0])
+        orange = unit([0.95, 0.30, 0.05])
+        rays = np.stack([neutral, orange])
+        # This location belongs to the orange plate, but observes a dark
+        # neutral cancellation.  The old 50-degree gate recoloured it orange.
+        density = np.broadcast_to(neutral, (*shape, 3)).copy()
+        magnitude = np.ones(shape, np.float64)
+        ownership = np.ones(shape, np.int16)
+
+        masks, readable, residual = golden_components.unified_ink_observation(
+            density,
+            magnitude,
+            np.ones(shape, bool),
+            rays,
+            ownership,
+            [np.ones(shape, bool), np.ones(shape, bool)],
+        )
+
+        self.assertTrue(residual.all())
+        self.assertFalse(readable.any())
+        self.assertFalse(masks.any())
+
+    def test_unified_observation_keeps_the_expected_coloured_ink(self):
+        shape = (12, 16)
+        neutral = unit([1.0, 1.0, 1.0])
+        orange = unit([0.95, 0.30, 0.05])
+        rays = np.stack([neutral, orange])
+        density = np.broadcast_to(0.7 * orange, (*shape, 3)).copy()
+        magnitude = np.linalg.norm(density, axis=2)
+        ownership = np.ones(shape, np.int16)
+
+        masks, readable, residual = golden_components.unified_ink_observation(
+            density,
+            magnitude,
+            np.ones(shape, bool),
+            rays,
+            ownership,
+            [np.ones(shape, bool), np.ones(shape, bool)],
+        )
+
+        self.assertFalse(residual.any())
+        self.assertTrue(readable.all())
+        self.assertFalse(masks[0].any())
+        self.assertTrue(masks[1].all())
+
     def test_achromatic_mode_does_not_replace_coloured_mode(self):
         neutral = unit([1.0, 1.0, 1.0])
         coloured = unit([0.90, 0.55, 0.12])
@@ -563,14 +696,15 @@ class ColourPreservationTests(unittest.TestCase):
 
         self.assertEqual(len(passes), 2)
         self.assertGreater(float(passes[1].golden.max()), 0.5)
-        self.assertEqual(len(passes[1].comparison_goldens), 1)
+        self.assertEqual(len(passes[1].comparison_goldens), 0)
         self.assertEqual(
-            passes[1].comparison_notes[0],
+            passes[1].best_note,
             "colour from best single stamp #1 only",
         )
-        np.testing.assert_allclose(passes[1].comparison_rays[0], coloured, atol=1e-6)
+        self.assertEqual(passes[1].best_source, 0)
+        np.testing.assert_allclose(passes[1].best_ray, coloured, atol=1e-6)
 
-    def test_screen_selection_falls_back_to_stronger_singleton(self):
+    def test_screen_selection_does_not_hide_a_bad_merge_with_a_singleton(self):
         values = {
             frozenset({0}): 8.0,
             frozenset({1}): 3.0,
@@ -585,9 +719,24 @@ class ColourPreservationTests(unittest.TestCase):
             lambda members: values[frozenset(members)], 3
         )
 
-        self.assertEqual(chosen, [0])
-        self.assertEqual(trail[-1], 8.0)
+        self.assertEqual(chosen, [0, 1, 2])
+        self.assertEqual(trail[-1], 5.0)
         self.assertEqual(alone, [8.0, 3.0, 2.0])
+
+    def test_preservation_keeps_two_when_one_stamp_is_much_stronger(self):
+        layers = np.zeros((3, 30, 30), np.float32)
+        masks = np.ones_like(layers, bool)
+        layers[0] = 1.0
+        layers[1] = 0.70
+        layers[2] = 0.05
+
+        selected, _, boundary = golden_components.colour_preservation_selection(
+            layers, masks
+        )
+
+        self.assertIsNotNone(boundary)
+        self.assertEqual(int(selected.sum()), 2)
+        np.testing.assert_array_equal(selected, [True, True, False])
 
     def test_shared_screen_corner_follows_colour_evidence(self):
         size = golden_components.background_ink.SCREEN_WINDOW
@@ -598,42 +747,6 @@ class ColourPreservationTests(unittest.TestCase):
         corner = golden_components.shared_screen_corner(fields)
 
         self.assertEqual(corner, (40, 70))
-
-    def test_screen_geometry_preserves_best_colour_and_only_fills_its_gap(self):
-        shape = (20, 24)
-        best = np.full(shape, 0.8, np.float32)
-        peer = np.full(shape, 0.4, np.float32)
-        best_mask = np.ones(shape, bool)
-        best_mask[6:12, 8:15] = False
-        entries = [
-            {"source_index": 0, "coverage": best, "readable": best_mask},
-            {"source_index": 1, "coverage": peer, "readable": np.ones(shape, bool)},
-        ]
-
-        merged, seen, source = golden_components.best_preserving_colour_merge(
-            entries,
-            np.zeros((2, 2), np.float32),
-            np.array([0, 1]),
-            np.array([1.0, 0.6]),
-        )
-
-        self.assertEqual(source, 0)
-        np.testing.assert_allclose(merged[best_mask], 0.8)
-        np.testing.assert_allclose(merged[~best_mask], 0.4)
-        self.assertTrue(seen.all())
-
-    def test_a_lone_selected_impression_is_still_used_whole(self):
-        shape = (12, 16)
-        only = np.full(shape, 0.7, np.float32)
-        entries = [{"source_index": 0, "coverage": only, "readable": np.ones(shape, bool)}]
-
-        merged, seen, source = golden_components.best_preserving_colour_merge(
-            entries, np.zeros((1, 2), np.float32), np.array([0]), np.array([1.0])
-        )
-
-        self.assertEqual(source, 0)
-        np.testing.assert_allclose(merged, 0.7)
-        self.assertTrue(seen.all())
 
     def test_background_projection_is_not_counted_twice(self):
         main_ray = unit([0.82, 0.50, 0.28])

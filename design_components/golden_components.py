@@ -180,48 +180,68 @@ def robust_golden(
     return golden.astype(np.float32), enough
 
 
-def best_preserving_colour_merge(
-    entries: list[dict],
+def periodic_narrow_band(
+    layer: np.ndarray, wave: np.ndarray, mask: np.ndarray
+) -> np.ndarray:
+    """Complex-demodulate the slowly varying envelope around one screen wave."""
+    wave = np.asarray(wave, np.float64)
+    frequency = float(np.hypot(*wave))
+    if frequency <= 1e-9:
+        return np.zeros_like(layer, np.float32)
+    yy, xx = np.indices(layer.shape, dtype=np.float64)
+    carrier = np.exp(2j * math.pi * (wave[0] * xx + wave[1] * yy))
+    valid = np.asarray(mask, bool)
+    weight = valid.astype(np.float64)
+    sigma = max(2.0, 0.75 / frequency)
+    normalizer = cv2.GaussianBlur(weight, (0, 0), sigma)
+    demodulated = np.asarray(layer, np.float64) * np.conj(carrier) * weight
+    real = cv2.GaussianBlur(demodulated.real, (0, 0), sigma)
+    imaginary = cv2.GaussianBlur(demodulated.imag, (0, 0), sigma)
+    envelope = np.divide(
+        real + 1j * imaginary,
+        normalizer,
+        out=np.zeros_like(real, np.complex128),
+        where=normalizer > 0.1,
+    )
+    result = 2.0 * np.real(envelope * carrier)
+    return np.where(valid, result, 0.0).astype(np.float32)
+
+
+def spectral_screen_hybrid(
+    layers: np.ndarray,
+    masks: np.ndarray,
     shifts: np.ndarray,
-    preferred_sources: np.ndarray,
-    preservation: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, int]:
-    """Apply screen geometry without allowing averaging to erase the best plate.
+    weights: np.ndarray,
+    wave: np.ndarray,
+    quorum: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Use a robust plate for broad structure and a phase merge for its ruling."""
+    phase, phase_seen = screen_golden(layers, masks, shifts, weights, quorum)
+    broad, broad_seen = robust_golden(
+        layers, masks, shifts, quorum, floor=min(2, len(layers))
+    )
+    common = phase_seen & broad_seen
+    phase_band = periodic_narrow_band(phase, wave, common)
+    broad_band = periodic_narrow_band(broad, wave, common)
+    hybrid = broad.copy()
+    hybrid[common] += phase_band[common] - broad_band[common]
+    hybrid = np.clip(hybrid, 0.0, None)
+    return hybrid.astype(np.float32), broad_seen | phase_seen
 
-    The clean periodic field chooses the transformations, not the density of the
-    finished colour plate.  The strongest preservation-ranked impression remains
-    authoritative wherever it is readable; aligned peers only fill pixels hidden
-    from it by a postmark or an invalid mask.
 
-    Merging the peers instead removes the stains and evens the coverage, but a
-    single global shift per impression cannot hold an 8 px ruling in phase right
-    across a stamp, so the median then cancels the very screen this route exists
-    to recover.  Separating the broadband and narrowband parts is what would let
-    both be had; see TODO.md.
-    """
-    wanted = set(int(index) for index in np.asarray(preferred_sources).ravel())
-    positions = [
-        position
-        for position, entry in enumerate(entries)
-        if int(entry["source_index"]) in wanted
-    ]
-    if not positions:
-        raise RuntimeError("No preservation-selected colour impression fits the screen")
-
-    sources = np.array([int(entries[position]["source_index"]) for position in positions])
-    layers = np.stack([entries[position]["coverage"] for position in positions])
-    masks = np.stack([entries[position]["readable"] for position in positions])
-    motions = np.asarray(shifts, np.float32)[positions]
-    merged, merged_seen = robust_golden(layers, masks, motions, quorum=1, floor=1)
-
-    best_local = int(np.argmax(preservation[sources]))
-    best_source = int(sources[best_local])
-    best_layer = move_image(layers[best_local], motions[best_local], cv2.INTER_CUBIC)
-    best_seen = move_image(
-        masks[best_local].astype(np.uint8), motions[best_local], cv2.INTER_NEAREST
-    ) > 0
-    merged[best_seen] = best_layer[best_seen]
-    return merged.astype(np.float32), best_seen | merged_seen, best_source
+def match_layer_density(
+    layer: np.ndarray,
+    reference: np.ndarray,
+    mask: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """Match one robust ink-density quantile without copying reference structure."""
+    common = mask & (layer > 0.0) & (reference > 0.0)
+    if int(common.sum()) < 1000:
+        return layer.astype(np.float32), 1.0
+    source = float(np.percentile(layer[common], 75))
+    target = float(np.percentile(reference[common], 75))
+    scale = float(np.clip(target / max(source, 1e-9), 0.5, 5.0))
+    return (np.asarray(layer, np.float32) * scale).astype(np.float32), scale
 
 
 def colour_preservation_selection(
@@ -232,9 +252,10 @@ def colour_preservation_selection(
     Water loss removes both area and density from an ink.  Their product is a
     useful one-dimensional preservation measure.  Work in log space and cut
     only across a conspicuous gap; a smooth quality gradient contains no
-    defensible boundary, so all readable impressions remain in play.  There
-    is deliberately no minimum group size: one surviving impression is still
-    better evidence than abandoning the colour pass altogether.
+    defensible boundary, so all readable impressions remain in play.  When
+    more than one readable impression exists, at least two remain in the main
+    reconstruction.  A lone outstanding stamp belongs in the separate
+    single-stamp diagnostic rather than silently replacing the collection.
 
     Returns the selection, scores relative to the strongest impression, and
     the relative-score boundary when a distinct group was found.
@@ -277,6 +298,8 @@ def colour_preservation_selection(
 
     selected[:] = False
     selected[ordered[split + 1 :]] = True
+    if int(selected.sum()) == 1 and len(live) >= 2:
+        selected[ordered[-2:]] = True
     boundary = math.sqrt(
         float(relative[ordered[split]]) * float(relative[ordered[split + 1]])
     )
@@ -943,14 +966,11 @@ def choose_impressions(score, count: int) -> tuple[list[int], list[float], list[
             break
         chosen.remove(drop)
         trail.append(best)
-    # Backward elimination can be trapped by a set where removing any one
-    # member is insufficient, even though the complete merge is worse than a
-    # clean singleton.  Never publish a merge weaker than the evidence already
-    # available in its best constituent.
-    best_single = int(np.argmax(alone))
-    if alone[best_single] > trail[-1]:
-        chosen = [best_single]
-        trail.append(alone[best_single])
+    # A clean singleton is an important diagnostic, but it is not a
+    # reconstruction from the collection.  Keep it in ``alone`` and in the
+    # dedicated "from best" panel column; do not silently publish it as the
+    # multi-impression path.  With two or more observations this routine must
+    # therefore return at least two, even when the best singleton is sharper.
     return chosen, trail, alone
 
 
@@ -1663,6 +1683,32 @@ def averaged_achromatic_pass(collection: Collection, palette: dict) -> list[Pass
     )
     support = palette.get("achromatic_supports", [None])[0]
     scoring = collection.covered if support is None else collection.covered & support
+    best_sources = closest_sources_to_average(collection, min(2, len(collection.images)))
+    best_source = best_sources[0]
+    best_seen = collection.valid[best_source].copy()
+    best_golden = achromatic_layer(
+        collection.images[best_source],
+        collection.papers[best_source],
+        best_seen,
+        ray,
+    )
+    best_two_layers = np.stack([
+        achromatic_layer(
+            collection.images[index],
+            collection.papers[index],
+            collection.valid[index],
+            ray,
+        )
+        for index in best_sources
+    ])
+    best_two_masks = collection.valid[best_sources]
+    best_two_golden, best_two_seen = robust_golden(
+        best_two_layers,
+        best_two_masks,
+        np.zeros((len(best_sources), 2), np.float32),
+        collection_quorum(len(best_sources)),
+        floor=1,
+    )
     return [
         Pass(
             name="achromatic pass",
@@ -1672,6 +1718,24 @@ def averaged_achromatic_pass(collection: Collection, palette: dict) -> list[Pass
             density_note="achromatic pass, density; averaged baseline",
             ink_note=f"achromatic pass in its own ink; averaged baseline; "
                      f"{bgr_hex(to_srgb(to_linear(collection.paper) * 10.0 ** (-ray)))}",
+            best_golden=best_golden,
+            best_seen=best_seen,
+            best_ray=ray.copy(),
+            best_source=best_source,
+            best_note=(
+                f"achromatic pass from closest single stamp "
+                f"#{collection.numbers[best_source]}"
+            ),
+            best_two_golden=best_two_golden,
+            best_two_seen=best_two_seen,
+            best_two_ray=ray.copy(),
+            best_two_sources=tuple(best_sources),
+            best_two_note=(
+                "achromatic pass from closest two stamps "
+                + " + ".join(
+                    f"#{collection.numbers[index]}" for index in best_sources
+                )
+            ),
             band=edge_band(golden, scoring),
         )
     ]
@@ -2140,6 +2204,25 @@ class Pass:
     ray: np.ndarray
     density_note: str
     ink_note: str
+    # Honest single-observation reference.  It is displayed beside the main
+    # reconstruction and never substitutes for it when multiple observations
+    # are available.
+    best_golden: np.ndarray | None = None
+    best_seen: np.ndarray | None = None
+    best_ray: np.ndarray | None = None
+    best_source: int | None = None
+    best_note: str = ""
+    # The same control using this pass's own two strongest observations.
+    best_two_golden: np.ndarray | None = None
+    best_two_seen: np.ndarray | None = None
+    best_two_ray: np.ndarray | None = None
+    best_two_sources: tuple[int, ...] = ()
+    best_two_note: str = ""
+    # One temporary experiment retained beside the stable controls.
+    spectral_golden: np.ndarray | None = None
+    spectral_seen: np.ndarray | None = None
+    spectral_ray: np.ndarray | None = None
+    spectral_note: str = ""
     # Short, stable label for the accepted reconstruction column.
     primary_note: str = ""
     # Edges the rebuild is scored over.  Carried rather than derived from the
@@ -2153,6 +2236,42 @@ class Pass:
     comparison_seen: list[np.ndarray] = field(default_factory=list)
     comparison_rays: list[np.ndarray] = field(default_factory=list)
     comparison_notes: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PanelComparison:
+    """One diagnostic column owned by exactly one printing pass."""
+
+    owner: int
+    variant: int
+    label: str
+
+
+def panel_comparisons(passes: list[Pass]) -> list[PanelComparison]:
+    """Name honest comparison columns without combining unrelated variants.
+
+    When a screen reconstruction replaced an ordinary pass, its alternatives
+    are the relevant panel comparison and other plates stay at their accepted
+    result.  Otherwise each pass gets its own columns.  Positional zipping made
+    a V/5K image sourced from stamp #7 inherit stamp #9 from another pass's
+    label, even though those rankings are unrelated.
+    """
+    screen_owners = [
+        index
+        for index, entry in enumerate(passes)
+        if entry.primary_note and entry.comparison_goldens
+    ]
+    owners = screen_owners or [
+        index for index, entry in enumerate(passes) if entry.comparison_goldens
+    ]
+    qualify = len(owners) > 1
+    columns = []
+    for owner in owners:
+        entry = passes[owner]
+        for variant, note in enumerate(entry.comparison_notes):
+            label = f"{entry.name}: {note}" if qualify else note
+            columns.append(PanelComparison(owner, variant, label))
+    return columns
 
 
 def load_collection(scan: Path, args: Settings) -> Collection:
@@ -2189,6 +2308,27 @@ def load_collection(scan: Path, args: Settings) -> Collection:
     )
 
 
+def closest_sources_to_average(collection: Collection, count: int = 1) -> list[int]:
+    """Fallback source ranking when a branch has no plate-specific score."""
+    scores = []
+    for image, valid in zip(collection.images, collection.valid):
+        shared = valid & collection.covered
+        if not shared.any():
+            scores.append(float("inf"))
+            continue
+        difference = np.abs(
+            np.asarray(image[shared], np.float32)
+            - np.asarray(collection.baseline[shared], np.float32)
+        )
+        missing = 1.0 - float(shared.sum()) / max(float(collection.covered.sum()), 1.0)
+        scores.append(float(np.mean(difference)) + 255.0 * missing)
+    return [int(index) for index in np.argsort(scores)[: max(1, count)]]
+
+
+def closest_source_to_average(collection: Collection) -> int:
+    return closest_sources_to_average(collection, 1)[0]
+
+
 def screen_passes(collection: Collection, palette: dict, args: Settings) -> list[Pass]:
     """The main design, and the ruled screen printed behind it.
 
@@ -2201,9 +2341,9 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
     main_is_achromatic = bool(palette.get("achromatic", [False])[0])
     main_name = "achromatic pass" if main_is_achromatic else "main pass"
     results, kept = [], []
-    for number, image, mask, stamp_paper in zip(
+    for source_index, (number, image, mask, stamp_paper) in enumerate(zip(
         collection.numbers, collection.images, collection.valid, collection.papers
-    ):
+    )):
         try:
             # The impression's own ink ray is allowed to be useless here; the
             # coverage is re-read below against the one the collection agrees on.
@@ -2216,6 +2356,7 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
         result["valid"] = mask
         result["image"] = image
         result["paper"] = stamp_paper
+        result["source_index"] = source_index
         results.append(result)
         kept.append(number)
     if not results:
@@ -2393,6 +2534,39 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
 
     if not separable and not selection_note:
         selection_note = "one ink only, no separable background"
+    finite_main = np.where(np.isfinite(main_scores), main_scores, -np.inf)
+    if np.isfinite(finite_main).any():
+        best_main_local = int(np.argmax(finite_main))
+    else:
+        best_main_local = int(np.argmax(registration_readable.sum(axis=(1, 2))))
+    best_main_layers = conserved_layers if publishing else main_layers
+    best_main_golden = move_image(
+        best_main_layers[best_main_local], main_shifts[best_main_local], cv2.INTER_CUBIC
+    )
+    best_main_seen = move_image(
+        readable[best_main_local].astype(np.uint8),
+        main_shifts[best_main_local],
+        cv2.INTER_NEAREST,
+    ) > 0
+    best_main_source = int(results[best_main_local]["source_index"])
+    main_order = np.argsort(-finite_main)
+    main_order = main_order[np.isfinite(finite_main[main_order])]
+    if not len(main_order):
+        main_order = np.array([best_main_local], np.int32)
+    main_pair = np.asarray(main_order[:2], np.int32)
+    best_two_main, best_two_main_seen = robust_golden(
+        best_main_layers[main_pair],
+        readable[main_pair],
+        main_shifts[main_pair],
+        collection_quorum(len(main_pair)),
+        floor=1,
+    )
+    best_two_main_sources = tuple(
+        int(results[index]["source_index"]) for index in main_pair
+    )
+    best_two_main_numbers = [
+        collection.numbers[index] for index in best_two_main_sources
+    ]
     passes = [
         Pass(
             name=main_name,
@@ -2406,6 +2580,22 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
             ink_note=f"{main_name} in its own ink"
                      f"{'; ' + selection_note if selection_note else ''}; "
                      f"{bgr_hex(to_srgb(to_linear(paper) * 10.0 ** (-main_ray)))}",
+            best_golden=best_main_golden,
+            best_seen=best_main_seen,
+            best_ray=main_ray.copy(),
+            best_source=best_main_source,
+            best_note=(
+                f"{main_name} from best registered single stamp "
+                f"#{collection.numbers[best_main_source]}"
+            ),
+            best_two_golden=best_two_main,
+            best_two_seen=best_two_main_seen,
+            best_two_ray=main_ray.copy(),
+            best_two_sources=best_two_main_sources,
+            best_two_note=(
+                f"{main_name} from best registered "
+                + " + ".join(f"#{number}" for number in best_two_main_numbers)
+            ),
             band=comparison_band if comparison_band is not None else
                  edge_band(golden_main, covered & seen_main),
         )
@@ -2523,14 +2713,10 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
 
     by_kind = {candidate["kind"]: candidate for candidate in back["comparisons"]}
     main_variants: list[tuple[np.ndarray, str]] = []
-    # Fixed, comparable columns, in a stable order: the single best impression
-    # first as the honest "one good stamp" reference, then one column per fix
-    # under test.  Both plates contribute to every column, so each one is a
-    # complete rebuild rather than a change to the background alone.
+    # The stable single-stamp reference lives in Pass.best_* and is rendered as
+    # the third standard panel column.  Keep only temporary reconstruction
+    # experiments in these variant lists.
     diagnostic_candidates = []
-    if "best" in by_kind:
-        diagnostic_candidates.append(by_kind["best"])
-        main_variants.append((passes[0].golden, f"{main_name} as accepted"))
 
     shape = registration_readable.shape[1:]
     chosen_back = np.asarray(accepted_back["chosen"], np.int32)
@@ -2630,6 +2816,18 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
     passes[0].comparison_seen = [seen_main for _ in main_variants]
     passes[0].comparison_rays = [main_ray.copy() for _ in main_variants]
     passes[0].comparison_notes = [note for _, note in main_variants]
+    best_background = by_kind.get("best")
+    best_two_background = by_kind.get("pair")
+    best_background_source = None
+    if best_background is not None and len(best_background["chosen"]):
+        best_background_local = int(best_background["chosen"][0])
+        best_background_source = int(results[best_background_local]["source_index"])
+    best_two_background_sources: tuple[int, ...] = ()
+    if best_two_background is not None:
+        best_two_background_sources = tuple(
+            int(results[int(index)]["source_index"])
+            for index in best_two_background["chosen"]
+        )
     passes.append(
         Pass(
             name="background pass",
@@ -2646,6 +2844,33 @@ def screen_passes(collection: Collection, palette: dict, args: Settings) -> list
                      + ("global pairwise cell consensus"
                         if consensus_candidate is not None
                         else f"strength {trail[-1]:.1f} vs {trail[0]:.1f} single"),
+            best_golden=(
+                best_background["golden"] if best_background is not None else None
+            ),
+            best_seen=(
+                best_background["seen"] if best_background is not None else None
+            ),
+            best_ray=back_ray.copy() if best_background is not None else None,
+            best_source=best_background_source,
+            best_note=(
+                best_background["note"] if best_background is not None else ""
+            ),
+            best_two_golden=(
+                best_two_background["golden"]
+                if best_two_background is not None else None
+            ),
+            best_two_seen=(
+                best_two_background["seen"]
+                if best_two_background is not None else None
+            ),
+            best_two_ray=(
+                back_ray.copy() if best_two_background is not None else None
+            ),
+            best_two_sources=best_two_background_sources,
+            best_two_note=(
+                best_two_background["note"]
+                if best_two_background is not None else ""
+            ),
             comparison_goldens=[entry["golden"] for entry in diagnostic_candidates],
             comparison_seen=[entry["seen"] for entry in diagnostic_candidates],
             comparison_rays=[back_ray.copy() for _ in diagnostic_candidates],
@@ -2717,16 +2942,67 @@ def report_halves(back: dict, covered: np.ndarray) -> None:
         )
 
 
+def unified_ink_observation(
+    density: np.ndarray,
+    magnitude: np.ndarray,
+    valid: np.ndarray,
+    rays: np.ndarray,
+    ownership: np.ndarray | None,
+    supports: list[np.ndarray | None],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split one observation only where colour and repeatable plate agree.
+
+    A cancellation may have any colour.  It is therefore not represented by a
+    fixed grey direction.  Instead a pixel is printable evidence only when its
+    closest ink direction agrees with the plate that owns that position in the
+    registered median and lies inside that plate's repeatable support.  A
+    disagreement is an unexplained per-impression residual and is made
+    unreadable for every plate rather than recoloured as the spatial owner.
+    """
+    rays = np.asarray(rays, np.float64)
+    directions = np.divide(
+        density,
+        magnitude[:, :, None],
+        out=np.zeros_like(density),
+        where=magnitude[:, :, None] > 1e-8,
+    )
+    similarity = directions @ rays.T
+    assigned = np.argmax(similarity, axis=2)
+    closest = np.take_along_axis(similarity, assigned[:, :, None], axis=2)[:, :, 0]
+
+    if len(rays) > 1:
+        gram = np.clip(rays @ rays.T, -1.0, 1.0)
+        angles = np.degrees(np.arccos(gram))
+        separation = float(np.min(angles[~np.eye(len(rays), dtype=bool)]))
+        colour_tolerance = float(np.clip(0.45 * separation, 12.0, 25.0))
+    else:
+        colour_tolerance = 25.0
+    confident = closest >= math.cos(math.radians(colour_tolerance))
+
+    expected = np.ones(valid.shape, bool)
+    if ownership is not None:
+        expected &= assigned == ownership
+    supported = np.ones(valid.shape, bool)
+    for ink, support in enumerate(supports):
+        if support is not None:
+            selected = assigned == ink
+            supported[selected] = support[selected]
+
+    dense = magnitude >= 0.05
+    explained = dense & confident & expected & supported
+    residual = valid & dense & ~explained
+    readable = valid & ~residual
+    masks = np.stack([
+        readable & dense & (assigned == ink)
+        for ink in range(len(rays))
+    ])
+    return masks, readable, residual
+
+
 def unified_colour_layers(
     collection: Collection, palette: dict
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Split fixed-count inks without treating neutral colour as another pass.
-
-    Every requested ink competes in the same three-dimensional density space.
-    Neutral is offered only as a nuisance cancellation direction when none of
-    the requested inks is itself near-neutral; otherwise moving cancellations
-    are left for the collection-wide robust merge to remove.
-    """
+    """Split fixed-count inks and reject arbitrary-colour stamp residuals."""
     rays = np.asarray(palette["rays"], np.float64)
     local = palette.get("local_ink_rays")
     supports = palette.get("ink_supports", [None] * len(rays))
@@ -2734,9 +3010,6 @@ def unified_colour_layers(
     count, shape = len(rays), collection.images.shape[1:3]
     layers = np.zeros((count, len(collection.images), *shape), np.float32)
     readable = np.zeros((count, len(collection.images), *shape), bool)
-    has_neutral_ink = bool(
-        np.any(rays @ background_ink.NEUTRAL >= math.cos(math.radians(12.0)))
-    )
     for index, (image, valid, paper) in enumerate(
         zip(collection.images, collection.valid, collection.papers)
     ):
@@ -2745,54 +3018,19 @@ def unified_colour_layers(
             for ink in range(count):
                 if np.isfinite(local[index, ink]).all():
                     stamp_rays[ink] = local[index, ink]
-        # Keep plate identity tied to the collection-wide centres.  A badly
-        # faded coloured ink can move close to the neutral ink on one stamp;
-        # letting that local estimate redefine the decision boundary makes the
-        # two plates exchange pixels and turns cancellations into artwork.  The
-        # local ray still measures density and renders that stamp's own colour.
-        columns = (
-            rays
-            if has_neutral_ink
-            else np.vstack([rays, background_ink.NEUTRAL])
-        )
         density, magnitude = optical_density(image, paper)
-        directions = np.divide(
+        masks, observation_readable, _ = unified_ink_observation(
             density,
-            magnitude[:, :, None],
-            out=np.zeros_like(density),
-            where=magnitude[:, :, None] > 1e-8,
+            magnitude,
+            valid,
+            stamp_rays,
+            ownership,
+            supports,
         )
-        flat = density.reshape(-1, 3)
-        amounts = flat @ columns.T
-        residual = np.linalg.norm(
-            flat[:, None, :] - amounts[:, :, None] * columns[None, :, :],
-            axis=2,
-        )
-        residual[amounts < 0.0] = np.inf
-        assigned = np.argmin(residual, axis=1).reshape(shape)
-        nuisance = (
-            np.zeros(shape, bool)
-            if has_neutral_ink
-            else assigned == count
-        )
-        base = valid & ~nuisance
         for ink in range(count):
-            similarity = directions @ stamp_rays[ink]
-            if ownership is None:
-                identity = assigned == ink
-            else:
-                identity = ownership == ink
-            ink_mask = (
-                base
-                & identity
-                & (magnitude >= 0.05)
-                & (similarity >= math.cos(math.radians(50.0)))
-            )
-            if supports[ink] is not None:
-                ink_mask &= supports[ink]
             projection = np.maximum(density @ stamp_rays[ink], 0.0)
-            layers[ink, index] = np.where(ink_mask, projection, 0.0)
-            readable[ink, index] = base
+            layers[ink, index] = np.where(masks[ink], projection, 0.0)
+            readable[ink, index] = observation_readable
     return layers, readable
 
 
@@ -3007,6 +3245,23 @@ def screen_from_colour(
         )
         candidate["golden"] = full_golden
         candidate["seen"] = full_seen
+        candidate["experimental_variants"] = []
+        if candidate["kind"] == "consensus":
+            hybrid, hybrid_seen = spectral_screen_hybrid(
+                full_layers,
+                full_readable,
+                candidate["chosen_shifts"],
+                candidate["chosen_weights"],
+                merged["wave"],
+                candidate["quorum"],
+            )
+            candidate["experimental_variants"].append(
+                {
+                    "golden": hybrid,
+                    "seen": hybrid_seen,
+                    "note": "experimental spectral hybrid",
+                }
+            )
     merged["bearings"] = bearings
     merged["reference"] = reference
     merged["entries"] = entries
@@ -3080,6 +3335,33 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
             golden = achromatic_layer(
                 collection.baseline, collection.paper, collection.covered, ray
             )
+            best_sources = closest_sources_to_average(
+                collection, min(2, len(collection.images))
+            )
+            best_source = best_sources[0]
+            best_seen = collection.valid[best_source].copy()
+            best_golden = achromatic_layer(
+                collection.images[best_source],
+                collection.papers[best_source],
+                best_seen,
+                ray,
+            )
+            best_two_layers = np.stack([
+                achromatic_layer(
+                    collection.images[index],
+                    collection.papers[index],
+                    collection.valid[index],
+                    ray,
+                )
+                for index in best_sources
+            ])
+            best_two_golden, best_two_seen = robust_golden(
+                best_two_layers,
+                collection.valid[best_sources],
+                np.zeros((len(best_sources), 2), np.float32),
+                collection_quorum(len(best_sources)),
+                floor=1,
+            )
             support = palette.get("achromatic_supports", [None] * len(rays))[ink]
             scoring = collection.covered if support is None else collection.covered & support
             band = edge_band(golden, scoring) if not passes else None
@@ -3092,6 +3374,24 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
                     ray=ray,
                     density_note=f"{name}, density; solid averaged mask",
                     ink_note=f"{name} in its own ink, {share:.0%} of the inked area",
+                    best_golden=best_golden,
+                    best_seen=best_seen,
+                    best_ray=ray.copy(),
+                    best_source=best_source,
+                    best_note=(
+                        f"{name} from closest single stamp "
+                        f"#{collection.numbers[best_source]}"
+                    ),
+                    best_two_golden=best_two_golden,
+                    best_two_seen=best_two_seen,
+                    best_two_ray=ray.copy(),
+                    best_two_sources=tuple(best_sources),
+                    best_two_note=(
+                        f"{name} from closest two stamps "
+                        + " + ".join(
+                            f"#{collection.numbers[index]}" for index in best_sources
+                        )
+                    ),
                     band=band,
                 )
             )
@@ -3204,17 +3504,21 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
                 result = observed
             return result
 
-        # The first two columns preserve the observations exactly as extracted:
-        # they deliberately use no other colour stamp for density or hue.
-        for rank, index in enumerate(ranked[:2], start=1):
-            number = collection.numbers[index]
-            ordinal = "best" if rank == 1 else "second-best"
-            comparison_goldens.append(layers[ink, index].copy())
-            comparison_seen.append(readable[ink, index].copy())
-            comparison_rays.append(observed_ray(index))
-            comparison_notes.append(
-                f"colour from {ordinal} single stamp #{number} only"
-            )
+        best_index = int(ranked[0])
+        best_golden = layers[ink, best_index].copy()
+        best_seen = readable[ink, best_index].copy()
+        best_ray = observed_ray(best_index)
+        best_note = (
+            f"colour from best single stamp "
+            f"#{collection.numbers[best_index]} only"
+        )
+        best_two_golden = best_golden
+        best_two_seen = best_seen
+        best_two_ray = best_ray
+        best_two_sources = (best_index,)
+        best_two_note = best_note
+        spectral_golden = spectral_seen = spectral_ray = None
+        spectral_note = ""
 
         # Then show what the same merger does to only those two observations.
         if len(ranked) >= 2:
@@ -3238,10 +3542,11 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
             )
             pair_ray /= max(float(np.linalg.norm(pair_ray)), 1e-12)
             pair_numbers = [collection.numbers[int(index)] for index in pair]
-            comparison_goldens.append(pair_golden)
-            comparison_seen.append(pair_seen)
-            comparison_rays.append(pair_ray)
-            comparison_notes.append(
+            best_two_golden = pair_golden
+            best_two_seen = pair_seen
+            best_two_ray = pair_ray
+            best_two_sources = tuple(int(index) for index in pair)
+            best_two_note = (
                 f"colour merged from best two stamps #{pair_numbers[0]} + #{pair_numbers[1]}"
             )
         band = edge_band(golden, collection.covered & seen) if ink == 0 else None
@@ -3319,32 +3624,6 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
                     candidate["kind"]: candidate
                     for candidate in crisped["comparisons"]
                 }
-                cells = crisped.get("cell_resolution")
-                if accepted and cells is not None:
-                    for kind in ("anchor", "consensus"):
-                        candidate = by_kind.get(kind)
-                        if candidate is None:
-                            continue
-                        try:
-                            full_golden, full_seen, best_source = best_preserving_colour_merge(
-                                crisped["turned_entries"],
-                                cells[f"{kind}_shifts"],
-                                chosen,
-                                preservation,
-                            )
-                        except RuntimeError as error:
-                            print(f"    {kind} full-colour merge unavailable: {error}")
-                            continue
-                        candidate["golden"] = full_golden
-                        candidate["seen"] = full_seen
-                        candidate["note"] += (
-                            f"; full colour anchored to preservation-best stamp "
-                            f"#{collection.numbers[best_source]}"
-                        )
-                        print(
-                            f"    {kind} full-colour merge preserves stamp "
-                            f"#{collection.numbers[best_source]} and fills only its unreadable pixels"
-                        )
                 consensus = by_kind.get("consensus")
                 anchor = by_kind.get("anchor")
                 screen_primary = (
@@ -3355,38 +3634,37 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
                 consensus = anchor = screen_primary = None
 
             if accepted and screen_primary is not None:
-                # Use exactly the same primary/diagnostic layout as the
-                # single-colour background route.  Here "legacy" deliberately
-                # means the established whole-design ECC result: it is the
-                # result this optional screen interpretation is replacing.
-                legacy_golden, legacy_seen = golden, seen
-                single_goldens = comparison_goldens[:2]
-                single_seen = comparison_seen[:2]
-                single_rays = comparison_rays[:2]
-
                 golden, seen = screen_primary["golden"], screen_primary["seen"]
+                used_numbers = [
+                    crisped["turned_entries"][int(index)]["number"]
+                    for index in screen_primary["chosen"]
+                ]
                 if consensus is not None:
-                    primary_note = "consensus"
+                    primary_note = (
+                        f"consensus from {len(used_numbers)} stamps {used_numbers}"
+                    )
                     note = (
                         f"screen {crisped['pitch']:.2f} px; "
                         "global pairwise 2D-cell consensus"
                     )
                 else:
-                    primary_note = "screen best effort"
-                    note = f"screen {crisped['pitch']:.2f} px; strongest single impression"
-                comparison_goldens = [legacy_golden, *single_goldens]
-                comparison_seen = [legacy_seen, *single_seen]
-                comparison_rays = [ray.copy(), *single_rays]
-                comparison_notes = [
-                    "legacy",
-                    *(["best"] if len(single_goldens) >= 1 else []),
-                    *(["second"] if len(single_goldens) >= 2 else []),
-                ]
-                if anchor is not None:
-                    comparison_goldens.append(anchor["golden"])
-                    comparison_seen.append(anchor["seen"])
-                    comparison_rays.append(ray.copy())
-                    comparison_notes.append("anchor")
+                    primary_note = f"screen best effort from {len(used_numbers)} stamp(s)"
+                    note = f"screen {crisped['pitch']:.2f} px; phase merge"
+                if consensus is not None:
+                    experiments = consensus.get("experimental_variants", [])
+                    if experiments:
+                        experiment = experiments[0]
+                        matched, density_scale = match_layer_density(
+                            experiment["golden"],
+                            consensus["golden"],
+                            experiment["seen"] & consensus["seen"],
+                        )
+                        spectral_golden = matched
+                        spectral_seen = experiment["seen"]
+                        spectral_ray = ray.copy()
+                        spectral_note = (
+                            f"{experiment['note']}; density {density_scale:.2f}x"
+                        )
 
         passes.append(
             Pass(
@@ -3396,6 +3674,20 @@ def colour_passes(collection: Collection, palette: dict, args: Settings) -> list
                 ray=ray,
                 density_note=f"{name}, density; {note}",
                 ink_note=f"{name} in its own ink, {share:.0%} of the inked area",
+                best_golden=best_golden,
+                best_seen=best_seen,
+                best_ray=best_ray,
+                best_source=best_index,
+                best_note=best_note,
+                best_two_golden=best_two_golden,
+                best_two_seen=best_two_seen,
+                best_two_ray=best_two_ray,
+                best_two_sources=best_two_sources,
+                best_two_note=best_two_note,
+                spectral_golden=spectral_golden,
+                spectral_seen=spectral_seen,
+                spectral_ray=spectral_ray,
+                spectral_note=spectral_note,
                 band=band,
                 primary_note=primary_note,
                 comparison_goldens=comparison_goldens,
@@ -3548,6 +3840,36 @@ def write_panel(
     return output
 
 
+def best_reconstruction(
+    passes: list[Pass], paper: np.ndarray
+) -> tuple[np.ndarray, list[int]]:
+    """Rebuild from each pass's explicit best single observation."""
+    layers, rays, sources = [], [], []
+    for entry in passes:
+        layers.append(
+            entry.best_golden if entry.best_golden is not None else entry.golden
+        )
+        rays.append(entry.best_ray if entry.best_ray is not None else entry.ray)
+        if entry.best_source is not None:
+            sources.append(int(entry.best_source))
+    return reconstruct(layers, rays, paper), sources
+
+
+def optional_reconstruction(
+    passes: list[Pass], paper: np.ndarray, layer_field: str, ray_field: str
+) -> tuple[np.ndarray, list[int]]:
+    """Rebuild one named per-pass variant, leaving unavailable passes unchanged."""
+    layers, rays, owners = [], [], []
+    for index, entry in enumerate(passes):
+        layer = getattr(entry, layer_field)
+        ray = getattr(entry, ray_field)
+        layers.append(layer if layer is not None else entry.golden)
+        rays.append(ray if ray is not None else entry.ray)
+        if layer is not None:
+            owners.append(index)
+    return reconstruct(layers, rays, paper), owners
+
+
 def build(scan: Path, args: Settings) -> Path:
     """Rebuild one scan's golden from its printing passes and write the panel."""
     output = args.output or scan.with_name(f"{scan.stem}_golden_components.png")
@@ -3645,67 +3967,85 @@ def build(scan: Path, args: Settings) -> Path:
             f"  Marked {len(passes)} ink(s) per stamp on {marked.name}"
         )
 
-    comparison_count = max((len(entry.comparison_goldens) for entry in passes), default=0)
-    comparison_rebuilds = []
-    comparison_labels = []
-    for comparison in range(comparison_count):
-        selected_layers = [
-            entry.comparison_goldens[comparison]
-            if comparison < len(entry.comparison_goldens)
-            else entry.golden
-            for entry in passes
-        ]
-        selected_rays = [
-            entry.comparison_rays[comparison]
-            if comparison < len(entry.comparison_rays)
-            else entry.ray
-            for entry in passes
-        ]
-        comparison_rebuilds.append(
-            reconstruct(selected_layers, selected_rays, collection.paper)
-        )
-        notes = [
-            entry.comparison_notes[comparison]
-            for entry in passes
-            if comparison < len(entry.comparison_notes)
-        ]
-        comparison_labels.append("; ".join(notes))
-
     primary_notes = [entry.primary_note for entry in passes if entry.primary_note]
-    primary_label = "; ".join(primary_notes) if primary_notes else "rebuilt from its passes"
+    primary_label = "; ".join(primary_notes) if primary_notes else "registered merge"
+    best_rebuilt, best_sources = best_reconstruction(passes, collection.paper)
+    best_numbers = list(dict.fromkeys(collection.numbers[index] for index in best_sources))
+    best_label = ", ".join(f"#{number}" for number in best_numbers) or "unavailable"
+    best_two_rebuilt, best_two_owners = optional_reconstruction(
+        passes, collection.paper, "best_two_golden", "best_two_ray"
+    )
+    best_two_parts = []
+    for owner in best_two_owners:
+        entry = passes[owner]
+        numbers = [collection.numbers[index] for index in entry.best_two_sources]
+        best_two_parts.append(
+            f"{entry.name}: " + " + ".join(f"#{number}" for number in numbers)
+        )
+    best_two_label = "; ".join(best_two_parts) or "unavailable"
+    spectral_rebuilt, spectral_owners = optional_reconstruction(
+        passes, collection.paper, "spectral_golden", "spectral_ray"
+    )
+    spectral_label = "; ".join(
+        passes[index].spectral_note or passes[index].name
+        for index in spectral_owners
+    ) or "unavailable for this reconstruction"
 
-    # The optional third column is a direct diagnostic against the merged
-    # colour: it keeps every other pass unchanged and takes colour from only
-    # the best-preserved individual impression.
+    # Three stable columns precede all temporary experiments.  In particular,
+    # a sharp singleton must never make the main-path column look successful.
     rows = [
         [
             (collection.baseline,
-             f"{scan.stem}: golden as averaged now ({len(collection.numbers)} stamps), "
+             f"{scan.stem}: as averaged ({len(collection.numbers)} stamps), "
              f"paper {bgr_hex(collection.paper)}"),
             (rebuilt,
-             f"{primary_label}; design edge energy {gain:+.1%}; "
+             f"main path: {primary_label}; design edge energy {gain:+.1%}; "
              f"impression agreement {rebuilt_fit['median']:+.3f} "
              f"(#{rebuilt_fit['best_number']} leads by {rebuilt_fit['lead']:+.3f})"),
-            *list(zip(comparison_rebuilds, comparison_labels)),
+            (best_rebuilt, f"from best ({best_label})"),
+            (best_two_rebuilt, f"from best 2 ({best_two_label})"),
+            (spectral_rebuilt, f"spectral hybrid: {spectral_label}"),
         ]
     ]
     for entry in passes:
+        if entry.best_source is None:
+            source_crop = collection.baseline
+            source_note = f"no single-stamp source recorded for {entry.name}"
+        else:
+            source_crop = np.clip(
+                collection.images[entry.best_source], 0, 255
+            ).astype(np.uint8)
+            source_note = (
+                f"source crop as is: stamp "
+                f"#{collection.numbers[entry.best_source]} for {entry.name}"
+            )
+        best_layer = entry.best_golden if entry.best_golden is not None else entry.golden
+        best_ray = entry.best_ray if entry.best_ray is not None else entry.ray
+        best_two_layer = (
+            entry.best_two_golden
+            if entry.best_two_golden is not None
+            else entry.golden
+        )
+        best_two_ray = (
+            entry.best_two_ray if entry.best_two_ray is not None else entry.ray
+        )
+        spectral_layer = (
+            entry.spectral_golden
+            if entry.spectral_golden is not None
+            else entry.golden
+        )
+        spectral_ray = (
+            entry.spectral_ray if entry.spectral_ray is not None else entry.ray
+        )
         row = [
-            (cv2.cvtColor(contrast(entry.golden, entry.seen), cv2.COLOR_GRAY2BGR),
-             entry.density_note),
+            (source_crop, source_note),
             (render_ink(entry.golden, collection.paper, entry.ray), entry.ink_note),
+            (render_ink(best_layer, collection.paper, best_ray),
+             entry.best_note or f"{entry.name}; no separate single-stamp result"),
+            (render_ink(best_two_layer, collection.paper, best_two_ray),
+             entry.best_two_note or f"{entry.name}; unchanged, no best-two variant"),
+            (render_ink(spectral_layer, collection.paper, spectral_ray),
+             entry.spectral_note or f"{entry.name}; unchanged in spectral hybrid"),
         ]
-        for comparison in range(comparison_count):
-            if comparison >= len(entry.comparison_goldens):
-                row.append(
-                    (render_ink(entry.golden, collection.paper, entry.ray),
-                     f"same {entry.name}; unchanged in colour comparison")
-                )
-            else:
-                row.append(
-                    (render_ink(entry.comparison_goldens[comparison], collection.paper,
-                                entry.comparison_rays[comparison]),
-                     entry.comparison_notes[comparison])
-                )
         rows.append(row)
     return write_panel(rows, output, args.panel_width)
